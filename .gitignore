@@ -1,0 +1,22 @@
+node_modules/
+dist/
+*.db
+*.db-wal
+*.db-shm
+
+# Runtime state: database, vault, admin/CLI tokens, source settings, Pi configs
+/state/
+.superagent/
+cli-token
+pi-config/
+
+# Local secrets and deployment overrides
+.env
+.env.*
+!.env.example
+
+# Logs, archives, editor/OS noise
+*.log
+*.tgz
+.DS_Store
+Thumbs.db

@@ -1,0 +1,57 @@
+/* 设置页（分区网格、项目与会商分区、落点聚焦）样式。只由 F5a-2 维护；令牌见 style.css 和 README.md。 */
+
+/* 分区条：网格，手机两列、平板三列、桌面四列；不横向滚动 */
+.snav {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 4px;
+}
+@media (min-width: 720px) { .snav { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (min-width: 1120px) { .snav { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+
+.snav__i {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-2);
+  text-decoration: none;
+  text-align: center;
+  font-size: 0.92rem;
+  line-height: 1.3;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.snav__i:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.snav__i[aria-current="page"] {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--paper);
+}
+
+/* 落点聚焦：2px 墨色外框，不做动画；2 秒后由脚本移除 */
+.is-landed {
+  outline: 2px solid var(--ink);
+  outline-offset: 3px;
+  border-radius: var(--r-sm);
+}
+
+/* 会商角色列表：分隔线，不套卡片 */
+.council-roles { border-top: 1px solid var(--line); }
+.council-roles > .disclose { border-bottom: 1px solid var(--line); padding: 4px 0; }
+.council-role__sum {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  cursor: pointer;
+}
+.council-role__name { font-weight: 600; overflow-wrap: anywhere; }
+
+/* 读取失败提示里的重试按钮不换行、不被挤窄 */
+.page .banner .btn { white-space: nowrap; flex: none; }

@@ -1,0 +1,35 @@
+# Pi coding agent 1.5.0, one image for every ticket kind.
+#
+# Build:  podman build -f deploy/Containerfile.pi -t localhost/superagent-pi:1.5.0 deploy/
+# The image carries only Pi and the tools a worker is allowed to call. It holds no credentials: the ticket token and
+# the gateway/MCP URLs arrive as environment variables at `podman run` time.
+FROM node:22-bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      git \
+      less \
+      procps \
+      python3 \
+      ripgrep \
+ && rm -rf /var/lib/apt/lists/*
+
+# Git authenticates with the ticket's GITHUB_TOKEN: the helper answers `git credential fill` from the environment, so
+# `git clone/push https://github.com/<owner>/<repo>` works without a credential file. Identity defaults keep commits valid.
+RUN git config --system credential.https://github.com.helper '!f() { test "$1" = get && echo username=x-access-token && echo "password=$GITHUB_TOKEN"; }; f' \
+ && git config --system user.name superagent \
+ && git config --system user.email superagent@localhost
+
+# Pin the agent version: an unpinned update would silently change the RPC protocol under the executor.
+RUN npm install -g @earendil-works/pi-coding-agent@1.5.0 \
+ && npm cache clean --force
+
+# The base image already ships uid 1000 as `node`; `--userns=keep-id` maps the host user onto it so mounted files stay
+# writable without running the container as root.
+USER node
+WORKDIR /workspace
+
+# No ENTRYPOINT: the launcher passes the full `pi ...` command line, which keeps the image usable for one-off
+# `podman run ... pi --help` checks.
+CMD ["pi", "--help"]

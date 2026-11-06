@@ -1,0 +1,87 @@
+/* F5b: task page master-detail split. Only applies at >= 1200 px; below that
+   .split does not exist and the list and detail stay two full pages. */
+
+@media (min-width: 1200px) {
+  .page.split {
+    max-width: none;
+    display: grid;
+    grid-template-columns: 23.75rem minmax(0, 1fr);
+    gap: 1.5rem;
+    align-items: start;
+  }
+
+  .split__list {
+    position: sticky;
+    top: 0;
+    align-self: start;
+    max-height: 100vh;
+    overflow-y: auto;
+    min-width: 0;
+    padding-right: 1.5rem;
+    border-right: 1px solid var(--line);
+  }
+
+  .split__detail {
+    min-width: 0;
+  }
+
+  /* pages.css/style.css cap .page at 860px; the detail column owns its width. */
+  .split__detail > .page.is-split {
+    max-width: none;
+  }
+
+  /* The base .detail is two columns from 1120 px (main + 260px side card). Inside
+     the narrow detail column that squeezes file names to one or two characters,
+     so stack the side card under the main column here. */
+  .split__detail .detail {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .split__detail .detail__side {
+    display: block;
+  }
+
+  .split__list .row--link {
+    min-height: 44px;
+  }
+
+  .split__list .row--selected {
+    position: relative;
+    background: var(--paper-2);
+  }
+
+  .split__list .row--selected::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--ink);
+  }
+
+  /* F5c: shown above the list when the open ticket is not in the current filter. */
+  .split__list .list-hint {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0 0 0.75rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: var(--r6);
+    background: var(--paper-2);
+    font-size: 0.875rem;
+  }
+
+  /* The action bar must not span the viewport (it would cover the list): keep it in the detail column. */
+  .split__detail .page.is-split .stickybar {
+    position: sticky;
+    left: auto;
+    right: auto;
+    bottom: 0;
+    z-index: 2;
+    margin: 0;
+    padding: 0.75rem 0;
+    background: var(--desk);
+    backdrop-filter: none;
+  }
+}

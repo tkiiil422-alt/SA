@@ -1,0 +1,392 @@
+/* 项目页、项目详情、发任务面板里的项目/上传部分、上传胶囊的样式。只由 F2 维护；令牌见 style.css 和 README.md。 */
+
+/* Local status colours: words + shapes carry the meaning, colour only reinforces it. */
+.projects-page,
+.project-page,
+.compose-form {
+  --pstat-ready: var(--machine);
+  --pstat-failed: var(--human);
+  --pstat-extracting: var(--warn);
+  --pstat-uploading: var(--info);
+}
+
+/* ---------- 项目页：拖放区与续传条 ---------- */
+
+.drop {
+  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  min-height: 7rem; margin: 0 0 1rem; padding: 1.25rem 1.5rem;
+  background: var(--paper);
+  border: 1px dashed var(--line-2); border-radius: var(--r12);
+  transition: background-color .15s ease, border-color .15s ease;
+}
+.drop[data-drag="true"] {
+  border-color: var(--machine);
+  background: var(--machine-soft);
+}
+.drop__text { display: grid; gap: .25rem; min-width: 0; }
+.drop__title { font-size: 1rem; font-weight: 600; }
+.drop__hint { font-size: .8125rem; color: var(--ink-3); }
+.drop .btn { flex: 0 0 auto; }
+
+.resumebar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .75rem;
+  margin: 0 0 1rem; padding: .75rem 1rem;
+  background: var(--warn-soft); border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line));
+  border-radius: var(--r12);
+}
+.resumebar__text { flex: 1 1 16rem; font-size: .875rem; overflow-wrap: anywhere; }
+.resumebar__acts { display: flex; flex-wrap: wrap; gap: .5rem; }
+
+/* ---------- 上传卡片（全页唯一的卡片） ---------- */
+
+.upcard {
+  margin: 0 0 1rem; padding: 1rem;
+  background: var(--paper);
+  border: 1px solid var(--line-2); border-radius: var(--r12);
+}
+.upcard--done { border-color: color-mix(in srgb, var(--machine) 50%, var(--line)); }
+.upcard--failed { border-color: color-mix(in srgb, var(--human) 50%, var(--line)); }
+.upcard__head {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: .25rem .75rem;
+}
+.upcard__name { font-size: .9375rem; font-weight: 600; overflow-wrap: anywhere; }
+.upcard__state { font-size: .8125rem; color: var(--ink-2); }
+.upcard__meta {
+  display: flex; flex-wrap: wrap; gap: .25rem 1rem;
+  font-size: .8125rem; color: var(--ink-2);
+}
+.upcard__foot {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: .5rem; margin-top: .5rem; font-size: .8125rem; color: var(--ink-3);
+}
+.upcard__actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }
+.upcard__error { margin-top: .5rem; font-size: .875rem; color: var(--human); overflow-wrap: anywhere; }
+.upcard__notice { margin-top: .5rem; font-size: .8125rem; color: var(--warn); }
+
+.upbar {
+  height: .5rem; margin: .75rem 0; overflow: hidden;
+  background: var(--paper-2); border: 1px solid var(--line); border-radius: var(--r-full);
+}
+.upbar > i {
+  display: block; height: 100%;
+  background: var(--machine);
+  transition: width .2s ease;
+}
+.upbar--slim { height: .375rem; margin: .375rem 0; }
+
+/* ---------- 项目列表（分组行） ---------- */
+
+.plist { border-top: 1px solid var(--line); }
+.prow {
+  display: flex; align-items: center; gap: .75rem;
+  min-height: 4rem; padding: .75rem .125rem;
+  border-bottom: 1px solid var(--line);
+}
+.prow:active { background: var(--paper-2); }
+.prow__main { display: grid; gap: .25rem; min-width: 0; flex: 1 1 auto; }
+.prow__top { display: flex; flex-wrap: wrap; align-items: baseline; gap: .25rem .75rem; }
+.prow__title { font-size: .9375rem; font-weight: 600; overflow-wrap: anywhere; }
+.prow__time { margin-left: auto; font-size: .7812rem; color: var(--ink-3); white-space: nowrap; }
+.prow__meta { display: flex; flex-wrap: wrap; gap: .25rem .75rem; font-size: .7812rem; color: var(--ink-3); }
+.prow__status { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.prow__progress { display: flex; flex: 1 1 12rem; align-items: center; gap: .5rem; min-width: 8rem; }
+.prow__progress .upbar { flex: 1 1 auto; margin: 0; }
+.prow__error {
+  display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  font-size: .7812rem; color: var(--human); overflow-wrap: anywhere;
+}
+.prow__side { flex: 0 0 auto; color: var(--ink-3); font-size: 1.25rem; }
+
+/* 状态 = 中文词 + 形状；颜色只做加强。 */
+.pstat {
+  display: inline-flex; align-items: center; gap: .375rem;
+  font-size: .8125rem; font-weight: 600; color: var(--ink-2);
+}
+.pstat[data-s="ready"] { color: var(--pstat-ready); }
+.pstat[data-s="failed"] { color: var(--pstat-failed); }
+.pstat[data-s="extracting"] { color: var(--pstat-extracting); }
+.pstat[data-s="uploading"] { color: var(--pstat-uploading); }
+.pstat[data-s="paused"] { color: var(--ink-2); }
+.pstat__mark {
+  display: inline-block; flex: 0 0 auto; width: .625rem; height: .625rem;
+  border: 1.5px solid currentColor; border-radius: .125rem;
+}
+.pstat[data-s="ready"] .pstat__mark { background: currentColor; border-radius: 50%; }
+.pstat[data-s="failed"] .pstat__mark { transform: rotate(45deg); border-radius: .0625rem; }
+.pstat[data-s="extracting"] .pstat__mark {
+  border-radius: 50%; border-right-color: transparent;
+  animation: pstat-spin 1s linear infinite;
+}
+.pstat[data-s="uploading"] .pstat__mark {
+  border-radius: 50%; background: currentColor;
+  animation: pstat-pulse 1.2s ease-in-out infinite;
+}
+@keyframes pstat-spin { to { transform: rotate(360deg); } }
+@keyframes pstat-pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+
+/* Grouped message, not a second card: only the active upload gets a card. */
+.projects-page .empty,
+.project-page .empty {
+  padding: 1.5rem 0 1rem;
+  background: transparent;
+  border: 0; border-top: 1px solid var(--line); border-radius: 0;
+}
+.empty .btn { margin-top: .75rem; }
+
+/* ---------- 项目详情 ---------- */
+
+.backlink {
+  display: inline-flex; align-items: center;
+  min-height: 2.75rem; padding: 0 .25rem;
+  font-size: .8125rem; color: var(--ink-3);
+}
+.project-status { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin-top: .5rem; }
+.project-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }
+.pstatusblock { display: flex; flex: 1 1 100%; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.pstatusblock .upbar { flex: 1 1 12rem; margin: 0; }
+
+.project-fail {
+  padding: 1rem;
+  background: var(--human-soft);
+  border: 1px solid color-mix(in srgb, var(--human) 45%, var(--line));
+  border-left: 3px solid var(--human);
+  border-radius: var(--r12);
+}
+.project-fail__reason { font-size: .9375rem; color: var(--ink); overflow-wrap: anywhere; }
+.project-fail .hint { margin-top: .375rem; }
+
+.profile { display: grid; gap: 1.25rem; }
+.profile__block { padding-top: .75rem; border-top: 1px solid var(--line); }
+.profile__block:first-child { padding-top: 0; border-top: 0; }
+.profile__k { margin-bottom: .5rem; font-size: .8125rem; font-weight: 600; color: var(--ink-2); }
+
+.langbar {
+  display: flex; height: .75rem; margin: .5rem 0;
+  overflow: hidden; background: var(--paper-2);
+  border: 1px solid var(--line); border-radius: var(--r-full);
+}
+.langbar > i { display: block; height: 100%; min-width: .125rem; }
+.langlist { display: grid; gap: .125rem; }
+.langlist li { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; padding: .25rem 0; font-size: .8125rem; }
+.lang__mark { width: .625rem; height: .625rem; flex: 0 0 auto; border-radius: .125rem; border: 1px solid var(--line-2); }
+.lang__name { min-width: 6rem; font-weight: 500; }
+
+.langbar > i[data-i="0"], .lang__mark[data-i="0"] { background: var(--ink); }
+.langbar > i[data-i="1"], .lang__mark[data-i="1"] {
+  background: repeating-linear-gradient(135deg, var(--ink-2) 0 .2rem, var(--paper-2) .2rem .45rem);
+}
+.langbar > i[data-i="2"], .lang__mark[data-i="2"] { background: var(--ink-3); }
+.langbar > i[data-i="3"], .lang__mark[data-i="3"] {
+  background: repeating-linear-gradient(45deg, var(--ink-3) 0 .125rem, transparent .125rem .4rem), var(--paper-2);
+}
+.langbar > i[data-i="4"], .lang__mark[data-i="4"] { background: var(--line-2); }
+
+.project-readme {
+  max-width: 38em; max-height: 26rem; overflow: auto;
+  padding: .75rem 1rem; background: var(--paper-2); border-radius: var(--r6);
+}
+/* The shared renderer emits .md__list; the reading face restores the bullets. */
+.project-readme .md__list { list-style: revert; padding-left: 1.4em; }
+.project-readme .md__list li { margin: .15em 0; }
+
+.manifest { padding: .5rem 0; border-top: 1px solid var(--line); }
+.manifest:first-child { padding-top: 0; border-top: 0; }
+.manifest__file { font-size: .8125rem; color: var(--ink-2); }
+.manifest__summary {
+  margin: .25rem 0 0; padding: .5rem .625rem;
+  max-height: 12rem; overflow: auto;
+  background: var(--paper-2); border-radius: var(--r6);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: .7812rem; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.git__branch { font-size: .8125rem; color: var(--ink-2); }
+.git__commits { display: grid; gap: .375rem; margin-top: .5rem; }
+.git__commits li { display: flex; gap: .5rem; font-size: .8125rem; color: var(--ink-2); }
+.git__commits .mono { flex: 0 0 auto; color: var(--ink-3); }
+.git__commits span:last-child { min-width: 0; overflow-wrap: anywhere; }
+
+.ptree-host { max-height: 28rem; overflow: auto; padding: .25rem .25rem .25rem 0; }
+.ptree, .ptree ul { margin: 0; padding-left: 1rem; list-style: none; }
+.ptree { padding-left: 0; font-size: .8125rem; line-height: 1.7; color: var(--ink-2); }
+.ptree li { min-height: 1.5rem; overflow-wrap: anywhere; }
+.ptree__dir > .ptree__name::before { content: "▸"; margin-right: .375rem; color: var(--ink-3); }
+.ptree__file::before { content: "·"; margin-right: .375rem; color: var(--ink-3); }
+.ptree__name { color: var(--ink); }
+
+.warnings { border-top: 1px solid var(--line); }
+.warnings summary {
+  display: flex; align-items: center; gap: .375rem;
+  min-height: 2.75rem; cursor: pointer;
+  font-size: .875rem; color: var(--ink-2); list-style: none;
+}
+.warnings summary::-webkit-details-marker { display: none; }
+.warnings summary::before { content: "▸"; color: var(--ink-3); }
+.warnings[open] summary::before { content: "▾"; }
+.warnings ul { padding: .25rem 0 .75rem 1.25rem; list-style: disc; }
+.warnings li { margin: .125rem 0; font-size: .8125rem; color: var(--ink-2); overflow-wrap: anywhere; }
+
+/* ---------- 通用文件浏览器（项目详情，以后任务详情也用） ---------- */
+
+.fb {
+  overflow: hidden;
+  background: var(--paper);
+  border: 1px solid var(--line); border-radius: var(--r12);
+}
+.fb__bar {
+  display: flex; align-items: center; gap: .5rem;
+  padding: .25rem .5rem;
+  background: var(--paper-2); border-bottom: 1px solid var(--line);
+}
+.fb__crumbs { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; gap: .125rem .25rem; min-width: 0; }
+.fb__crumb {
+  display: inline-flex; align-items: center;
+  min-height: 2.75rem; padding: 0 .25rem;
+  font-size: .8125rem; color: var(--info);
+  text-decoration: underline; text-underline-offset: .18em;
+}
+.fb__sep { color: var(--ink-3); font-size: .8125rem; }
+.fb__up {
+  flex: 0 0 auto; min-height: 2.75rem; padding: 0 .75rem;
+  background: var(--paper); border: 1px solid var(--line-2); border-radius: var(--r6);
+  font-size: .8125rem;
+}
+.fb__body { max-width: 100%; overflow-x: auto; padding: .25rem .5rem .5rem; }
+.fb__list { display: grid; }
+.fb__row {
+  display: flex; align-items: center; gap: .625rem;
+  width: 100%; min-height: 2.75rem; padding: .375rem .25rem;
+  text-align: left; background: none; border: 0;
+  border-bottom: 1px solid var(--line);
+}
+.fb__list li:last-child .fb__row { border-bottom: 0; }
+.fb__row:active { background: var(--paper-2); }
+.fb__kind {
+  flex: 0 0 auto; width: .625rem; height: .625rem;
+  border: 1.5px solid var(--ink-3);
+}
+.fb__kind[data-kind="dir"] { border-radius: .125rem; background: var(--paper-2); }
+.fb__kind[data-kind="file"] { border-radius: 50%; }
+.fb__name { flex: 1 1 auto; min-width: 0; font-size: .875rem; overflow-wrap: anywhere; }
+.fb__meta { flex: 0 0 auto; font-size: .7812rem; color: var(--ink-3); white-space: nowrap; }
+.fb__view { min-width: 0; }
+.fb__viewhead {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
+  padding: .5rem .25rem; border-bottom: 1px solid var(--line);
+}
+.fb__viewname { flex: 1 1 12rem; min-width: 0; font-size: .8125rem; overflow-wrap: anywhere; }
+.fb__viewacts { display: flex; flex-wrap: wrap; gap: .375rem; margin-left: auto; }
+.fb__viewacts .btn { min-height: 2.75rem; padding: 0 .75rem; }
+.fb__code {
+  margin: .5rem 0 0; padding: .75rem;
+  max-height: 60vh; max-width: 100%; overflow: auto;
+  background: var(--paper-2); border-radius: var(--r6);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: .8125rem; line-height: 1.6; white-space: pre;
+}
+.fb__image {
+  display: block; max-width: 100%; margin: .5rem 0 0;
+  background: var(--paper-2); border: 1px solid var(--line); border-radius: var(--r6);
+}
+
+/* ---------- 发任务面板里的附加行 ---------- */
+
+.compose-form[data-dragging="true"] {
+  box-shadow: inset 0 0 0 2px var(--machine);
+  border-radius: var(--r12);
+}
+.attach {
+  display: flex; flex-wrap: wrap; align-items: stretch; gap: .5rem;
+  margin-top: .75rem;
+}
+.attach__btn {
+  display: inline-flex; align-items: center; gap: .5rem;
+  min-height: 2.75rem; padding: 0 .875rem;
+  background: var(--paper-2); border: 1px solid var(--line-2); border-radius: var(--r-full);
+  font-size: .8125rem; color: var(--ink-2); text-align: left;
+}
+.attach__btn[aria-expanded="true"],
+.attach__btn[aria-checked="true"] {
+  border-color: color-mix(in srgb, var(--machine) 55%, var(--line-2));
+  background: var(--machine-soft); color: var(--ink);
+}
+.attach__kind { flex: 0 0 auto; color: var(--ink-3); }
+.attach__value {
+  max-width: 13rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ink);
+}
+.attach__field {
+  display: inline-flex; align-items: center; gap: .5rem;
+  min-height: 2.75rem; padding: 0 .5rem;
+  background: var(--paper-2); border: 1px solid var(--line-2); border-radius: var(--r-full);
+}
+.attach__select {
+  width: auto; min-width: 8rem; max-width: 16rem; min-height: 2.75rem;
+  padding: .25rem 1.5rem .25rem .25rem;
+  background: transparent; border: 0; border-radius: 0;
+  font-size: .8125rem;
+}
+.project-picker {
+  margin-top: .5rem; overflow: hidden;
+  background: var(--paper); border: 1px solid var(--line-2); border-radius: var(--r12);
+}
+.project-picker__head {
+  display: flex; align-items: center; gap: .5rem;
+  padding: .125rem .25rem .125rem .75rem;
+  border-bottom: 1px solid var(--line);
+}
+.project-picker__title { flex: 1 1 auto; font-size: .8125rem; color: var(--ink-2); }
+.project-picker__list { display: grid; }
+.pickrow {
+  display: flex; align-items: center; gap: .75rem;
+  width: 100%; min-height: 3rem; padding: .5rem .75rem;
+  background: transparent; border: 0; border-top: 1px solid var(--line);
+  text-align: left;
+}
+.project-picker__list .pickrow:first-child { border-top: 0; }
+.pickrow--picked { background: var(--machine-soft); }
+.pickrow__main { display: grid; gap: .125rem; min-width: 0; flex: 1 1 auto; }
+.pickrow__name { font-size: .875rem; font-weight: 600; overflow-wrap: anywhere; }
+.pickrow__meta { font-size: .7812rem; color: var(--ink-3); }
+.pickrow__side { flex: 0 0 auto; font-size: .7812rem; color: var(--ink-3); }
+.project-picker__upload {
+  display: flex; align-items: center; width: 100%; min-height: 2.75rem;
+  padding: .5rem .75rem; background: transparent; border: 0; border-top: 1px solid var(--line);
+  font-size: .875rem; color: var(--info); text-align: left;
+}
+.waitline {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
+  margin-top: .75rem; padding: .75rem;
+  background: var(--machine-soft);
+  border-left: 3px solid var(--machine); border-radius: var(--r6);
+  font-size: .875rem;
+}
+.waitline .btn { margin-left: auto; }
+
+/* ---------- narrow screens ---------- */
+
+@media (max-width: 719px) {
+  .drop {
+    min-height: 0; padding: 0; background: transparent; border: 0;
+  }
+  .drop__text { display: none; }
+  .drop .btn { width: 100%; }
+  .attach__field { flex: 1 1 100%; }
+  .attach__select { flex: 1 1 auto; max-width: none; }
+  .attach__value { max-width: 9rem; }
+  .lang__name { min-width: 5rem; }
+  .fb__viewacts { width: 100%; margin-left: 0; }
+}
+
+/* The drop area is for desktop; touch screens use the button. */
+@media (hover: none) and (pointer: coarse) {
+  .drop { min-height: 0; padding: 0; background: transparent; border: 0; }
+  .drop__text { display: none; }
+  .drop .btn { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drop,
+  .upbar > i { transition: none; }
+  .pstat__mark { animation: none !important; }
+}

@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#e8ebeb">
+<meta name="description" content="超级智能体后台：看任务、回答问题、改配置。">
+<title>超级智能体后台</title>
+<link rel="icon" href="data:,">
+<script src="boot.js"></script>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="css/projects.css">
+<link rel="stylesheet" href="css/council.css">
+<link rel="stylesheet" href="css/reader.css">
+<link rel="stylesheet" href="css/connections.css">
+<link rel="stylesheet" href="css/settings.css">
+<link rel="stylesheet" href="css/pages.css">
+<link rel="stylesheet" href="css/split.css">
+</head>
+<body>
+<div id="shell" class="shell" data-view="today" hidden>
+  <header class="bar">
+    <span class="bar__title" id="bar-title">今日</span>
+    <div class="bar__right">
+      <a class="upload-chip" id="upload-chip" href="#/projects" aria-live="polite" hidden></a>
+      <span class="lamp" id="lamp" data-state="ok">连接中</span>
+    </div>
+  </header>
+  <button class="compose-fab" id="compose-fab" type="button">＋ 发任务</button>
+
+  <aside class="rail" aria-label="主导航">
+    <a class="brand" href="#/today">
+      <span class="brand__stamp" aria-hidden="true">SA</span>
+      <span class="brand__name">超级智能体</span>
+    </a>
+    <nav class="rail__nav" id="rail-nav"></nav>
+    <div class="rail__foot">
+      <span class="lamp lamp--block" id="rail-lamp" data-state="ok">连接中</span>
+      <div class="rail__theme" id="rail-theme" role="group" aria-label="外观"></div>
+    </div>
+  </aside>
+
+  <main class="stage" id="stage" tabindex="-1"></main>
+
+  <aside class="aside" id="aside" aria-label="今日概况"></aside>
+
+  <nav class="tabs" id="tabs" aria-label="主导航"></nav>
+</div>
+
+<div id="login-layer" class="login-layer" hidden>
+  <div class="login-card">
+    <span class="brand__stamp brand__stamp--large" aria-hidden="true">SA</span>
+    <h1 class="login-title">登录后台</h1>
+    <p class="login-sub">输入管理口令。这里只有你一个人用。</p>
+    <form id="login-form" class="login-form" novalidate>
+      <label class="field__label" for="login-password">管理口令</label>
+      <div class="login-row">
+        <input id="login-password" class="input" type="password" autocomplete="current-password" autofocus spellcheck="false">
+        <button class="btn btn--ink" type="submit" id="login-submit">登录</button>
+      </div>
+      <p id="login-error" class="field__error" role="alert" hidden></p>
+    </form>
+    <p id="login-http-warning" class="hint" role="note" hidden>当前是 HTTP 明文连接，口令可能被窃听；只在本人网络里用强口令。</p>
+    <p id="login-mock-hint" class="hint" role="note" hidden>演示模式：没有连接真实后台，口令是 <code>demo</code>。</p>
+  </div>
+</div>
+
+<div id="compose-host" class="compose-host" hidden></div>
+<div id="sheet-host" class="sheet-host" hidden></div>
+<div id="toast-host" class="toast-host" aria-live="polite" aria-atomic="false"></div>
+<div id="dialog-host" class="dialog-host"></div>
+<div id="banner-host" class="banner-host"></div>
+<div id="route-announcer" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
+<noscript><p class="noscript">这个后台需要 JavaScript，请打开后刷新。</p></noscript>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

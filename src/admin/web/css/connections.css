@@ -1,0 +1,80 @@
+/* 连接页（飞书、GitHub、邮箱、密钥库、预览）。只由 F4 维护。 */
+
+.connections-page { max-width: 880px; }
+
+.conn-intro {
+  margin: 2px 0 0;
+  max-width: 44em;
+  color: var(--ink-2);
+  line-height: 1.65;
+}
+
+.conn-list {
+  margin: 18px 0 0;
+  border-top: 1px solid var(--line);
+}
+
+.conn-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px 20px;
+  align-items: center;
+  padding: 16px 2px;
+  border-bottom: 1px solid var(--line);
+}
+
+.conn-row__text { min-width: 0; }
+.conn-row__name { display: block; font-size: 1rem; font-weight: 600; line-height: 1.35; }
+.conn-row__desc { display: block; margin-top: 3px; font-size: 0.8438rem; color: var(--ink-3); line-height: 1.5; overflow-wrap: anywhere; }
+
+.conn-row__side {
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: 14px; flex-wrap: wrap;
+}
+
+.conn-status {
+  display: inline-flex; align-items: center; gap: 7px;
+  min-height: 44px;
+  font-size: 0.8438rem;
+  white-space: nowrap;
+}
+.conn-status__shape {
+  width: 0.7rem; height: 0.7rem;
+  flex: 0 0 auto;
+  border: 2px solid var(--ink-3);
+  border-radius: 50%;
+  background: transparent;
+}
+.conn-status__word { color: var(--ink); }
+.conn-status__detail { color: var(--ink-3); max-width: 15em; overflow: hidden; text-overflow: ellipsis; }
+
+/* Shape carries the state; the word always says it too. */
+.conn-status[data-s="ok"] .conn-status__shape { border-color: var(--machine); background: var(--machine); }
+.conn-status[data-s="off"] .conn-status__shape { border-color: var(--ink-3); background: transparent; }
+.conn-status[data-s="warn"] .conn-status__shape { border-color: var(--warn); border-radius: 1px; background: var(--warn); }
+.conn-status[data-s="error"] .conn-status__shape { border-color: var(--human); border-radius: 1px; background: var(--human); transform: rotate(45deg); }
+.conn-status[data-s="unknown"] .conn-status__shape { border-color: var(--ink-3); border-radius: 1px; background: transparent; }
+
+.conn-row__action { min-height: 44px; white-space: nowrap; }
+
+.conn-hint {
+  margin: 18px 0 0;
+  padding: 10px 12px;
+  border-left: 3px solid var(--ink);
+  background: var(--paper-2);
+  color: var(--ink-2);
+  font-size: 0.875rem; line-height: 1.6;
+}
+
+.conn-foot { margin-top: 18px; font-size: 0.7812rem; color: var(--ink-3); }
+
+@media (max-width: 559px) {
+  .conn-row { grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 14px 0; }
+  .conn-row__side { justify-content: space-between; }
+  .conn-status { min-height: 44px; }
+  .conn-status__detail { max-width: 40vw; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conn-status__shape { transition: none; }
+}
