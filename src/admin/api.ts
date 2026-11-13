@@ -27,14 +27,18 @@ import {
   type TicketSummaryView,
 } from './host.ts'
 import { decisionKindLabel, reasonLabels, ticketStatusLabel } from './labels.ts'
-import { OptionsError, OptionsSchema, formatRef } from './options.ts'
+import { OptionsError, OptionsSchema, findModel, formatRef } from './options.ts'
 import type { Options, OptionsStore } from './options.ts'
 import type { EventLevel, EventLog } from '../ledger/events.ts'
 import type { Ledger, UsageRange } from '../ledger/ledger.ts'
 import { LIMITS } from '../limits.ts'
 import { UploadConflict, type ProjectService } from '../projects/service.ts'
 import { MAX_COUNCIL_BRIEF_CHARS, type CouncilService } from '../council/service.ts'
+import { NovelError, type NovelService } from '../novel/service.ts'
 import type { ActivityLog } from '../executor/activity.ts'
+import type { FanqieService } from '../fanqie/service.ts'
+import { PiVersionError, type PiVersionService } from '../executor/pi-versions.ts'
+import { GoalError, resolveGoal, type GoalService, type GoalSpec } from '../goal/service.ts'
 
 export interface CreateAdminApiOptions {
   host: AdminHost
@@ -52,6 +56,14 @@ export interface CreateAdminApiOptions {
   councils?: CouncilService
   /** Each worker's recent steps, kept in memory by the executor. Absent in tests that do not exercise it. */
   activity?: Pick<ActivityLog, 'list'>
+  /** The book library. Absent in tests that do not exercise it; its routes answer 404 while `novel.enabled` is off. */
+  novels?: NovelService
+  /** Fanqie publishing; absent in tests that do not exercise it. */
+  fanqie?: FanqieService
+  /** Pi worker image versions; absent in tests that do not exercise it. */
+  piVersions?: PiVersionService
+  /** Ticket goals; absent in tests that do not exercise them. */
+  goals?: Pick<GoalService, 'view' | 'set' | 'cancel' | 'brief'>
 }
 
 export type AdminApi = (req: IncomingMessage, res: ServerResponse) => Promise<boolean>
@@ -257,11 +269,24 @@ const PasswordSchema = z.object({
   new: z.string().min(1, '请输入新口令'),
 }).strict()
 const SecretNameSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/, '名称只能是大写字母、数字和下划线，以字母开头，最长 64 位')
+/** A goal as a person writes it on a new ticket or a running one; limits left out come from the settings. */
+const GoalInputSchema = z.object({
+  text: z.string().trim().min(1, '请写清目标').max(4000, '目标不能超过 4000 字'),
+  commands: z.array(z.string().trim().min(1, '验收命令不能是空的').max(1000, '一条验收命令不能超过 1000 字')).max(20, '最多 20 条验收命令').optional(),
+  mode: z.enum(['commands+ai', 'commands', 'ai']).optional(),
+  maxRounds: z.number().int('必须是整数').min(1, '至少 1 轮').max(50, '最多 50 轮').optional(),
+  maxUsd: z.number().min(0.01, '至少 $0.01').max(100, '最多 $100').optional(),
+  maxHours: z.number().min(0.1, '至少 0.1 小时').max(72, '最多 72 小时').optional(),
+}).strict()
 const CreateTicketSchema = z.object({
   text: z.string().trim().min(1, '请写一句任务内容').max(10_000, '任务内容不能超过 10000 字'),
   model: z.string().max(200, '模型名过长').optional(),
   secrets: z.array(SecretNameSchema).max(100, '一次最多授权 100 个密钥').optional(),
   projectId: z.string().regex(/^p_[A-Za-z0-9]{1,32}$/, '项目编号不合法').optional(),
+  /** False switches multi-model collaboration off for this ticket; absent means the setting decides. */
+  collab: z.boolean().optional(),
+  /** A goal the ticket must reach before it ends. */
+  goal: GoalInputSchema.optional(),
 }).strict()
 const UploadCreateSchema = z.object({
   name: z.string().trim().min(1, '请填写压缩包文件名').max(255, '文件名不能超过 255 个字符'),
@@ -288,6 +313,11 @@ const SecretDecisionSchema = z.object({ decision: z.enum(['grant', 'deny'], { me
 const StopSchema = z.object({ reason: z.string().trim().max(2_000, '停止原因不能超过 2000 字').optional() }).strict()
 const TextSchema = z.object({
   text: z.string().trim().min(1, '内容不能为空').max(10_000, '内容不能超过 10000 字'),
+}).strict()
+/** A new instruction on a ticket; `model` ("provider/model") switches the ticket's model from this round on. */
+const ReplySchema = z.object({
+  text: z.string().trim().min(1, '内容不能为空').max(10_000, '内容不能超过 10000 字'),
+  model: z.string().max(200, '模型名过长').optional(),
 }).strict()
 const PauseSchema = z.object({ paused: z.boolean() }).strict()
 const CleanupSchema = z.object({
@@ -327,6 +357,29 @@ const ExecutorSchema = OptionsSchema.shape.executor
 const PreviewSettingsSchema = OptionsSchema.shape.preview
 const ProjectsSettingsSchema = OptionsSchema.shape.projects
 const CouncilSettingsSchema = OptionsSchema.shape.council
+const NovelSettingsSchema = OptionsSchema.shape.novel
+const CollabSettingsSchema = OptionsSchema.shape.collab
+const GoalSettingsSchema = OptionsSchema.shape.goal
+const BookIdSchema = z.string().regex(/^b_[A-Za-z0-9]{1,32}$/)
+const NovelOpenSchema = z.object({
+  idea: z.string().trim().min(1, '请写一句灵感').max(4000, '灵感不能超过 4000 字'),
+  genre: z.enum(['xianxia', 'xuanhuan'], { message: '题材只能是仙侠或玄幻' }),
+  title: z.string().trim().max(60, '书名不能超过 60 个字').optional(),
+  chapterChars: z.tuple([z.number().int().min(500), z.number().int().max(20000)]).optional(),
+  volumes: z.number().int().min(1).max(50).optional(),
+  chaptersPerVolume: z.number().int().min(5).max(1000).optional(),
+}).strict()
+const NovelImportSchema = z.object({
+  title: z.string().trim().min(1, '请写书名').max(60),
+  genre: z.enum(['xianxia', 'xuanhuan']),
+  idea: z.string().max(4000).optional(),
+  chapterChars: z.tuple([z.number().int().min(500), z.number().int().max(20000)]).optional(),
+  volumes: z.number().int().min(1).max(50).optional(),
+  chaptersPerVolume: z.number().int().min(5).max(1000).optional(),
+  setup: z.unknown(),
+}).strict()
+const NovelArcSchema = z.object({ note: z.string().trim().max(500, '要求不能超过 500 字').optional() }).strict()
+const NovelEditSchema = z.object({ note: z.string().trim().min(1, '请写一句要怎么改').max(1000, '修改意见不能超过 1000 字') }).strict()
 const ModelTestSchema = z.object({
   provider: z.string().min(1, '请选择服务商'),
   model: z.string().min(1, '请选择模型'),
@@ -563,6 +616,9 @@ const SECTION_NAMES: Record<SettingsSection, string> = {
   github: 'GitHub 设置',
   email: '邮箱设置',
   council: '会商设置',
+  novel: '小说设置',
+  collab: '协作设置',
+  goal: '目标设置',
 }
 
 function noteFor(section: SettingsSection, changed: string[], paused?: boolean): string {
@@ -587,6 +643,12 @@ function noteFor(section: SettingsSection, changed: string[], paused?: boolean):
       return '邮箱设置已保存，新收到的邮件立即按新设置处理。'
     case 'council':
       return '会商设置已保存；之后召集的会商按新角色、轮数和字数执行，正在进行的会商不受影响。'
+    case 'novel':
+      return '小说设置已保存；正在写的书从下一次模型调用起按新设置执行。'
+    case 'collab':
+      return '协作设置已保存；任务下一次启动执行者时按新角色和上限执行，正在进行的这一轮不受影响。'
+    case 'goal':
+      return '目标设置已保存；之后设定的目标按新的默认上限，判定模型和命令超时从下一次检查起生效。'
     case 'policy':
       return '受理规则已保存；新收到的消息按新规则判断，正在运行的任务不受影响。'
     case 'pause':
@@ -602,7 +664,25 @@ function labelSummary(item: TicketSummaryView): TicketSummaryView & { stageLabel
 // --- The factory --------------------------------------------------------------------------------------------------
 
 export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
-  const { host, auth, options: store, ledger, events, cliToken, onPolicyOrSettingsChange, projects, councils, activity } = options
+  const { host, auth, options: store, ledger, events, cliToken, onPolicyOrSettingsChange, projects, councils, activity, novels, fanqie, piVersions, goals } = options
+
+  function requireNovels(): NovelService {
+    if (novels === undefined || !store.get().novel.enabled) throw new AdminError('not_found', '写小说功能没有开启。', 404)
+    return novels
+  }
+
+  /** Runs a book-library call, mapping its refusals onto the API's error shape. */
+  async function novelCall<T>(work: () => T | Promise<T>): Promise<T> {
+    try {
+      return await work()
+    } catch (error) {
+      if (error instanceof NovelError) {
+        const status = error.code === 'not_found' || error.code === 'disabled' ? 404 : error.code === 'conflict' ? 409 : 400
+        throw new AdminError(error.code === 'disabled' ? 'not_found' : error.code, error.message, status)
+      }
+      throw error
+    }
+  }
 
   function requireProjects(): ProjectService {
     if (projects === undefined) throw new AdminError('not_found', '这台服务器没有启用项目库。', 404)
@@ -959,6 +1039,58 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
       return
     }
 
+    // Live board: one SSE stream for the console's home page and nav badges. A snapshot is sent on connect and again
+    // only when something on the board changed; otherwise a comment line keeps proxies from closing the connection.
+    if (route === '/live/stream' && method === 'GET') {
+      const snapshot = (): Record<string, unknown> => {
+        const facts = host.overview()
+        const totals = ledger.dayTotals()
+        const budget = store.getPublic().budget
+        const open = host.listTickets({ status: 'open', limit: 60, offset: 0 }).items.map(labelSummary).map(item => {
+          const goal = goals?.brief(item.id)
+          return goal ? { ...item, goal } : item
+        })
+        const ended = host.listTickets({ status: 'ended', limit: 8, offset: 0 }).items.map(labelSummary)
+        return {
+          paused: facts.paused,
+          slots: facts.slots,
+          tickets: facts.tickets,
+          usage: { todayUsd: totals.usd, todayCalls: totals.calls, dailyBudgetUsd: budget.dailyUsd },
+          upstream: facts.upstream,
+          runningSteps: facts.runningSteps ?? [],
+          open,
+          ended,
+          alerts: buildAlerts(facts, budget, totals.usd, auth.usingGeneratedPassword),
+        }
+      }
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-store, no-transform',
+        'x-accel-buffering': 'no',
+        connection: 'keep-alive',
+        ...SECURITY_HEADERS,
+      })
+      let previous = ''
+      let beat = 0
+      let seq = 0
+      const push = (): void => {
+        const body = JSON.stringify(snapshot())
+        if (body !== previous) {
+          previous = body
+          seq += 1
+          res.write(`id: ${seq}\nevent: board\ndata: ${JSON.stringify({ now: new Date().toISOString(), ...JSON.parse(body) })}\n\n`)
+          beat = 0
+        } else if (++beat % 15 === 0) {
+          res.write(': ping\n\n')
+        }
+      }
+      res.write('retry: 3000\n\n')
+      try { push() } catch { /* next tick */ }
+      const timer = setInterval(() => { try { push() } catch { /* keep the stream */ } }, 1000)
+      res.on('close', () => clearInterval(timer))
+      return
+    }
+
     // Overview.
     if (route === '/overview' && method === 'GET') {
       const facts = host.overview()
@@ -983,6 +1115,7 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
         },
         host: facts.host,
         upstream: facts.upstream,
+        ...(facts.runningSteps ? { runningSteps: facts.runningSteps } : {}),
         alerts: buildAlerts(facts, budget, totals.usd, auth.usingGeneratedPassword),
         recent: events.recent(15),
       })
@@ -1119,6 +1252,182 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
           sendJson(res, 404, { error: 'not_found', message: '找不到这个项目。' })
           return
         }
+        sendJson(res, 200, { ok: true })
+        return
+      }
+      sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
+      return
+    }
+
+    // Books.
+    if (route === '/novels' && method === 'GET') {
+      const service = requireNovels()
+      sendJson(res, 200, { items: await novelCall(() => service.list()) })
+      return
+    }
+    if (route === '/novels' && method === 'POST') {
+      const service = requireNovels()
+      const parsed = NovelOpenSchema.safeParse(await parseJsonBody(req))
+      if (!parsed.success) {
+        invalidWithHint(res, parsed.error, ['idea'])
+        return
+      }
+      const input = parsed.data
+      const created = await novelCall(() => service.openBook({
+        idea: input.idea,
+        genre: input.genre,
+        ...(input.title ? { title: input.title } : {}),
+        ...(input.chapterChars ? { chapterChars: input.chapterChars } : {}),
+        ...(input.volumes ? { volumes: input.volumes } : {}),
+        ...(input.chaptersPerVolume ? { chaptersPerVolume: input.chaptersPerVolume } : {}),
+      }))
+      sendJson(res, 200, created)
+      return
+    }
+    if (route === '/novels/import' && method === 'POST') {
+      const service = requireNovels()
+      const parsed = NovelImportSchema.safeParse(await parseJsonBody(req))
+      if (!parsed.success) {
+        invalid(res, issuesOf(parsed.error))
+        return
+      }
+      const input = parsed.data
+      const book = await novelCall(() => service.importBook({
+        title: input.title,
+        genre: input.genre,
+        setup: input.setup,
+        ...(input.idea ? { idea: input.idea } : {}),
+        ...(input.chapterChars ? { chapterChars: input.chapterChars } : {}),
+        ...(input.volumes ? { volumes: input.volumes } : {}),
+        ...(input.chaptersPerVolume ? { chaptersPerVolume: input.chaptersPerVolume } : {}),
+      }))
+      sendJson(res, 200, { id: book.id })
+      return
+    }
+    if (route.startsWith('/pi/')) {
+      if (piVersions === undefined) throw new AdminError('not_found', 'Pi 版本管理没有开启。', 404)
+      const pi = async <T>(work: () => Promise<T>): Promise<void> => {
+        try { sendJson(res, 200, await work()) } catch (e) {
+          if (e instanceof PiVersionError) throw new AdminError('pi', e.message, e.status)
+          throw e
+        }
+      }
+      const field = async (name: 'version' | 'image'): Promise<string> => {
+        const body = await parseJsonBody(req)
+        const value = body && typeof body === 'object' ? (body as Record<string, unknown>)[name] : undefined
+        if (typeof value !== 'string' || !value.trim() || value.length > 200) throw new AdminError('invalid', `缺少 ${name}。`, 400)
+        return value.trim()
+      }
+      if (route === '/pi/status' && method === 'GET') { await pi(() => piVersions.status()); return }
+      if (route === '/pi/check' && method === 'POST') { await pi(() => piVersions.check()); return }
+      if (route === '/pi/build' && method === 'POST') { const v = await field('version'); await pi(() => piVersions.startBuild(v)); return }
+      if (route === '/pi/apply' && method === 'POST') { const i = await field('image'); await pi(() => piVersions.apply(i)); return }
+      if (route === '/pi/remove' && method === 'POST') { const i = await field('image'); await pi(() => piVersions.remove(i)); return }
+      sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
+      return
+    }
+    if (route.startsWith('/fanqie/')) {
+      if (fanqie === undefined) throw new AdminError('not_found', '番茄发布功能没有开启。', 404)
+      if (route === '/fanqie/status' && method === 'GET') { sendJson(res, 200, fanqie.status()); return }
+      if (route === '/fanqie/check' && method === 'POST') { sendJson(res, 200, await fanqie.check()); return }
+      if (route === '/fanqie/books' && method === 'GET') {
+        try { sendJson(res, 200, { items: await fanqie.remoteBooks() }) } catch (e) { throw new AdminError('fanqie', e instanceof Error ? e.message : String(e), 502) }
+        return
+      }
+      const fb = /^\/fanqie\/novels\/([^/]+)(\/bind)?$/.exec(route)
+      if (fb !== null) {
+        const bookId = BookIdSchema.safeParse(decodeSegment(fb[1] ?? '') ?? '')
+        if (!bookId.success) { sendJson(res, 400, { error: 'invalid_path', message: '书的编号不合法。' }); return }
+        if (fb[2] === '/bind' && method === 'PUT') {
+          const parsed = z.object({ fqBookId: z.string().regex(/^\d{6,30}$/, '番茄作品 ID 应是一串数字') }).strict().safeParse(await parseJsonBody(req))
+          if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return }
+          fanqie.bind(bookId.data, parsed.data.fqBookId); sendJson(res, 200, { ok: true }); return
+        }
+        if (!fb[2] && method === 'GET') { sendJson(res, 200, { fqBookId: fanqie.boundTo(bookId.data) ?? null, chapters: fanqie.list(bookId.data) }); return }
+      }
+      if (route === '/fanqie/sync' && method === 'POST') {
+        const parsed = z.object({
+          bookId: BookIdSchema, chapters: z.array(z.number().int().min(1).max(99999)).min(1, '请至少选一章').max(500, '一次最多 500 章'),
+          mode: z.enum(['draft', 'publish', 'timer']), timerTime: z.number().int().optional(), useAi: z.boolean().default(true),
+        }).strict().safeParse(await parseJsonBody(req))
+        if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return }
+        try { sendJson(res, 200, fanqie.start(parsed.data)) } catch (e) { throw new AdminError('invalid', e instanceof Error ? e.message : String(e), 400) }
+        return
+      }
+      sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' }); return
+    }
+    const novelMatch = /^\/novels\/([^/]+)(?:\/(arcs|canon|work|export|chapters\/(\d{1,5})(?:\/(edit|undo|read))?))?$/.exec(route)
+    if (novelMatch !== null) {
+      const service = requireNovels()
+      const id = BookIdSchema.safeParse(decodeSegment(novelMatch[1] ?? '') ?? '')
+      if (!id.success) {
+        sendJson(res, 400, { error: 'invalid_path', message: '书的编号不合法。' })
+        return
+      }
+      const bookId = id.data
+      const sub = novelMatch[2]
+      if (sub === undefined && method === 'GET') {
+        sendJson(res, 200, await novelCall(() => service.detail(bookId)))
+        return
+      }
+      if (sub === undefined && method === 'DELETE') {
+        await novelCall(() => service.deleteBook(bookId))
+        sendJson(res, 200, { ok: true })
+        return
+      }
+      if (sub === 'arcs' && method === 'POST') {
+        const parsed = NovelArcSchema.safeParse(await parseJsonBody(req))
+        if (!parsed.success) {
+          invalidWithHint(res, parsed.error, ['note'])
+          return
+        }
+        const result = await novelCall(() => service.startArc(bookId, parsed.data.note))
+        sendJson(res, 200, { ok: true, ...result })
+        return
+      }
+      if (sub === 'canon' && method === 'GET') {
+        sendJson(res, 200, await novelCall(() => service.canon(bookId)))
+        return
+      }
+      if (sub === 'work' && method === 'GET') {
+        sendJson(res, 200, await novelCall(() => service.work(bookId)))
+        return
+      }
+      if (sub === 'export' && method === 'GET') {
+        const from = clampInt(url.searchParams.get('from'), 1, 1, 100000)
+        const toRaw = url.searchParams.get('to')
+        const exported = await novelCall(() => service.exportText(bookId, from, toRaw === null ? undefined : clampInt(toRaw, from, from, 100000)))
+        const name = encodeURIComponent(`${exported.title}.txt`)
+        res.writeHead(200, {
+          'content-type': 'text/plain; charset=utf-8',
+          'content-disposition': `attachment; filename*=UTF-8''${name}`,
+          'cache-control': 'no-store',
+        })
+        res.end(exported.text)
+        return
+      }
+      const chapterAction = novelMatch[4]
+      if (sub?.startsWith('chapters/') && chapterAction === undefined && method === 'GET') {
+        const n = Number(novelMatch[3])
+        sendJson(res, 200, await novelCall(() => service.chapter(bookId, n)))
+        return
+      }
+      if (sub?.startsWith('chapters/') && chapterAction !== undefined && method === 'POST') {
+        const n = Number(novelMatch[3])
+        if (chapterAction === 'edit') {
+          const parsed = NovelEditSchema.safeParse(await parseJsonBody(req))
+          if (!parsed.success) {
+            invalidWithHint(res, parsed.error, ['note'])
+            return
+          }
+          sendJson(res, 200, { ok: true, edit: await novelCall(() => service.editChapter(bookId, n, parsed.data.note)) })
+          return
+        }
+        if (chapterAction === 'undo') {
+          sendJson(res, 200, { ok: true, edit: await novelCall(() => service.undoEdit(bookId, n)) })
+          return
+        }
+        await novelCall(() => service.markRead(bookId, n))
         sendJson(res, 200, { ok: true })
         return
       }
@@ -1323,11 +1632,25 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
         invalid(res, issuesOf(parsed.error))
         return
       }
+      let goal: GoalSpec | undefined
+      if (parsed.data.goal !== undefined) {
+        try {
+          goal = resolveGoal(parsed.data.goal, store.get().goal)
+        } catch (error) {
+          if (error instanceof GoalError) {
+            invalid(res, [{ path: `goal.${error.field}`, message: error.message }])
+            return
+          }
+          throw error
+        }
+      }
       const result = await host.createTicket(
         parsed.data.text,
         parsed.data.model || undefined,
         parsed.data.secrets,
         parsed.data.projectId,
+        parsed.data.collab,
+        goal,
       )
       sendJson(res, 200, { ok: true, ...result })
       return
@@ -1347,6 +1670,35 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
       return
     }
 
+    const streamMatch = /^\/tickets\/([^/]+)\/activity\/stream$/.exec(route)
+    if (streamMatch !== null && method === 'GET') {
+      const id = decodeSegment(streamMatch[1] ?? '')
+      if (id === undefined || host.ticket(id) === undefined) {
+        sendJson(res, 404, { error: 'not_found', message: '找不到这张任务票。' })
+        return
+      }
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-store, no-transform',
+        'x-accel-buffering': 'no',
+        connection: 'keep-alive',
+        ...SECURITY_HEADERS,
+      })
+      let last = clampInt(String(req.headers['last-event-id'] ?? url.searchParams.get('after') ?? ''), 0, 0, Number.MAX_SAFE_INTEGER)
+      let beat = 0
+      const push = (): void => {
+        const view = activity ? activity.list(id, last, 120) : { items: [], last: 0 }
+        if (view.last < last) last = 0
+        for (const item of view.items) res.write(`id: ${item.seq}\nevent: step\ndata: ${JSON.stringify(item)}\n\n`)
+        if (view.items.length > 0) last = Math.max(last, view.last)
+        else if (++beat % 15 === 0) res.write(': ping\n\n')
+      }
+      res.write('retry: 3000\n\n')
+      try { push() } catch { /* next tick */ }
+      const timer = setInterval(() => { try { push() } catch { /* keep the stream */ } }, 1000)
+      res.on('close', () => clearInterval(timer))
+      return
+    }
     const activityMatch = /^\/tickets\/([^/]+)\/activity$/.exec(route)
     if (activityMatch !== null && method === 'GET') {
       const id = decodeSegment(activityMatch[1] ?? '')
@@ -1361,6 +1713,54 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
       const after = clampInt(url.searchParams.get('after'), 0, 0, Number.MAX_SAFE_INTEGER)
       const limit = clampInt(url.searchParams.get('limit'), 120, 1, 300)
       sendJson(res, 200, activity ? activity.list(id, after, limit) : { items: [], last: 0 })
+      return
+    }
+    const goalMatch = /^\/tickets\/([^/]+)\/goal$/.exec(route)
+    if (goalMatch !== null) {
+      if (goals === undefined) throw new AdminError('not_found', '目标功能没有开启。', 404)
+      const id = decodeSegment(goalMatch[1] ?? '')
+      if (id === undefined) {
+        sendJson(res, 400, { error: 'invalid_path', message: '任务票编号不合法。' })
+        return
+      }
+      const ticket = host.ticket(id)
+      if (ticket === undefined) {
+        sendJson(res, 404, { error: 'not_found', message: '找不到这张任务票。' })
+        return
+      }
+      if (method === 'GET') {
+        sendJson(res, 200, { goal: goals.view(id) ?? null })
+        return
+      }
+      if (method === 'PUT') {
+        if (ticket.status === 'ended') {
+          sendJson(res, 400, { error: 'invalid', message: '任务已经结束。先在任务里发一句话重新打开，再设目标。' })
+          return
+        }
+        const body = await parseJsonBody(req)
+        const parsed = GoalInputSchema.safeParse(body)
+        if (!parsed.success) {
+          invalid(res, issuesOf(parsed.error))
+          return
+        }
+        let spec: GoalSpec
+        try {
+          spec = resolveGoal(parsed.data, store.get().goal)
+        } catch (error) {
+          if (error instanceof GoalError) {
+            invalid(res, [{ path: error.field, message: error.message }])
+            return
+          }
+          throw error
+        }
+        sendJson(res, 200, { ok: true, goal: goals.set(id, spec) ?? null })
+        return
+      }
+      if (method === 'DELETE') {
+        sendJson(res, 200, { ok: goals.cancel(id) })
+        return
+      }
+      sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
       return
     }
     const actionMatch = /^\/tickets\/([^/]+)\/(stop|retry|note|reply|files|secrets|deliverables|archive)$/.exec(route)
@@ -1392,6 +1792,8 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
         stageHint: label.hint,
         usage: { totalUsd: totals.usd, calls: totals.calls, hit: totals.hit, miss: totals.miss, out: totals.out, hitRate: totals.hitRate },
         calls: ledger.calls({ ticketId: id, limit: 50 }),
+        byAgent: ledger.ticketByAgent(id),
+        ...(goals ? { goal: goals.view(id) } : {}),
         events: events.list({ ticketId: id, limit: 100 }),
       })
       return
@@ -1517,12 +1919,13 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
       }
       if (action === 'reply' && method === 'POST') {
         const body = await parseJsonBody(req)
-        const parsed = TextSchema.safeParse(body)
+        const parsed = ReplySchema.safeParse(body)
         if (!parsed.success) {
           invalid(res, issuesOf(parsed.error))
           return
         }
-        host.replyTicket(id, parsed.data.text)
+        if (parsed.data.model) host.replyTicket(id, parsed.data.text, parsed.data.model)
+        else host.replyTicket(id, parsed.data.text)
         sendJson(res, 200, { ok: true })
         return
       }
@@ -1791,6 +2194,104 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
           throw error
         }
         finishSettings(res, 'projects', updated.changed)
+        return
+      }
+      sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
+      return
+    }
+    if (route === '/settings/novel') {
+      if (method === 'GET') {
+        sendJson(res, 200, store.getPublic().novel)
+        return
+      }
+      if (method === 'PUT') {
+        const parsed = NovelSettingsSchema.safeParse(await parseJsonBody(req))
+        if (!parsed.success) {
+          invalid(res, issuesOf(parsed.error))
+          return
+        }
+        let updated
+        try {
+          updated = store.update('novel', parsed.data)
+        } catch (error) {
+          if (error instanceof OptionsError) {
+            invalid(res, error.issues)
+            return
+          }
+          throw error
+        }
+        finishSettings(res, 'novel', updated.changed)
+        return
+      }
+      sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
+      return
+    }
+    if (route === '/settings/goal') {
+      if (method === 'GET') {
+        sendJson(res, 200, store.getPublic().goal)
+        return
+      }
+      if (method === 'PUT') {
+        const body = await parseJsonBody(req)
+        const parsed = GoalSettingsSchema.safeParse(body)
+        if (!parsed.success) {
+          invalid(res, issuesOf(parsed.error))
+          return
+        }
+        const judge = parsed.data.judge
+        if (judge !== null && findModel(store.get().models, judge, { enabledOnly: true }) === undefined) {
+          invalid(res, [{ path: 'judge', message: '判定模型不存在或没有启用' }])
+          return
+        }
+        let updated
+        try {
+          updated = store.update('goal', parsed.data)
+        } catch (error) {
+          if (error instanceof OptionsError) {
+            invalid(res, error.issues)
+            return
+          }
+          throw error
+        }
+        finishSettings(res, 'goal', updated.changed)
+        return
+      }
+      sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
+      return
+    }
+    if (route === '/settings/collab') {
+      if (method === 'GET') {
+        sendJson(res, 200, store.getPublic().collab)
+        return
+      }
+      if (method === 'PUT') {
+        const body = await parseJsonBody(req)
+        const parsed = CollabSettingsSchema.safeParse(body)
+        if (!parsed.success) {
+          invalid(res, issuesOf(parsed.error))
+          return
+        }
+        // A role's model must be usable when it is chosen; one disabled later falls back to the ticket's model.
+        const models = store.get().models
+        const issues = parsed.data.roles.flatMap((role, index) =>
+          role.model === null || findModel(models, role.model, { enabledOnly: true }) !== undefined
+            ? []
+            : [{ path: `roles.${index}.model`, message: `角色「${role.name}」用的模型不存在或没有启用` }])
+        if (issues.length > 0) {
+          invalid(res, issues)
+          return
+        }
+        let updated
+        try {
+          updated = store.update('collab', parsed.data)
+        } catch (error) {
+          if (error instanceof OptionsError) {
+            invalid(res, error.issues)
+            return
+          }
+          throw error
+        }
+        finishSettings(res, 'collab', updated.changed)
         return
       }
       sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })

@@ -538,7 +538,7 @@ describe('callModel', () => {
     expect(seen.headers['x-session']).toBeUndefined()
     expect(seen.body).toEqual({
       model: 'm',
-      system: 'sys',
+      system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: 'hi' }],
       max_tokens: 50,
     })

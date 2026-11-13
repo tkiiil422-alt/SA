@@ -6,6 +6,7 @@
  * and after `realpath` — so neither `..`, encoded separators, backslashes, NUL bytes nor a symlink can read outside it.
  */
 import { readFileSync, realpathSync, statSync } from 'node:fs'
+import { gzipSync } from 'node:zlib'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { extname, resolve, sep } from 'node:path'
 
@@ -30,6 +31,9 @@ const MIME: Record<string, string> = {
 }
 
 const CACHEABLE = new Set(['html', 'htm', 'css', 'js', 'mjs'])
+const COMPRESSIBLE = new Set(['html', 'htm', 'css', 'js', 'mjs', 'json', 'svg', 'txt', 'map'])
+/** Compressed copies keyed by path and ETag, so each file is gzipped once per change. */
+const gzipCache = new Map<string, Buffer>()
 const SECURITY_HEADERS: Record<string, string> = {
   'x-content-type-options': 'nosniff',
   'x-frame-options': 'DENY',
@@ -141,14 +145,34 @@ export function createStaticHandler(rootDir: string): StaticHandler {
     }
 
     const extension = extname(real).slice(1).toLowerCase()
+    const etag = `"${info.size.toString(16)}-${Math.trunc(info.mtimeMs).toString(16)}"`
     const headers: Record<string, string> = {
       ...SECURITY_HEADERS,
       'content-type': MIME[extension] ?? 'application/octet-stream',
-      'content-length': String(body.length),
       'cache-control': CACHEABLE.has(extension) ? 'no-cache' : 'public, max-age=3600',
+      etag,
+      vary: 'accept-encoding',
     }
+    if (String(req.headers['if-none-match'] ?? '').split(',').some(tag => tag.trim().replace(/^W\//, '') === etag)) {
+      res.writeHead(304, headers)
+      res.end()
+      return true
+    }
+    let payload = body
+    if (COMPRESSIBLE.has(extension) && body.length > 512 && /\bgzip\b/.test(String(req.headers['accept-encoding'] ?? ''))) {
+      const key = `${real}|${etag}`
+      let packed = gzipCache.get(key)
+      if (!packed) {
+        packed = gzipSync(body)
+        if (gzipCache.size > 200) gzipCache.clear()
+        gzipCache.set(key, packed)
+      }
+      payload = packed
+      headers['content-encoding'] = 'gzip'
+    }
+    headers['content-length'] = String(payload.length)
     res.writeHead(200, headers)
-    res.end(method === 'HEAD' ? undefined : body)
+    res.end(method === 'HEAD' ? undefined : payload)
     return true
   }
 }

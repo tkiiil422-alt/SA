@@ -1,0 +1,31 @@
+{
+  "stateDir": "/home/user/superagent/state-stub",
+  "maxSlots": 2,
+  "operatorId": "operator",
+  "deepseekApiKeyEnv": "DEEPSEEK_API_KEY",
+  "launcher": {
+    "command": "/home/user/superagent/deploy/pi-container.sh",
+    "args": [
+      "--provider", "deepseek",
+      "--model", "deepseek-v4.1-flash",
+      "--mode", "rpc",
+      "--no-approve"
+    ],
+    "env": {
+      "SA_PI_IMAGE": "localhost/superagent-pi:1.5.0",
+      "SA_WORKSPACE_ROOT": "/home/user/superagent-workspaces",
+      "SA_PI_CPUS": "2",
+      "SA_PI_MEMORY": "6g"
+    }
+  },
+  "policy": {
+    "policy": {
+      "sources": {
+        "cli": {
+          "allowed": [{ "id": "operator", "name": "Operator" }]
+        }
+      }
+    },
+    "eval": { "mode": "auto" }
+  }
+}

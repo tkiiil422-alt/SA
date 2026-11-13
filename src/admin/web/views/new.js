@@ -39,6 +39,12 @@ function clearDraft() {
   try { localStorage.removeItem(DRAFT_KEY) } catch { /* a private window may refuse */ }
 }
 
+const MODE_KEY = 'sa-compose-mode'
+
+function readMode() {
+  try { return localStorage.getItem(MODE_KEY) } catch { return null }
+}
+
 function speedText(value) {
   const speed = Number(value)
   if (!Number.isFinite(speed) || speed <= 0) return '正在估算'
@@ -62,6 +68,14 @@ function uploadPercent(state) {
 function createCompose(ctx, { preset = {}, panel = false } = {}) {
   const root = document.createElement('div')
   root.className = panel ? 'compose-form' : 'page'
+  const wrap = document.createElement('div')
+  const modeBar = document.createElement('div')
+  modeBar.className = 'seg mode-seg'
+  modeBar.hidden = true
+  const novelHost = document.createElement('div')
+  novelHost.className = root.className
+  novelHost.hidden = true
+  wrap.append(modeBar, root, novelHost)
   let alive = true
   let models = { items: [], default: '', autoSelect: true }
   let recent = []
@@ -80,6 +94,10 @@ function createCompose(ctx, { preset = {}, panel = false } = {}) {
   let unsubscribeUpload = null
   let waiting = null
   let lastDoneProject = ''
+  let mode = preset.mode === 'novel' || readMode() === 'novel' ? 'novel' : 'generic'
+  let novelOn = false
+  let novelCfg = null
+  const nv = { sub: 'new', idea: '', genre: 'xianxia', min: 0, max: 0, volumes: 3, perVolume: 100, bookId: '', note: '', books: null, busy: false }
 
   const draft = { ...readDraft(), ...preset }
   const state = {
@@ -764,10 +782,168 @@ function createCompose(ctx, { preset = {}, panel = false } = {}) {
     }
   }
 
+  function paintMode() {
+    modeBar.hidden = !novelOn
+    modeBar.innerHTML = `<button class="seg__i" type="button" data-mode="generic" aria-pressed="${mode === 'generic'}">通用任务</button><button class="seg__i" type="button" data-mode="novel" aria-pressed="${mode === 'novel'}">写小说</button>`
+    root.hidden = mode === 'novel'
+    novelHost.hidden = mode !== 'novel'
+    if (mode === 'novel') paintNovel()
+  }
+
+  async function loadNovelSettings() {
+    try {
+      novelCfg = await get('api/settings/novel')
+      novelOn = novelCfg?.enabled === true
+    } catch {
+      novelOn = false
+    }
+    if (!alive) return
+    if (!novelOn) mode = 'generic'
+    if (novelOn && !nv.min) {
+      const range = Array.isArray(novelCfg.chapterChars) ? novelCfg.chapterChars : []
+      nv.min = Number(range[0]) || 2500
+      nv.max = Number(range[1]) || 3500
+    }
+    paintMode()
+  }
+
+  modeBar.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-mode]')
+    if (!button) return
+    mode = button.dataset.mode === 'novel' ? 'novel' : 'generic'
+    try { localStorage.setItem(MODE_KEY, mode) } catch { /* storage may be unavailable */ }
+    paintMode()
+  })
+
+  function paintNovel() {
+    const books = Array.isArray(nv.books) ? nv.books : []
+    const open = books.filter((item) => ['ready', 'writing', 'paused'].includes(item.phase))
+    const book = open.find((item) => item.id === nv.bookId) || open[0] || null
+    if (book) nv.bookId = book.id
+    const next = book?.nextArc
+    const genres = [['xianxia', '仙侠'], ['xuanhuan', '玄幻']]
+      .map(([value, label]) => `<option value="${value}"${nv.genre === value ? ' selected' : ''}>${label}</option>`).join('')
+    const subSwitch = `<div class="seg mode-seg" role="group" aria-label="写小说动作">
+      <button class="seg__i" type="button" data-nsub="new" aria-pressed="${nv.sub === 'new'}">开新书</button>
+      <button class="seg__i" type="button" data-nsub="continue" aria-pressed="${nv.sub === 'continue'}">续写已有书</button></div>`
+    let body
+    if (nv.sub === 'new') {
+      body = `<div class="field"><label class="field__label" for="nv-idea">一句灵感 / 卖点</label>
+          <textarea class="textarea" rows="4" id="nv-idea" data-nv="idea" placeholder="例如：废材少年得到一枚会吞噬功法的古戒">${esc(nv.idea)}</textarea></div>
+        <div class="novel-row">
+          <label class="field"><span class="field__label">题材</span><select class="select" data-nv="genre">${genres}</select></label>
+          <label class="field"><span class="field__label">每章最少字数</span><input class="input" type="number" data-nv="min" value="${esc(nv.min)}"></label>
+          <label class="field"><span class="field__label">每章最多字数</span><input class="input" type="number" data-nv="max" value="${esc(nv.max)}"></label>
+          <label class="field"><span class="field__label">预计卷数</span><input class="input" type="number" data-nv="volumes" value="${esc(nv.volumes)}"></label>
+          <label class="field"><span class="field__label">每卷章数</span><input class="input" type="number" data-nv="perVolume" value="${esc(nv.perVolume)}"></label>
+        </div>
+        <div class="stickybar"><button class="btn btn--ink btn--wide" type="button" data-nv-send>开始：先生成设定</button></div>`
+    } else if (!Array.isArray(nv.books)) {
+      body = '<p class="hint">正在读书库…</p>'
+    } else if (!open.length) {
+      body = '<p class="hint">还没有可以续写的书。先开一本新书。</p>'
+    } else {
+      body = `<div class="field"><label class="field__label" for="nv-book">选一本书</label>
+          <select class="select" id="nv-book" data-nv="bookId">${open.map((item) => `<option value="${esc(item.id)}"${item.id === nv.bookId ? ' selected' : ''}>${esc(item.title)}（第 ${esc(item.lastChapter ?? 0)} 章）</option>`).join('')}</select></div>
+        <p class="novel-next">${next ? `下一弧：第 ${esc(next.n)} 弧《${esc(next.title)}》，约 ${esc(next.chapters)} 章` : '这本书没有待写的弧了。'}</p>
+        <div class="field"><label class="field__label" for="nv-note">要求（可不填）</label>
+          <input class="input" id="nv-note" data-nv="note" value="${esc(nv.note)}" placeholder="例如：这一弧让女主出场"></div>
+        <div class="stickybar"><button class="btn btn--ink btn--wide" type="button" data-nv-send${next ? '' : ' disabled'}>写下一弧</button></div>`
+    }
+    novelHost.innerHTML = `${subSwitch}${body}`
+  }
+
+  async function loadBooks() {
+    try {
+      const data = await get('api/novels')
+      nv.books = Array.isArray(data?.items) ? data.items : []
+    } catch (error) {
+      nv.books = []
+      if (error?.status !== 401) bus.toast(error?.message || '书库没读出来', { danger: true })
+    }
+    if (alive && mode === 'novel') paintNovel()
+  }
+
+  novelHost.addEventListener('input', (event) => {
+    const field = event.target.dataset?.nv
+    if (!field || field === 'bookId' || field === 'genre') return
+    if (field === 'idea' || field === 'note') nv[field] = event.target.value
+    else nv[field] = Number(event.target.value) || 0
+  })
+
+  novelHost.addEventListener('change', (event) => {
+    const field = event.target.dataset?.nv
+    if (field === 'bookId') {
+      nv.bookId = event.target.value
+      paintNovel()
+    } else if (field === 'genre') {
+      nv.genre = event.target.value
+    }
+  })
+
+  novelHost.addEventListener('click', async (event) => {
+    const sub = event.target.closest('[data-nsub]')
+    if (sub) {
+      nv.sub = sub.dataset.nsub === 'continue' ? 'continue' : 'new'
+      if (nv.sub === 'continue' && !Array.isArray(nv.books)) void loadBooks()
+      paintNovel()
+      return
+    }
+    if (event.target.closest('[data-nv-send]')) await sendNovel()
+  })
+
+  async function sendNovel() {
+    if (nv.busy) return
+    nv.busy = true
+    try {
+      if (nv.sub === 'new') {
+        const idea = nv.idea.trim()
+        if (!idea) {
+          bus.toast('先写一句灵感或卖点', { danger: true })
+          return
+        }
+        const result = await post('api/novels', {
+          idea,
+          genre: nv.genre,
+          chapterChars: [nv.min, nv.max],
+          volumes: nv.volumes,
+          chaptersPerVolume: nv.perVolume,
+        })
+        const id = result?.id
+        nv.idea = ''
+        bus.toast('开始生成设定，好了就能在书页看')
+        bus.closeCompose?.({ stay: true })
+        ctx.navigate(id ? `novels/${encodeURIComponent(id)}` : 'novels')
+        return
+      }
+      if (!nv.bookId) {
+        bus.toast('先选一本书', { danger: true })
+        return
+      }
+      const note = nv.note.trim()
+      const result = await post(`api/novels/${encodeURIComponent(nv.bookId)}/arcs`, note ? { note } : {})
+      nv.note = ''
+      invalidateOverview()
+      bus.closeCompose?.({ stay: true })
+      if (result?.ticketId) {
+        bus.toast('已开票，开始写下一弧')
+        ctx.navigate(`tickets/${encodeURIComponent(result.ticketId)}`)
+      } else {
+        bus.toast('下一弧已排上')
+        ctx.navigate(`novels/${encodeURIComponent(nv.bookId)}`)
+      }
+    } catch (error) {
+      bus.toast(error?.message || '没有发出去，可以再试。', { danger: true })
+    } finally {
+      nv.busy = false
+    }
+  }
+
   render()
+  void loadNovelSettings()
 
   return {
-    root,
+    root: wrap,
     refresh: async () => {
       await refreshProjectList()
       if (!submitting && !waiting) paintStats()

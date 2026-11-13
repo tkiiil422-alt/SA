@@ -24,6 +24,7 @@ import type { Outbox } from '../outbox/outbox.ts'
 import type { SqliteRepositories } from '../store/sqlite.ts'
 import { findModel, type OptionsStore } from './options.ts'
 import { InvalidModelError } from '../executor/pi-models.ts'
+import type { GoalSpec } from '../goal/service.ts'
 import { SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
 import type { Settings } from '../policy.ts'
 import { createBackup as writeBackup, listBackups } from './backup.ts'
@@ -37,6 +38,7 @@ import {
   AdminError,
   type AdminHost,
   type AttentionTicket,
+  type RunningStep,
   type BackupItemView,
   type BackupsResult,
   type BatchDeleteResult,
@@ -83,6 +85,8 @@ import type { Reason } from '../core/reasons.ts'
 
 /** What the runtime hands the host. Every dependency is injected so the host can be tested without a daemon. */
 export interface RuntimeAdminDeps {
+  /** Step log; when present the overview reports each running ticket's latest step. */
+  activity?: { list(ticketId: string, after?: number, limit?: number): { items: Array<{ summary: string; kind: string; at: string; tool?: string; status?: string; model?: string; agents?: { role: string; name?: string; model?: string; state: string }[] }> } }
   repo: SqliteRepositories
   engine: Engine
   outbox: Outbox
@@ -102,7 +106,7 @@ export interface RuntimeAdminDeps {
   /** The Source scope used when a policy change revalidates open mandates. */
   source: SourceScope
   /** Accept a sentence as a ticket, exactly like `sa ask`; `model` is an optional "provider/model" person choice. */
-  ask(text: string, model?: string, secrets?: string[], projectId?: string): Promise<CreateTicketResult>
+  ask(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec): Promise<CreateTicketResult>
   /** Answer on the ticket's original thread as a person. */
   reply(ticketId: string, text: string): void
   /** Feishu connection test; absent when the runtime has no Feishu source. */
@@ -132,6 +136,10 @@ export interface RuntimeAdminDeps {
   discoverModels(input: DiscoverInput): Promise<DiscoverResult>
   /** The model a ticket runs on and how it was chosen; resolved by the runtime from choices and routing. */
   ticketModel(ticket: Ticket): TicketModelView
+  /** Make "provider/model" the ticket's model from its next launch on; throws `InvalidModelError` when not enabled. */
+  chooseModel?(ticket: Ticket, ref: string): void
+  /** A person wrote on the ticket (reply or retry): a ticket goal stopped at a cap goes on with another batch. */
+  goalReplied?(ticketId: string): void
   now?: () => Date
   /** Runs `podman ps`; injectable for tests. Rejects on failure; `system` turns that into a warning. */
   run?: (file: string, args: string[], timeoutMs: number) => Promise<string>
@@ -533,6 +541,28 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
     return items
   }
 
+  const runningSteps = (open: readonly Ticket[]): RunningStep[] => {
+    const items: RunningStep[] = []
+    for (const ticket of open) {
+      const run = runningAssignment(ticket)
+      if (run === undefined) continue
+      const since = run.startedAt ?? run.createdAt
+      try {
+        const last = deps.activity?.list(ticket.id, 0, 1).items.at(-1)
+        if (last) {
+          items.push({
+            id: ticket.id, summary: last.summary, kind: last.kind, at: last.at,
+            ...(last.tool ? { tool: last.tool } : {}), status: last.status, since,
+            ...(last.model ? { model: last.model } : {}), ...(last.agents ? { agents: last.agents } : {}),
+          })
+        } else {
+          items.push({ id: ticket.id, summary: '', kind: 'none', at: since, since })
+        }
+      } catch { /* best effort */ }
+    }
+    return items
+  }
+
   const upstream = (): UpstreamStatus => {
     const models = deps.options.get().models
     const found = findModel(models, models.routing.worker)
@@ -598,6 +628,7 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
           endedToday: tickets.filter(ticket => ticket.ended !== undefined && sameDay(ticket.ended.at)).length,
         },
         attentionTickets: attentionTickets(open),
+        ...(deps.activity ? { runningSteps: runningSteps(open) } : {}),
         host: hostMetrics(),
         upstream: upstream(),
       }
@@ -706,7 +737,7 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
       return deps.previews?.list(id) ?? []
     },
 
-    async createTicket(text: string, model?: string, secrets?: string[], projectId?: string): Promise<CreateTicketResult> {
+    async createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec): Promise<CreateTicketResult> {
       // Validate before accepting: a bad name or an unready project must not leave a ticket behind.
       if (secrets !== undefined) {
         const missing = [...new Set(secrets)].filter(name => !deps.vault.has(name))
@@ -723,7 +754,7 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
       let result: CreateTicketResult
       try {
         // Secrets and the project go in with the message so the first launch already has them.
-        result = await deps.ask(text, model, secrets, projectId)
+        result = await deps.ask(text, model, secrets, projectId, collab, goal)
       } catch (error) {
         if (error instanceof InvalidModelError) throw new AdminError('invalid', error.message, 400, { issues: error.issues })
         mapUserError(error)
@@ -817,6 +848,7 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
       } catch (error) {
         mapUserError(error)
       }
+      deps.goalReplied?.(id)
     },
 
     noteTicket(id: string, text: string): void {
@@ -827,16 +859,29 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
       }
     },
 
-    replyTicket(id: string, text: string): void {
+    replyTicket(id: string, text: string, model?: string): void {
       const current = deps.repo.tickets.get(id)
       if (!current) throw new AdminError('not_found', '找不到这张任务票。', 404)
+      // A different model chosen with the instruction applies from this round on; the same model changes nothing.
+      let switched = false
+      if (model !== undefined && model !== '' && model !== deps.ticketModel(current).ref) {
+        if (deps.chooseModel === undefined) throw new AdminError('invalid', '这台服务器不支持给任务换模型。', 400)
+        try {
+          deps.chooseModel(current, model)
+        } catch (error) {
+          if (error instanceof InvalidModelError) throw new AdminError('invalid', error.message, 400, { issues: error.issues })
+          throw error
+        }
+        switched = true
+      }
       // Whatever its state, a message written on the ticket page is an instruction for this ticket. Sending it down the
       // ticket's thread instead lets Eval read it as a new request and open an unrelated ticket (seen on the host).
       try {
-        deps.engine.instruct(id, text)
+        deps.engine.instruct(id, text, { restart: switched })
       } catch (error) {
         mapUserError(error)
       }
+      deps.goalReplied?.(id)
     },
 
     decisions(limit: number, offset = 0, kind?: string): DecisionView[] {

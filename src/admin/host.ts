@@ -9,6 +9,7 @@
 import type { AcceptMode, ActorRef, AssignmentState, DecisionKind, ReportState, Strength, TicketInput, TicketOutcome } from '../core/model.ts'
 import type { Reason } from '../core/reasons.ts'
 import type { TicketStage } from '../core/stage.ts'
+import type { GoalSpec } from '../goal/service.ts'
 
 /** A field-level problem attached to a rejected admin request. */
 export interface AdminIssue {
@@ -53,6 +54,25 @@ export interface SlotsInfo {
 }
 
 /** One open ticket that waits on a person because its worker failed, is blocked, or its input delivery failed. */
+/** The newest step of a running ticket, so the overview can show what it is doing. */
+export interface RunningStep {
+  id: string
+  /** Latest step's one-line summary; empty when the worker has not recorded a step yet. */
+  summary: string
+  kind: string
+  at: string
+  /** Tool name when the latest step is a tool call. */
+  tool?: string
+  /** Latest step's status: running, done or error. */
+  status?: string
+  /** When the running assignment started, so the console can show how long it has been working. */
+  since?: string
+  /** Model that made the latest step (the main worker), when Pi reported it. */
+  model?: string
+  /** When the latest step is a delegation: its sub-agents, each with model and state. */
+  agents?: { role: string; name?: string; model?: string; state: string }[]
+}
+
 export interface AttentionTicket {
   id: string
   title: string
@@ -66,6 +86,8 @@ export interface OverviewFacts {
   slots: SlotsInfo
   tickets: { open: number; running: number; needsPerson: number; endedToday: number }
   attentionTickets: AttentionTicket[]
+  /** Latest step per running ticket; absent when step recording is not wired. */
+  runningSteps?: RunningStep[]
   host: HostMetrics
   upstream: UpstreamStatus
 }
@@ -477,7 +499,7 @@ export interface BackupsResult {
   items: BackupItemView[]
 }
 
-export type SettingsSection = 'policy' | 'executor' | 'models' | 'budget' | 'pause' | 'feishu' | 'preview' | 'projects' | 'github' | 'email' | 'council'
+export type SettingsSection = 'policy' | 'executor' | 'models' | 'budget' | 'pause' | 'feishu' | 'preview' | 'projects' | 'github' | 'email' | 'council' | 'novel' | 'collab' | 'goal'
 
 /** Extra notification after a settings write succeeded and was persisted. */
 export interface AdminSettingsChange {
@@ -514,7 +536,7 @@ export interface AdminHost {
    * `secrets` grants existing secret names to the new ticket when one was created; an unknown name is a 400.
    * `projectId` must name a `ready` project: its tree is copied into the ticket workspace before the worker starts.
    */
-  createTicket(text: string, model?: string, secrets?: string[], projectId?: string): Promise<CreateTicketResult>
+  createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec): Promise<CreateTicketResult>
 
   /** Every stored secret, metadata only, sorted by name. */
   listSecrets(): SecretListItemView[]
@@ -550,7 +572,7 @@ export interface AdminHost {
   noteTicket(id: string, text: string): void
 
   /** Answer the worker on the ticket's original thread, as a person. Throws `AdminError` when it has no thread to answer on. */
-  replyTicket(id: string, text: string): void
+  replyTicket(id: string, text: string, model?: string): void
 
   /** The most recent decisions, newest first, with raw reason codes (the API translates them). */
   decisions(limit: number, offset?: number, kind?: string): DecisionView[]

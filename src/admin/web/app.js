@@ -23,6 +23,8 @@ import * as projectView from './views/project.js'
 import * as councilView from './views/council.js'
 import * as readerView from './views/reader.js'
 import * as connectionsView from './views/connections.js'
+import * as novelsView from './views/novels.js'
+import * as novelView from './views/novel.js'
 
 const query = new URLSearchParams(location.search)
 const mockMode = query.get('mock') === '1'
@@ -84,13 +86,15 @@ const VIEWS = {
   council: councilView,
   reader: readerView,
   connections: connectionsView,
+  novels: novelsView,
+  novel: novelView,
 }
 
 const TITLES = {
   today: '今日', tickets: '任务', ticket: '任务详情', new: '发任务',
   usage: '花费', decisions: '判断记录', events: '事件', more: '更多',
   settings: '设置', secrets: '密钥', system: '系统',
-  projects: '项目', project: '项目详情', council: '会商', reader: '文档', connections: '连接',
+  projects: '项目', project: '项目详情', council: '会商', reader: '文档', connections: '连接', novels: '书库', novel: '书页',
 }
 
 const TABS = [
@@ -118,6 +122,7 @@ const RAIL_GROUPS = [
   {
     title: '资源',
     items: [
+      { key: 'novels', label: '书库', href: '#/novels' },
       { key: 'connections', label: '连接', href: '#/connections' },
       { key: 'secrets', label: '密钥', href: '#/secrets' },
       { key: 'usage', label: '花费', href: '#/usage' },
@@ -209,6 +214,8 @@ function parseHash() {
   if (first === 'tickets') return { key: 'tickets', ...base('tickets') }
   if (first === 'projects' && second) return { key: 'project', params: { id: second }, base: 'projects', query: parsedQuery, fragment }
   if (first === 'projects') return { key: 'projects', ...base('projects') }
+  if (first === 'novels' && second) return { key: 'novel', params: { id: second, n: third }, base: 'novels', query: parsedQuery, fragment }
+  if (first === 'novels') return { key: 'novels', ...base('novels') }
   if (first === 'council' && second) return { key: 'council', params: { id: second }, base: 'tickets', query: parsedQuery, fragment }
   if (first === 'doc' && second && third) {
     const readerBase = second === 'project' ? 'projects' : 'tickets'
@@ -216,7 +223,7 @@ function parseHash() {
   }
   if (first === 'settings') {
     const tab = second === 'upstream' ? 'models' : (second ?? 'policy')
-    const known = ['policy', 'executor', 'models', 'budget', 'feishu', 'github', 'email', 'preview', 'projects', 'council', 'account']
+    const known = ['policy', 'executor', 'models', 'budget', 'feishu', 'github', 'email', 'preview', 'projects', 'council', 'novel', 'account']
     return { key: 'settings', params: { tab: known.includes(tab) ? tab : 'policy' }, base: 'settings', query: parsedQuery, fragment }
   }
   if (['today', 'new', 'usage', 'decisions', 'events', 'more', 'secrets', 'system', 'connections'].includes(first)) {
@@ -258,7 +265,7 @@ function toast(text, action) {
  * A confirmation sheet. Resolves with `{ [fieldId]: value }` (an empty object
  * when there is no field) or null when dismissed.
  */
-function sheet({ title, text = '', confirmLabel = '确定', cancelLabel = '再想想', danger = false, field }) {
+function sheet({ title, text = '', confirmLabel = '确定', cancelLabel = '再想想', danger = false, field, select }) {
   return new Promise((resolve) => {
     let settled = false
     const finish = (value) => {
@@ -283,6 +290,11 @@ function sheet({ title, text = '', confirmLabel = '确定', cancelLabel = '再�
           <label class="field__label" for="sheet-field">${esc(field.label)}</label>
           <input class="input" id="sheet-field" type="text" placeholder="${esc(field.placeholder ?? '')}">
         </div>` : ''}
+        ${select && Array.isArray(select.options) && select.options.length ? `<div class="field" style="margin-top:12px">
+          <label class="field__label" for="sheet-select">${esc(select.label)}</label>
+          <select class="select" id="sheet-select">${select.options.map((option) => `<option value="${esc(option.value)}"${option.value === select.value ? ' selected' : ''}>${esc(option.label)}</option>`).join('')}</select>
+          ${select.help ? `<p class="hint" style="margin-top:6px">${esc(select.help)}</p>` : ''}
+        </div>` : ''}
         <div class="sheet__actions">
           <button class="btn" type="button" data-sheet-cancel>${esc(cancelLabel)}</button>
           <button class="btn ${danger ? 'btn--danger' : 'btn--human'}" type="button" data-sheet-confirm>${esc(confirmLabel)}</button>
@@ -292,7 +304,10 @@ function sheet({ title, text = '', confirmLabel = '确定', cancelLabel = '再�
     sheetHost.querySelector('[data-sheet-cancel]').addEventListener('click', () => finish(null))
     sheetHost.querySelector('[data-sheet-cancel]:not(.sheet__backdrop)')?.focus?.()
     sheetHost.querySelector('[data-sheet-confirm]').addEventListener('click', () => {
-      finish(field ? { [field.id ?? 'value']: input?.value?.trim() ?? '' } : {})
+      const values = field ? { [field.id ?? 'value']: input?.value?.trim() ?? '' } : {}
+      const picked = sheetHost.querySelector('#sheet-select')
+      if (select && picked) values[select.id ?? 'choice'] = picked.value
+      finish(values)
     })
     sheetHost.querySelector('.sheet__backdrop').addEventListener('click', () => finish(null))
   })

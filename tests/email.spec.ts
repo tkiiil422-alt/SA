@@ -248,6 +248,23 @@ describe('EmailSource attachments', () => {
 })
 
 describe('EmailSource delivery and status', () => {
+  it('sends a new mail from the bound address to any recipient, and scrubs the password from failures', async () => {
+    const h = harness([])
+    await h.source.sendNew({ to: ['someone@qq.com'], subject: '你好', text: '我来了', ticketId: 't1' })
+    expect(h.smtp.sent).toHaveLength(1)
+    expect(h.smtp.sent[0]).toMatchObject({ from: '"Me" <me@example.com>', to: 'someone@qq.com', subject: '你好', text: '我来了' })
+    expect(h.smtp.sent[0]!.inReplyTo).toBeUndefined()
+    expect(h.events.map(event => event.kind)).toEqual(['email.sent'])
+
+    h.smtp.send = async () => { throw new Error(`auth failed for ${PASSWORD}`) }
+    const failure = await h.source.sendNew({ to: ['someone@qq.com'], subject: 'x', text: 'y' }).catch(error => error as Error)
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).message).not.toContain(PASSWORD)
+
+    const off = harness([], { cfg: { enabled: false } })
+    await expect(off.source.sendNew({ to: ['a@b.com'], subject: 'x', text: 'y' })).rejects.toThrow('没有启用')
+  })
+
   it('replies in thread with In-Reply-To/References and a Re: subject', async () => {
     const h = harness([])
     await h.source.deliver({

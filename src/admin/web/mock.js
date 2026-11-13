@@ -61,6 +61,7 @@ import { createState, detail, clone, round4, todayKey, DAY_MS } from './mock-dat
 import { install as installMockProjects } from './mock-projects.js'
 import { install as installMockCouncil } from './mock-council.js'
 import { install as installMockReader } from './mock-reader.js'
+import { install as installMockNovels } from './mock-novels.js'
 
 function ticketSummary(ticket) {
   return {
@@ -579,7 +580,7 @@ export function installMock(params = new URLSearchParams(globalThis.location?.se
     fail: failBody,
     addEvent,
   }
-  for (const install of [installMockProjects, installMockCouncil, installMockReader]) {
+  for (const install of [installMockProjects, installMockCouncil, installMockReader, installMockNovels]) {
     try { install(registry) } catch (error) { console.error('[mock] feature module failed to install', error) }
   }
 

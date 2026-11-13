@@ -85,6 +85,18 @@ describe('discoverModels', () => {
     expect(result.models.find(m => m.id === 'plain')).toEqual({ id: 'plain' })
   })
 
+  it('reads OpenCode-style cost.text prices, already per million tokens', async () => {
+    const base = await serve((_req, res) => json(res, 200, {
+      data: [
+        { id: 'glm-5.3-flash', cost: { text: { input: { price: 0.15, cache: { read: 0.03 } }, output: { price: 0.5 } }, multipliers: [] } },
+        { id: 'no-cache', cost: { text: { input: { price: 1 }, output: { price: 2 } } } },
+      ],
+    }))
+    const result = await discoverModels({ api: 'openai-completions', baseUrl: base, apiKey: '' }, { timeoutMs: 5000 })
+    expect(result.models.find(m => m.id === 'glm-5.3-flash')?.price).toEqual({ input: 0.15, cacheRead: 0.03, output: 0.5 })
+    expect(result.models.find(m => m.id === 'no-cache')?.price).toEqual({ input: 1, cacheRead: 1, output: 2 })
+  })
+
   it('pages through anthropic models with x-api-key and anthropic-version', async () => {
     const urls: string[] = []
     const keys: Array<string | undefined> = []

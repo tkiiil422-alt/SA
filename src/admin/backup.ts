@@ -6,7 +6,7 @@
  * directories. Archives live in one directory, are mode 0600, and only the newest `keep` are retained.
  */
 import { execFile } from 'node:child_process'
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { chmodSync, copyFileSync, cpSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
@@ -27,7 +27,16 @@ export interface CreateBackupOptions {
   now?: () => Date
   /** How many archives to keep after the new one is written. Default 7. */
   keep?: number
+  /**
+   * The book library (`<stateDir>/novels`), when the novel engine exists. Each book's `book.json`, `canon/`, `chapters/`
+   * and `summaries/` are archived under `novels/<bookId>/`; rollback snapshots and in-progress work files are not.
+   */
+  novelsDir?: string
 }
+
+/** Parts of a book folder that belong in a backup. */
+const BOOK_PARTS = ['book.json', 'canon', 'chapters', 'summaries'] as const
+const BOOK_ID = /^b_[A-Za-z0-9]{1,32}$/
 
 /** Archive names produced by {@link createBackup}; anything else in the directory is ignored. */
 const NAME = /^state-\d{8}-\d{6}\.tgz$/
@@ -78,6 +87,32 @@ export function listBackups(dir: string): BackupItem[] {
   return items.sort((a, b) => a.name < b.name ? 1 : a.name > b.name ? -1 : 0)
 }
 
+/** Copy the backed-up parts of every book; symbolic links are never followed, and a missing library is skipped. */
+function copyBooks(source: string, target: string): void {
+  let books: string[]
+  try {
+    books = readdirSync(source)
+  } catch {
+    return
+  }
+  for (const bookId of books) {
+    if (!BOOK_ID.test(bookId)) continue
+    for (const part of BOOK_PARTS) {
+      const from = join(source, bookId, part)
+      try {
+        const info = lstatSync(from)
+        if (info.isSymbolicLink()) continue
+        cpSync(from, join(target, bookId, part), {
+          recursive: true,
+          filter: path => !lstatSync(path).isSymbolicLink(),
+        })
+      } catch {
+        // A part that does not exist yet (a book still drafting) is skipped.
+      }
+    }
+  }
+}
+
 /**
  * Write one archive and prune old ones. The SQLite snapshot is made with `VACUUM INTO`; the configuration files are
  * copied only when they exist. Throws when `tar` fails or the snapshot cannot be written.
@@ -115,6 +150,8 @@ export async function createBackup(options: CreateBackupOptions): Promise<Backup
         // The file is optional.
       }
     }
+
+    if (options.novelsDir !== undefined) copyBooks(options.novelsDir, join(staging, 'novels'))
 
     const name = `state-${stamp(now)}.tgz`
     const target = join(options.backupDir, name)

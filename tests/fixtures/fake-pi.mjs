@@ -35,6 +35,13 @@ function send(record) {
   process.stdout.write(`${JSON.stringify(record)}\n`)
 }
 
+// FAKE_PI_ENV_LOG=<path>: append the launch environment the runtime gave this worker (tests reuse its ticket token).
+if (process.env.FAKE_PI_ENV_LOG) {
+  appendFileSync(process.env.FAKE_PI_ENV_LOG, `${JSON.stringify({
+    token: process.env.SA_TICKET_TOKEN ?? '', mcp: process.env.SA_MCP_URL ?? '', gateway: process.env.SA_GATEWAY_URL ?? '',
+    dir: process.env.PI_CODING_AGENT_DIR ?? '', image: process.env.SA_PI_IMAGE ?? '', args: process.argv.slice(2),
+  })}\n`)
+}
 const logFile = process.env.FAKE_PI_LOG
 function log(command) {
   if (!logFile) return
@@ -73,9 +80,23 @@ function stopRun(aborted) {
   running = false
 }
 
+// FAKE_PI_MODEL_ERRORS=<n>: the first n runs end on a model error (stopReason "error") without a report.
+let modelErrorsLeft = Number(process.env.FAKE_PI_MODEL_ERRORS ?? 0)
+
 function startRun(id) {
   running = true
   respond(id, 'prompt', { disposition: 'started' })
+  if (modelErrorsLeft > 0) {
+    modelErrorsLeft -= 1
+    schedule(() => {
+      send({ type: 'agent_start' })
+      send({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '502: bad gateway' } })
+      send({ type: 'agent_end', messages: [], willRetry: false })
+      send({ type: 'agent_settled', aborted: false })
+      running = false
+    }, 5)
+    return
+  }
   schedule(() => {
     send({ type: 'agent_start' })
     if (crash) {

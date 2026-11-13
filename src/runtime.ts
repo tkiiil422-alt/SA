@@ -13,10 +13,11 @@
 import { randomBytes } from 'node:crypto'
 import { chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { createBackup, listBackups } from './admin/backup.ts'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { fileURLToPath } from 'node:url'
-import { Engine, UserError, canRetry, key, latestReport, threadKey, ticketStage, waitsForPerson } from './core/index.ts'
+import { Engine, UserError, canRetry, key, latestAssignment, latestReport, threadKey, ticketStage, waitsForPerson } from './core/index.ts'
 import { Ledger } from './ledger/ledger.ts'
 import { EventLog, describeDomainEvent } from './ledger/events.ts'
 import { AdminAuth, createCliToken } from './admin/auth.ts'
@@ -27,6 +28,11 @@ import { TicketLinks } from './admin/links.ts'
 import { PreviewStore, createPreviewProxy } from './admin/preview.ts'
 import { ProjectService } from './projects/service.ts'
 import { CouncilService } from './council/service.ts'
+import { NovelStore } from './novel/store.ts'
+import { NovelExecutor } from './novel/executor.ts'
+import { NovelService } from './novel/service.ts'
+import { BookFiles } from './novel/files.ts'
+import type { Role as NovelRole } from './novel/pipeline.ts'
 import { readProjectProfile } from './council/profile.ts'
 import { createAdminApi } from './admin/api.ts'
 import { createAdminServer, type AdminServer } from './admin/server.ts'
@@ -39,6 +45,12 @@ import { SqliteRepositories } from './store/sqlite.ts'
 import { Effects } from './effects/effects.ts'
 import { PiExecutor } from './executor/pi-executor.ts'
 import { ActivityLog } from './executor/activity.ts'
+import { FanqieService } from './fanqie/service.ts'
+import { PiVersionService } from './executor/pi-versions.ts'
+import { CollabChoices, collabFile, splitAgentToken } from './executor/collab.ts'
+import { GoalService, type GoalSpec, type JudgeInput, type JudgeResult } from './goal/service.ts'
+import { JUDGE_SYSTEM, judgeUser, parseVerdict } from './goal/judge.ts'
+import { containerContext, containerRunner, localRunner } from './goal/runner.ts'
 import { createGateway, type Gateway } from './gateway/gateway.ts'
 import { createWorkerMcpServer, type WorkerMcpServer } from './mcp/worker-server.ts'
 import { CliSource } from './sources/cli.ts'
@@ -63,6 +75,9 @@ interface TokenEntry {
   assignmentId: string
   role: string
 }
+
+/** Pi extension behind multi-model collaboration; copied into each ticket's Pi config directory at launch. */
+const COLLAB_EXTENSION = join(dirname(fileURLToPath(import.meta.url)), '..', 'deploy', 'pi-ext', 'collab.ts')
 
 /** Version reported to the console and written into the start event. */
 export const VERSION = '0.1.0'
@@ -240,6 +255,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     if (seededKey) defaults.models.providers[0]!.apiKey = seededKey
     // Per-ticket model choices, keyed by trigger id; they share the runtime database.
     const choices = new ModelChoices(repo.db)
+    const collabChoices = new CollabChoices(repo.db)
     /** Secrets requested with a new ticket, keyed by its trigger id until the first launch grants them. */
     const pendingSecrets = new Map<string, string[]>()
     const optionsStore = new OptionsStore(join(stateDir, 'options.json'), defaults)
@@ -251,6 +267,12 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       limits: () => optionsStore.get().projects,
     })
     cleanup.push(() => projects.close())
+    // Books live under the state directory, never in a ticket workspace, so deleting a ticket never deletes a book.
+    const novelRoot = join(stateDir, 'novels')
+    const novelStore = new NovelStore(repo.db)
+    /** Whether a ticket writes a book (bound at `ask`, before the engine receives the trigger). */
+    const novelTicket = (ticket: { id: string; origin: { triggerId: string } }): boolean =>
+      novelStore.byTicket(ticket.id) !== undefined || novelStore.byTrigger(ticket.origin.triggerId) !== undefined
     const auth = new AdminAuth({ stateDir })
     const cliToken = createCliToken(stateDir)
     const cliTokenFile = join(stateDir, 'cli-token')
@@ -274,7 +296,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     const backupDir = process.env.SA_BACKUP_DIR ?? join(homedir(), 'superagent-backups')
     const runBackup = async (why: string): Promise<void> => {
       try {
-        const item = await createBackup({ stateDir, backupDir, db: repo.db })
+        const item = await createBackup({ stateDir, backupDir, db: repo.db, novelsDir: novelRoot })
         try {
           events.add({
             kind: 'system.backup', level: 'info', text: `已备份状态：${item.name}`,
@@ -320,6 +342,8 @@ export async function createRuntime(config: Config): Promise<Runtime> {
      */
     const continueFeishu = (trigger: Trigger): { ticketId: string; title: string } | undefined => {
       if (trigger.source !== FEISHU_SOURCE || trigger.meta.chatType !== 'p2p') return undefined
+      // Only a message that starts with 小说： continues a book's ticket, and such a message continues nothing else.
+      const forNovel = /^小说[:：\s]/.test(trigger.text)
       const intent = continuationIntent(trigger.text)
       trigger.text = intent.text
       if (intent.kind === 'new' || !allowedSender(settings, trigger.actor)) return undefined
@@ -329,6 +353,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       const candidates: ContinuationCandidate[] = []
       const titles = new Map<string, string>()
       for (const ticket of repo.tickets.list()) {
+        if (novelTicket(ticket) !== forNovel) continue
         const threads = new Set<string>()
         for (const channel of ticket.channels) {
           if (channel.source === FEISHU_SOURCE && channel.thread.startsWith(prefix)) threads.add(channel.thread)
@@ -496,6 +521,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
 
     let engine!: Engine
     let executor!: PiExecutor
+    let novelExecutor!: NovelExecutor
     // Preview links and their host ports live beside the tickets; `isRunning` reads the executor once it exists.
     const previews = new PreviewStore({
       db: repo.db,
@@ -504,10 +530,13 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     })
     // The Engine needs an Executor at construction; the real PiExecutor is built after the gateway and MCP ports exist.
     // Nothing calls these methods before `effects.start()`, which is the last startup step.
+    // A ticket bound to a book goes to the novel executor; every other ticket goes to Pi exactly as before.
+    const executorFor = (ticket: { id: string; origin: { triggerId: string } }): Executor =>
+      novelTicket(ticket) ? novelExecutor : executor
     const executorPort: Executor = {
-      start: (ticket, assignment) => executor.start(ticket, assignment),
-      deliver: (ticket, assignment) => executor.deliver(ticket, assignment),
-      stop: (ticket, assignment, reason) => executor.stop(ticket, assignment, reason),
+      start: (ticket, assignment) => executorFor(ticket).start(ticket, assignment),
+      deliver: (ticket, assignment) => executorFor(ticket).deliver(ticket, assignment),
+      stop: (ticket, assignment, reason) => executorFor(ticket).stop(ticket, assignment, reason),
     }
     /** The price of a model at a provider, read live from the console's options. */
     const priceOf = (providerId: string, modelId: string) =>
@@ -670,22 +699,28 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         if (!provider || !provider.enabled) return undefined
         return { api: provider.api, baseUrl: provider.baseUrl, apiKey: provider.apiKey, models: provider.models.map(m => m.id) }
       },
-      upstreamHeaders: (auth: { ticketId: string }, providerId: string) => {
+      upstreamHeaders: (auth: { ticketId: string; agent?: string }, providerId: string) => {
         const provider = optionsStore.get().models.providers.find(p => p.id === providerId)
-        return provider?.sessionHeader ? { [provider.sessionHeader]: auth.ticketId } : {}
+        // Each sub-agent role gets its own upstream session, so roles never evict each other's prompt cache.
+        const session = auth.agent ? `${auth.ticketId}-${auth.agent}` : auth.ticketId
+        return provider?.sessionHeader ? { [provider.sessionHeader]: session } : {}
       },
       price: (providerId, model) => priceOf(providerId, model),
       authorize: token => {
-        const entry = tokens.get(token)
-        if (!entry) return { denied: 'unknown' }
+        // A sub-agent's token is the ticket token plus `.<role>` (tokens are base64url, so never contain a dot): same
+        // ticket, same budget, booked under that role. The worker MCP endpoint never accepts the suffixed form.
+        const split = splitAgentToken(token)
+        const entry = split ? tokens.get(split.token) : undefined
+        if (!split || !entry) return { denied: 'unknown' }
         if (!checkBudget(entry.ticketId)) return { denied: 'budget' }
-        return { ticketId: entry.ticketId, role: entry.role }
+        return { ticketId: entry.ticketId, role: entry.role, ...(split.agent ? { agent: split.agent } : {}) }
       },
       record: entry => {
         const usage = entry.usage
         try {
           ledger.record({
             at: entry.at, ticketId: entry.ticketId, provider: entry.provider, model: entry.model || '(none)', status: entry.status,
+            agent: entry.agent ?? '',
             promptHit: usage?.prompt_cache_hit_tokens ?? 0, promptMiss: usage?.prompt_cache_miss_tokens ?? 0,
             completion: usage?.completion_tokens ?? 0, costUsd: entry.costUsd, latencyMs: entry.latencyMs,
           })
@@ -695,13 +730,89 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         const detail = usage
           ? `hit=${usage.prompt_cache_hit_tokens} miss=${usage.prompt_cache_miss_tokens} out=${usage.completion_tokens}`
           : 'usage=unknown'
-        console.log(`superagentd: upstream ${entry.status} ${entry.model || '(no model)'} ${detail} $${entry.costUsd.toFixed(6)} ${entry.latencyMs}ms ticket=${entry.ticketId}`)
+        console.log(`superagentd: upstream ${entry.status} ${entry.model || '(no model)'} ${detail} $${entry.costUsd.toFixed(6)} ${entry.latencyMs}ms ticket=${entry.ticketId}${entry.agent ? ` agent=${entry.agent}` : ''}`)
       },
     })
     cleanup.push(() => gateway.close())
     const gatewayPort = (await gateway.listen()).port
     const gatewayUrl = `http://127.0.0.1:${gatewayPort}`
 
+    // Ticket goals: a goal must be reached before the ticket ends (see src/goal/service.ts). Acceptance commands run in the
+    // worker's own container when workers run in containers, else in the ticket's workspace on this machine.
+    const goalsInContainers = basename(config.launcher.command) === 'pi-container.sh'
+    const judgeGoal = async (input: JudgeInput): Promise<JudgeResult> => {
+      const models = optionsStore.get().models
+      const configured = optionsStore.get().goal.judge
+      const ticketRow = repo.tickets.get(input.ticketId)
+      const ref: ModelRef = configured !== null && findModel(models, configured, { enabledOnly: true }) !== undefined
+        ? configured
+        : ticketRow ? resolveTicketModel(ticketRow).ref : models.routing.worker
+      const found = findModel(models, ref, { enabledOnly: true })
+      if (!found) return { ok: false, error: '没有可用的判定模型' }
+      const { provider, model } = found
+      const target: ModelTarget = {
+        api: provider.api,
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey,
+        ...(provider.sessionHeader ? { sessionHeader: provider.sessionHeader } : {}),
+      }
+      const result = await callModel(target, {
+        model: model.id, system: JUDGE_SYSTEM, user: judgeUser(input), maxTokens: Math.min(12_000, model.maxTokens),
+      }, { timeoutMs: 180_000, stream: true, sessionId: `${input.ticketId}-goal` })
+      try {
+        const price = priceOf(provider.id, model.id)
+        ledger.record({
+          at: new Date().toISOString(), ticketId: input.ticketId, agent: 'goal', provider: provider.id, model: model.id,
+          status: result.status ?? 0,
+          promptHit: result.usage?.prompt_cache_hit_tokens ?? 0,
+          promptMiss: result.usage?.prompt_cache_miss_tokens ?? 0,
+          completion: result.usage?.completion_tokens ?? 0,
+          costUsd: result.usage && price ? costOf(price, result.usage) : 0,
+          latencyMs: result.latencyMs,
+        })
+      } catch (error) {
+        console.error(`superagentd: goal judge ledger write failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      if (!result.ok) return { ok: false, error: result.error ?? `上游返回 ${result.status ?? '错误'}` }
+      const verdict = parseVerdict(result.text)
+      return verdict ? { ok: true, verdict } : { ok: false, error: `判定模型的回答不是合法的 JSON：${result.text.slice(0, 120)}` }
+    }
+    const goals = new GoalService({
+      db: repo.db,
+      ticket: id => {
+        const value = repo.tickets.get(id)
+        if (!value) return undefined
+        const report = latestAssignment(value)?.report
+        return {
+          triggerId: value.origin.triggerId,
+          ended: value.ended !== undefined,
+          waitsForPerson: waitsForPerson(value),
+          ...(value.attention ? { question: value.attention.question } : {}),
+          undelivered: value.undelivered.length,
+          ...(report ? { report: { state: report.state, at: report.at } } : {}),
+        }
+      },
+      spend: id => ledger.ticketTotals(id).usd,
+      settings: () => optionsStore.get().goal,
+      run: goalsInContainers ? containerRunner() : localRunner(id => join(workspaceRoot, id)),
+      ...(goalsInContainers ? { context: containerContext() } : {}),
+      judge: judgeGoal,
+      report: (id, report) => { engine.report(id, report) },
+      step: (id, summary, detail, status) => {
+        try { activity.goal(id, summary, detail, status) } catch { /* the step log is a view */ }
+      },
+      event: (id, level, text) => {
+        try { events.add({ kind: 'goal', ticketId: id, level, text }) } catch { /* best effort */ }
+      },
+      notify: (id, text) => {
+        try { engine.note(id, text) } catch { /* the ticket moved on */ }
+      },
+    })
+    /** The goal goes to the worker as an addition to its system prompt, on every launch while it is pursued. */
+    const goalArgs = (ticketId: string): string[] => {
+      const text = goals.systemPrompt(ticketId)
+      return text ? ['--append-system-prompt', text] : []
+    }
     const mcp = createWorkerMcpServer({
       engine,
       authorize: token => {
@@ -710,6 +821,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       },
       // A report is redacted before the Engine stores it, so the value never reaches the ticket detail or a channel.
       redact: text => vault.redactSecrets(text),
+      gate: (ticketId, report) => goals.gate(ticketId, report),
       secretStore: (ticketId, input) => {
         try {
           vault.create(input.name, input.value, input.description ?? '', 'ai')
@@ -796,6 +908,21 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         }
         return result
       },
+      emailSend: async (ticketId, input) => {
+        if (!repo.tickets.get(ticketId)) return { ok: false, message: '找不到这张任务票。' }
+        try {
+          await email.sendNew({ ...input, ticketId })
+          try {
+            events.add({
+              kind: 'email.sent', level: 'info', ticketId,
+              text: `已发邮件给 ${input.to.join('、')}：${input.subject.slice(0, 60)}`, data: { ticketId, to: input.to },
+            })
+          } catch { /* the mail is sent; the log line is best effort */ }
+          return { ok: true }
+        } catch (error) {
+          return { ok: false, message: error instanceof Error ? error.message : String(error) }
+        }
+      },
       onError: error => console.error(`superagentd: MCP tool failed: ${error instanceof Error ? error.message : String(error)}`),
     })
     cleanup.push(() => mcp.close())
@@ -803,7 +930,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     const mcpUrl = `http://127.0.0.1:${mcpPort}/mcp`
 
     // Each worker's recent steps (tool calls, output tails, what it says), kept in memory for the task detail page.
-    const activity = new ActivityLog()
+    const activity = new ActivityLog(undefined, repo.db)
     executor = new PiExecutor({
       effects,
       engine: () => engine,
@@ -822,7 +949,8 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         }
         const mcpConfig = {
           mcpServers: {
-            superagent: { url: mcpUrl, headers: { Authorization: 'Bearer ${SA_TICKET_TOKEN}' }, exposure: 'direct' },
+            // A goal check runs inside `sa_report` and can take many minutes; Pi's default MCP timeout is 60 s.
+            superagent: { url: mcpUrl, headers: { Authorization: 'Bearer ${SA_TICKET_TOKEN}' }, exposure: 'direct', timeout: 3600 },
           },
         }
         writeFileSync(join(directory, 'models.json'), `${JSON.stringify(models, null, 2)}\n`)
@@ -860,14 +988,36 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         const secretEnv = vault.launchEnv(ticket.id)
         const usedAt = new Date().toISOString()
         for (const name of secretEnv.names) vault.markUsed(name, usedAt, ticket.id)
+        // Collaboration: Pi discovers the extension in its config directory; `collab.json` carries the role table and
+        // the names (never values) of the granted secrets, which roles that cannot write do not get. Off means neither.
+        const collabDir = join(directory, 'extensions', 'sa-collab')
+        const collabOptions = optionsStore.get().collab
+        try {
+          if (collabOptions.enabled && !collabChoices.isOff(ticket.origin.triggerId)) {
+            mkdirSync(collabDir, { recursive: true })
+            copyFileSync(COLLAB_EXTENSION, join(collabDir, 'index.ts'))
+            const usable = (ref: ModelRef): boolean => findModel(optionsStore.get().models, ref, { enabledOnly: true }) !== undefined
+            const table = collabFile(collabOptions, usable, picked.ref, secretEnv.names)
+            writeFileSync(join(directory, 'collab.json'), `${JSON.stringify(table, null, 2)}\n`)
+          } else {
+            rmSync(collabDir, { recursive: true, force: true })
+            rmSync(join(directory, 'collab.json'), { force: true })
+          }
+        } catch (error) {
+          // Without its role table the extension registers nothing, so the ticket simply runs without helpers.
+          rmSync(join(directory, 'collab.json'), { force: true })
+          console.error(`superagentd: collaboration setup failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
         // Preview ports are allocated before the container starts; pasta forwards them from the host's loopback.
         const previewOptions = optionsStore.get().preview
         const previewPorts = previewOptions.enabled ? await previews.allocate(ticket.id) : []
         return {
           command: config.launcher.command,
-          args: launchArgs(config.launcher.args, picked.ref, context.resume),
+          args: [...launchArgs(config.launcher.args, picked.ref, context.resume), ...goalArgs(ticket.id)],
           env: {
             ...config.launcher.env,
+            // The console's Pi version page switches this; it wins over the config file so the switch takes effect.
+            SA_PI_IMAGE: optionsStore.get().executor.image,
             ...secretEnv.env,
             SA_TICKET_TOKEN: token,
             SA_MCP_URL: mcpUrl,
@@ -884,8 +1034,121 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       tickets: repo.tickets,
       triggers: repo.triggers,
       activity,
+      afterTurn: (ticketId, turnAt) => goals.afterTurn(ticketId, turnAt),
+      keepAlive: ticketId => goals.isChecking(ticketId),
     })
     cleanup.push(() => executor.close())
+
+    // The novel engine: resolved models, ledger rows under the arc ticket, and its own budget on top of the global one.
+    const resolveNovel = (role: NovelRole, bookId: string): { provider: string; model: string; target: ModelTarget } | undefined => {
+      const opts = optionsStore.get()
+      // `bookId` is reserved for a per-book writer override (book.json `models.writer`), read when one is set.
+      let ref: ModelRef = opts.novel.models[role] ?? opts.models.routing.worker
+      if (role === 'writer' && bookId) {
+        try {
+          const own = parseRef(new BookFiles(novelRoot, bookId).readBook().models?.writer ?? '')
+          if (own) ref = own
+        } catch { /* no such book yet (setup drafting) */ }
+      }
+      let found = findModel(opts.models, ref, { enabledOnly: true })
+      if (!found) {
+        ref = opts.models.routing.worker
+        found = findModel(opts.models, ref, { enabledOnly: true })
+      }
+      if (!found) return undefined
+      return {
+        provider: found.provider.id,
+        model: found.model.id,
+        target: {
+          api: found.provider.api,
+          baseUrl: found.provider.baseUrl,
+          apiKey: found.provider.apiKey,
+          ...(found.provider.sessionHeader ? { sessionHeader: found.provider.sessionHeader } : {}),
+        },
+      }
+    }
+    const recordNovel = (entry: { ticketId: string; provider: string; model: string; status: number; usage?: { prompt_tokens: number; completion_tokens: number; prompt_cache_hit_tokens: number; prompt_cache_miss_tokens: number }; latencyMs: number }): number => {
+      const price = priceOf(entry.provider, entry.model)
+      const cost = entry.usage && price ? costOf(price, entry.usage) : 0
+      ledger.record({
+        at: new Date().toISOString(),
+        ticketId: entry.ticketId,
+        provider: entry.provider,
+        model: entry.model,
+        status: entry.status,
+        promptHit: entry.usage?.prompt_cache_hit_tokens ?? 0,
+        promptMiss: entry.usage?.prompt_cache_miss_tokens ?? 0,
+        completion: entry.usage?.completion_tokens ?? 0,
+        costUsd: cost,
+        latencyMs: entry.latencyMs,
+      })
+      return cost
+    }
+    novelExecutor = new NovelExecutor({
+      effects,
+      engine: () => engine,
+      atomic: work => repo.atomic(work),
+      afterCommit: fn => repo.afterCommit(fn),
+      tickets: repo.tickets,
+      triggers: repo.triggers,
+      store: novelStore,
+      db: repo.db,
+      root: novelRoot,
+      resolve: resolveNovel,
+      record: recordNovel,
+      step: (ticketId, summary) => activity.note(ticketId, summary),
+      budget: ticketId => {
+        const opts = optionsStore.get()
+        return NovelService.budget({
+          db: repo.db,
+          ticketId,
+          bookId: novelStore.byTicket(ticketId)?.bookId,
+          now: new Date(),
+          novel: opts.novel,
+          global: opts.budget,
+          ticketUsd: id => ledger.ticketTotals(id).usd,
+          globalDayUsd: () => ledger.dayUsd(),
+        })
+      },
+      maxActive: () => optionsStore.get().novel.maxActiveBooks,
+      writerOptions: () => {
+        const novel = optionsStore.get().novel
+        return { maxRevisions: novel.maxRevisions, minScore: novel.minScore, extraBanned: novel.extraBanned }
+      },
+      onError: error => console.error(`superagentd: novel: ${error instanceof Error ? error.message : String(error)}`),
+    })
+    cleanup.push(() => novelExecutor.close())
+    const novels = new NovelService({
+      db: repo.db,
+      store: novelStore,
+      root: novelRoot,
+      enabled: () => optionsStore.get().novel.enabled,
+      resolve: resolveNovel,
+      record: recordNovel,
+      startArc: (text, bind) => ask(text, { novel: bind }),
+      writing: bookId => novelExecutor.writing(bookId),
+      dayUsd: () => NovelService.dayUsd(repo.db, new Date()),
+      dailyUsd: () => optionsStore.get().novel.dailyUsd,
+      onError: error => console.error(`superagentd: novel setup: ${error instanceof Error ? error.message : String(error)}`),
+    })
+    const fanqie = new FanqieService({
+      db: repo.db, vault, novels,
+      event: (kind, level, text) => { try { events.add({ kind, level, text }) } catch { /* best effort */ } },
+    })
+    // Pi version page: detect the version in the worker image, build a new one, switch new tickets over to it.
+    const deployDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'deploy')
+    const piVersions = new PiVersionService({
+      getImage: () => optionsStore.get().executor.image,
+      setImage: image => { optionsStore.update('executor', { ...optionsStore.get().executor, image }) },
+      containerfile: join(deployDir, 'Containerfile.pi'),
+      context: deployDir,
+      extension: COLLAB_EXTENSION,
+      note: (level, text, data) => { try { events.add({ kind: 'system.pi', level, text, ...(data ? { data } : {}) }) } catch { /* best effort */ } },
+    })
+    // Keep-alive: an authenticated call every 30 minutes keeps the login warm and notices expiry early.
+    const fanqieTimer = setInterval(() => { if (fanqie.hasCookie()) void fanqie.check().catch(() => undefined) }, 30 * 60_000)
+    fanqieTimer.unref()
+    cleanup.push(() => clearInterval(fanqieTimer))
     // The worker limit follows the console at once; running workers are not interrupted.
     const offOptions = optionsStore.onChange((section, next) => {
       if (section === 'executor') executor.setMaxSlots(next.executor.maxWorkers)
@@ -893,6 +1156,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     cleanup.push(offOptions)
 
     executor.resume()
+    novelExecutor.resume()
     engine.evaluateDue()
 
     const passTimer = setInterval(() => {
@@ -951,7 +1215,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     syncEmail()
 
     const sleep = (ms: number): Promise<void> => new Promise(resolveSleep => setTimeout(resolveSleep, ms))
-    const ask = async (text: string, opts: { model?: string; secrets?: string[]; projectId?: string } = {}): Promise<AskResult> => {
+    const ask = async (text: string, opts: { model?: string; secrets?: string[]; projectId?: string; collab?: boolean; goal?: GoalSpec; novel?: { bookId: string; arc: number } } = {}): Promise<AskResult> => {
       let personRef: ModelRef | undefined
       if (opts.model !== undefined) {
         const parsedRef = parseRef(opts.model)
@@ -965,6 +1229,12 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       if (opts.secrets && opts.secrets.length > 0) pendingSecrets.set(trigger.id, [...new Set(opts.secrets)])
       // The project is keyed by trigger id for the same reason: the launch can happen before the ticket id is known.
       if (opts.projectId !== undefined) projects.setPending(trigger.id, opts.projectId)
+      // Collaboration is on unless switched off for this ticket; the launch reads the choice by trigger id.
+      if (opts.collab === false) collabChoices.setOff(trigger.id)
+      // A goal is keyed by trigger id too, so the first launch already tells the worker about it.
+      if (opts.goal !== undefined) goals.setPending(trigger.id, opts.goal)
+      // A book is bound the same way, so the first launch already routes to the novel executor.
+      if (opts.novel !== undefined) novelStore.bindPending(trigger.id, opts.novel.bookId, opts.novel.arc, new Date().toISOString())
       const receive = engine.receive(trigger)
       if (receive === 'stored') {
         engine.evaluateDue()
@@ -990,6 +1260,13 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       if (opts.projectId !== undefined) {
         if (result.ticketId !== undefined) projects.bindTicket(result.ticketId, opts.projectId)
         else projects.clearPendingTrigger(trigger.id)
+      }
+      if (opts.novel !== undefined) {
+        if (result.ticketId !== undefined) {
+          if (novelStore.byTrigger(trigger.id)?.ticketId === undefined) novelStore.bindTicket(trigger.id, result.ticketId)
+        } else {
+          novelStore.clearPending(trigger.id)
+        }
       }
       return result
     }
@@ -1145,7 +1422,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       set: (next: typeof settings) => { saveSettings(settingsPath, next); settings = next },
     }
     const adminHost = createRuntimeAdminHost({
-      repo, engine, outbox, ledger, events, options: optionsStore, vault, previews, links, projects,
+      repo, engine, outbox, ledger, events, options: optionsStore, vault, previews, links, projects, activity,
       settings: settingsHolder,
       source: composite,
       testFeishu: () => feishu.test(),
@@ -1157,12 +1434,15 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         if (cfg.enabled && cfg.mode === 'ws') await feishuWs.restart()
         else feishuWs.stop()
       },
-      ask: (text, model, secrets, projectId) => ask(text, {
+      ask: (text, model, secrets, projectId, collab, goal) => ask(text, {
+        ...(goal === undefined ? {} : { goal }),
         ...(model === undefined ? {} : { model }),
         ...(secrets === undefined ? {} : { secrets }),
         ...(projectId === undefined ? {} : { projectId }),
+        ...(collab === undefined ? {} : { collab }),
       }),
       reply: replyOnTicket,
+      goalReplied: ticketId => { goals.personReplied(ticketId) },
       slots: () => executor.slots(),
       startedAt,
       version: VERSION,
@@ -1179,9 +1459,17 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         const info = resolveTicketModel(ticket)
         return { ...info, ref: formatRef(info.ref) }
       },
+      // A person's model switch is stored on the ticket's origin trigger, which every later launch reads.
+      chooseModel: (ticket, refText) => {
+        const parsed = parseRef(refText)
+        if (!parsed || !findModel(optionsStore.get().models, parsed, { enabledOnly: true })) throw new InvalidModelError()
+        choices.set(ticket.origin.triggerId, { ...parsed, source: 'person', reason: '在任务里换了模型' })
+      },
     })
-    const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity })
+    const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity, novels, fanqie, piVersions, goals })
     const webRoot = join(dirname(fileURLToPath(import.meta.url)), 'admin', 'web')
+    // The new console is the default; SA_WEB=legacy puts the old one back at the root. The old one stays at /legacy/.
+    const legacyDefault = process.env.SA_WEB === 'legacy'
     // Public preview links sit outside `/api` too: the token is the credential, and the worker app has no session.
     const previewProxy = createPreviewProxy({
       store: previews,
@@ -1191,9 +1479,30 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     })
     const adminServer = createAdminServer({
       api: adminApi,
-      staticHandler: createStaticHandler(webRoot),
+      staticHandler: (() => {
+        const legacy = createStaticHandler(webRoot)
+        const next = createStaticHandler(join(dirname(fileURLToPath(import.meta.url)), 'admin', 'web-next'))
+        const mounted = (handler: typeof legacy, prefix: string, req: IncomingMessage, res: ServerResponse): boolean => {
+          const original = req.url
+          req.url = (req.url ?? '/').slice(prefix.length) || '/'
+          try { return handler(req, res) } finally { req.url = original }
+        }
+        return (req: IncomingMessage, res: ServerResponse): boolean => {
+          const path = (req.url ?? '/').split('?')[0] ?? '/'
+          if (path === '/legacy') { res.writeHead(302, { location: 'legacy/' }); res.end(); return true }
+          if (path.startsWith('/legacy/')) return mounted(legacy, '/legacy', req, res)
+          // /next/ was the preview address of the new console; it is the default now.
+          if (path === '/next') { res.writeHead(302, { location: './' }); res.end(); return true }
+          if (path === '/next/') { res.writeHead(302, { location: '../' }); res.end(); return true }
+          if (path.startsWith('/next/')) return mounted(next, '/next', req, res)
+          return (legacyDefault ? legacy : next)(req, res)
+        }
+      })(),
       // The Feishu event callback sits outside `/api`: no login, its own signature and token checks.
       callbacks: async (req, res) => {
+        // A console mounted under /legacy/ or /next/ calls `api/...` relative to itself: route it to the one API.
+        const mount = /^\/(legacy|next)(\/api(?:\/|$|\?))/.exec(req.url ?? '')
+        if (mount) req.url = (req.url ?? '').slice(mount[1]!.length + 1)
         if (await previewProxy(req, res)) return true
         const url = new URL(req.url ?? '/', 'http://admin.invalid')
         if (url.pathname !== '/feishu/events') return false

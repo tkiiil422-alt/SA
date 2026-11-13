@@ -22,6 +22,7 @@ const SECTIONS = [
   { key: 'preview', label: '预览', hint: 'AI 把容器里的网页发布成临时链接，端口从这里分配。' },
   { key: 'projects', label: '项目', hint: '上传项目压缩包时的大小限制，防止磁盘被撑满。' },
   { key: 'council', label: '会商', hint: '让几个 AI 角色先讨论再开工。这里改角色、轮数和主持人。' },
+  { key: 'novel', label: '小说', hint: '写小说的开关、字数、预算，以及每个环节用哪个模型。' },
   { key: 'account', label: '账号', hint: '改后台口令。' },
 ]
 
@@ -108,6 +109,51 @@ const GROUP_MODES = [
   { value: 'mention', label: '只有在群里 @ 它才接', help: '' },
   { value: 'all', label: '群里所有消息都看', help: '' },
 ]
+
+function validateNovel(draft) {
+  const issues = []
+  const range = Array.isArray(draft.chapterChars) ? draft.chapterChars : []
+  const min = Number(range[0])
+  const max = Number(range[1])
+  if (!Number.isInteger(min) || !Number.isInteger(max) || min < 500 || max > 20000 || min > max) {
+    issues.push({ path: 'chapterChars', message: '每章字数要在 500–20000 之间，且最少不超过最多。' })
+  }
+  const intIn = (key, lo, hi, label) => {
+    const value = Number(draft[key])
+    if (!Number.isInteger(value) || value < lo || value > hi) issues.push({ path: key, message: `${label}要在 ${lo}–${hi} 之间。` })
+  }
+  intIn('maxRevisions', 0, 5, '修订次数')
+  intIn('minScore', 1, 10, '最低审稿分')
+  intIn('maxActiveBooks', 1, 4, '同时写几本')
+  for (const [key, label] of [['dailyUsd', '小说每日预算'], ['arcUsd', '单弧花费上限'], ['bookUsd', '整书花费上限']]) {
+    if (!(Number(draft[key]) >= 0)) issues.push({ path: key, message: `${label}不能是负数。` })
+  }
+  return issues
+}
+
+function novelPayload(novel) {
+  const pick = (ref) => (ref && typeof ref === 'object' && ref.provider && ref.model
+    ? { provider: String(ref.provider), model: String(ref.model) }
+    : null)
+  const models = novel.models ?? {}
+  return {
+    enabled: novel.enabled === true,
+    models: {
+      planner: pick(models.planner),
+      writer: pick(models.writer),
+      reviewer: pick(models.reviewer),
+      extractor: pick(models.extractor),
+    },
+    chapterChars: [Number(novel.chapterChars?.[0]), Number(novel.chapterChars?.[1])],
+    maxRevisions: Number(novel.maxRevisions),
+    minScore: Number(novel.minScore),
+    dailyUsd: Number(novel.dailyUsd),
+    arcUsd: Number(novel.arcUsd),
+    bookUsd: Number(novel.bookUsd),
+    maxActiveBooks: Number(novel.maxActiveBooks),
+    extraBanned: (novel.extraBanned ?? []).map(String),
+  }
+}
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const isObject = (value) => value !== null && typeof value === 'object'
@@ -201,15 +247,15 @@ export function mount(ctx) {
         get('api/settings/email').catch(() => null),
         get('api/settings/preview').catch(() => null),
       ])
-      const [projects, council] = await Promise.all([settleGet('api/settings/projects'), settleGet('api/settings/council')])
+      const [projects, council, novel] = await Promise.all([settleGet('api/settings/projects'), settleGet('api/settings/council'), settleGet('api/settings/novel')])
       if (!alive) return
       // A person may have edited while this request was in flight. Their draft wins across every
       // section: drop the whole response instead of overwriting the draft and clearing dirty.
       if (loaded && state.dirty.size > 0) return
       loaded = true
-      state.loadError = { projects: projects.error, council: council.error }
+      state.loadError = { projects: projects.error, council: council.error, novel: novel.error }
       state.saved = {
-        policy, executor, models, budget, feishu, projects: projects.value, council: council.value,
+        policy, executor, models, budget, feishu, projects: projects.value, council: council.value, novel: novel.value,
         github: github ?? { enabled: false, repos: [], defaultBase: 'main', apiBase: 'https://api.github.com', tokenSet: false },
         email: email ?? { enabled: false, address: '', displayName: '', allowedSenders: [], pollSeconds: 60, maxAttachmentMb: 20, passwordSet: false },
         preview: preview ?? { enabled: false, portStart: 19000, portEnd: 19199, perTicket: 2, publicBase: '' },
@@ -421,6 +467,11 @@ export function mount(ctx) {
                 <label class="formrow" style="flex:1 1 120px"><span class="formrow__label">最大输出</span>
                   <input class="input" type="number" value="${model.maxTokens}" data-focus-key="settings.providers.${index}.models.${modelIndex}.maxTokens" data-path="providers.${index}.models.${modelIndex}.maxTokens"></label>
               </div>
+              <div class="formrow__inline">
+                ${[['input', '输入价'], ['cacheRead', '缓存命中价'], ['output', '输出价']].map(([key, label]) => `<label class="formrow" style="flex:1 1 100px"><span class="formrow__label">${label}</span>
+                  <input class="input" type="number" min="0" step="any" value="${Number(model.price?.[key] ?? 0)}" data-focus-key="settings.providers.${index}.models.${modelIndex}.price.${key}" data-path="providers.${index}.models.${modelIndex}.price.${key}"></label>`).join('')}
+              </div>
+              <p class="hint" style="margin:2px 0 0">价格单位：美元 / 每百万 token，用于账本记账和预算拦截。${!model.price || (Number(model.price.input) === 0 && Number(model.price.output) === 0) ? '<strong>未设置价格，这个模型的调用会记成 $0，预算也拦不住它。</strong>' : ''}</p>
               <div class="bar-actions" style="margin-top:8px">
                 ${['reasoning', 'vision', 'autoPick'].map((flag) => `<button class="btn ${model[flag] ? 'btn--ink' : ''}" type="button" data-toggle="providers.${index}.models.${modelIndex}.${flag}">${flag === 'reasoning' ? '推理' : flag === 'vision' ? '看图' : '可自动选'}</button>`).join('')}
               </div>
@@ -763,6 +814,32 @@ export function mount(ctx) {
       </section>`
   }
 
+  function novelSection() {
+    const novel = state.draft.novel ?? {}
+    const models = novel.models ?? {}
+    const pick = (role, label) => `<div class="formrow"><span class="formrow__label">${esc(label)}</span>
+      <select class="select" data-nmodel="${role}"><option value="">用默认执行模型</option>${modelOptions(models[role])}</select>
+      <span class="formrow__help">留空就跟随默认执行模型</span></div>`
+    return `<div class="setgrid">
+      ${switchRow('enabled', { label: '启用写小说', help: '关掉后「发任务」里不再出现写小说模式' })}
+      ${input('chapterChars.0', { label: '每章最少字数', type: 'number' })}
+      ${input('chapterChars.1', { label: '每章最多字数', type: 'number', help: '500–20000 字；最少不能超过最多' })}
+      ${input('maxRevisions', { label: '修订次数', type: 'number', help: '审稿不过就改几次；0–5' })}
+      ${input('minScore', { label: '最低审稿分', type: 'number', help: '审稿低于这个分数就修订；1–10' })}
+      ${input('dailyUsd', { label: '小说每日预算（美元）', type: 'number', help: '0 表示不限' })}
+      ${input('arcUsd', { label: '单弧花费上限（美元）', type: 'number', help: '0 表示不限' })}
+      ${input('bookUsd', { label: '整书花费上限（美元）', type: 'number', help: '0 表示不限' })}
+      ${input('maxActiveBooks', { label: '同时写几本', type: 'number', help: '1–4' })}
+      ${pick('planner', '规划模型')}
+      ${pick('writer', '写手模型')}
+      ${pick('reviewer', '审稿模型')}
+      ${pick('extractor', '抽取模型')}
+      <div class="formrow"><span class="formrow__label">额外禁用词</span>
+        <textarea class="textarea" rows="4" data-nbanned placeholder="一行一个">${esc((novel.extraBanned ?? []).join('\n'))}</textarea>
+        <span class="formrow__help">写进正文就算不过的词，一行一个</span></div>
+    </div>`
+  }
+
   /** Put the server's (or client's) field-level messages on their inputs and open the role that holds them. */
   function markIssueFields() {
     root.querySelectorAll('[aria-invalid="true"]').forEach((node) => node.removeAttribute('aria-invalid'))
@@ -926,10 +1003,11 @@ export function mount(ctx) {
       : state.tab === 'email' ? emailSection()
       : state.tab === 'preview' ? previewSection()
       : state.tab === 'projects' ? projectsSection()
+      : state.tab === 'novel' ? novelSection()
       : state.tab === 'council' ? councilSection()
       : accountSection()
     const dirtyCount = state.dirty.size
-    const loadFailed = (state.tab === 'projects' || state.tab === 'council') && Boolean(state.loadError[state.tab])
+    const loadFailed = (state.tab === 'projects' || state.tab === 'council' || state.tab === 'novel') && Boolean(state.loadError[state.tab])
     root.innerHTML = `
       <div class="head">
         <div class="head__row"><h1 class="head__title">设置</h1></div>
@@ -1048,6 +1126,19 @@ export function mount(ctx) {
   })
 
   root.addEventListener('change', (event) => {
+    if (event.target.matches('[data-nmodel]')) {
+      const role = event.target.dataset.nmodel
+      const value = String(event.target.value ?? '')
+      const at = value.indexOf('/')
+      setPath(state.draft.novel, `models.${role}`, value && at > 0 ? { provider: value.slice(0, at), model: value.slice(at + 1) } : null)
+      markDirty()
+      return
+    }
+    if (event.target.matches('[data-nbanned]')) {
+      setPath(state.draft.novel, 'extraBanned', event.target.value.split('\n').map((line) => line.trim()).filter(Boolean))
+      markDirty()
+      return
+    }
     if (event.target.matches('[data-cref]')) {
       const target = event.target.dataset.cref
       const value = String(event.target.value ?? '')
@@ -1220,7 +1311,31 @@ export function mount(ctx) {
     const addDiscovered = event.target.closest('[data-add-discovered]')
     if (addDiscovered && state.discover.result?.models) {
       const model = state.discover.result.models.find((item) => item.id === addDiscovered.dataset.addDiscovered)
-      const provider = state.draft.models.providers.find((item) => item.baseUrl === state.discover.form.baseUrl) ?? state.draft.models.providers[0]
+      // A model belongs to the service it was pulled from. Match that service by address and interface type; when no
+      // saved provider has them, create one from the pull form (address, type, key, session header) instead of dropping
+      // the model into the first provider, whose upstream would answer "Model is unavailable".
+      const form = state.discover.form
+      const sameUrl = (a, b) => String(a ?? '').trim().replace(/\/+$/, '').toLowerCase() === String(b ?? '').trim().replace(/\/+$/, '').toLowerCase()
+      let provider = state.draft.models.providers.find((item) => sameUrl(item.baseUrl, form.baseUrl) && item.api === form.api)
+      if (model && !provider) {
+        const taken = new Set(state.draft.models.providers.map((item) => item.id))
+        let host = 'provider'
+        try { host = new URL(form.baseUrl).hostname.split('.').filter((part) => part !== 'www' && part !== 'api')[0] || 'provider' } catch { /* keep the fallback */ }
+        const base = host.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'provider'
+        let id = base
+        for (let n = 2; taken.has(id); n += 1) id = `${base}-${n}`
+        provider = {
+          id, name: host, api: form.api, baseUrl: String(form.baseUrl).trim().replace(/\/+$/, ''),
+          apiKey: form.apiKey || '', apiKeySet: false, apiKeyTail: '',
+          sessionHeader: form.sessionHeader || '', enabled: true, models: [],
+        }
+        state.draft.models.providers.push(provider)
+        if (!form.apiKey) bus.toast(`已新建服务商「${host}」，还要在它下面填 API 密钥`, { danger: true })
+      }
+      if (model && provider && provider.models.some((item) => item.id === model.id)) {
+        bus.toast(`${model.id} 已经在「${provider.name || provider.id}」里了`)
+        return
+      }
       if (model && provider) {
         provider.models.push({
           id: model.id,
@@ -1347,6 +1462,7 @@ export function mount(ctx) {
       : state.tab === 'email' ? validateEmail(state.draft.email)
       : state.tab === 'projects' ? validateProjects(state.draft.projects ?? {})
       : state.tab === 'council' ? validateCouncil(state.draft.council ?? {})
+      : state.tab === 'novel' ? validateNovel(state.draft.novel ?? {})
       : []
     if (preIssues.length) {
       state.issues = preIssues
@@ -1446,6 +1562,7 @@ export function mount(ctx) {
         }
       }
       if (state.tab === 'council') payload = councilPayload(state.draft.council)
+      if (state.tab === 'novel') payload = novelPayload(state.draft.novel)
 
       const result = await put(`api/settings/${state.tab}`, payload)
       if (state.tab === 'github') {

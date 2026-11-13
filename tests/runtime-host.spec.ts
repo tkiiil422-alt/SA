@@ -24,6 +24,7 @@ import { defaultSettings } from '../src/config.ts'
 import type { Settings } from '../src/policy.ts'
 import { createRuntimeAdminHost, type RuntimeAdminDeps } from '../src/admin/runtime-host.ts'
 import { AdminError } from '../src/admin/host.ts'
+import { InvalidModelError } from '../src/executor/pi-models.ts'
 import type { AdminHost, CreateTicketResult } from '../src/admin/host.ts'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -140,6 +141,7 @@ function harness() {
 
   const runs: { file: string; args: string[]; timeout: number }[] = []
   let podman: (file: string, args: string[], timeout: number) => Promise<string> = async () => ''
+  const chosen: { ticketId: string; ref: string }[] = []
 
   const deps: RuntimeAdminDeps = {
     repo,
@@ -167,6 +169,10 @@ function harness() {
     modelTest: async () => ({ ok: true, status: 200, latencyMs: 12, message: "连接正常" }),
     discoverModels: async () => ({ ok: true, message: '找到 0 个模型。', models: [] }),
     ticketModel: () => ({ ref: "default/deepseek-v4.1-flash", label: "deepseek-v4.1-flash", providerName: "默认服务", source: "default" as const }),
+    chooseModel: (ticket, ref) => {
+      if (ref !== 'default/glm-5.3-flash') throw new InvalidModelError()
+      chosen.push({ ticketId: ticket.id, ref })
+    },
     now: () => clock.now,
     run: (file, args, timeout) => {
       runs.push({ file, args, timeout })
@@ -194,6 +200,7 @@ function harness() {
     replies,
     launches,
     runs,
+    chosen,
     setReplyFailure: (error: Error | undefined) => { replyFailure = error },
     setPodman: (fn: (file: string, args: string[], timeout: number) => Promise<string>) => { podman = fn },
   }
@@ -387,6 +394,27 @@ describe('runtime admin host', () => {
     expect(ticket.assignments).toHaveLength(before + 1)
     expect(ticket.assignments.at(-2)!.state).toBe('ended')
     expect(ticket.undelivered.length).toBeGreaterThan(0)
+  })
+
+  it('switches a working ticket to another model with an instruction and restarts its round', async () => {
+    const h = harness()
+    const id = await create(h.host)
+    const before = h.repo.tickets.get(id)!.assignments.length
+    h.host.replyTicket(id, '难的部分换个模型做', 'default/glm-5.3-flash')
+    const ticket = h.repo.tickets.get(id)!
+    expect(h.chosen).toEqual([{ ticketId: id, ref: 'default/glm-5.3-flash' }])
+    expect(ticket.assignments).toHaveLength(before + 1)
+    expect(ticket.inputs.some(input => input.kind === 'text' && input.text.includes('switched the model'))).toBe(true)
+  })
+
+  it('keeps the round when the instruction names the current model, and rejects an unknown one', async () => {
+    const h = harness()
+    const id = await create(h.host)
+    const before = h.repo.tickets.get(id)!.assignments.length
+    h.host.replyTicket(id, '继续', 'default/deepseek-v4.1-flash')
+    expect(h.chosen).toEqual([])
+    expect(h.repo.tickets.get(id)!.assignments).toHaveLength(before)
+    expectAdminError(() => h.host.replyTicket(id, '换', 'nope/missing'), 400)
   })
 
   it('reopens a completed ticket on a new instruction', async () => {

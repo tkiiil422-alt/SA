@@ -12,6 +12,7 @@ import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from '
 import { dirname } from 'node:path'
 import { z } from 'zod'
 import { defaultCouncilRoles } from '../council/roles.ts'
+import { defaultCollabRoles } from '../executor/collab.ts'
 
 export const PriceSchema = z.object({
   input: z.number().min(0),
@@ -197,6 +198,71 @@ export const CouncilSchema = z.object({
   }
 })
 
+/**
+ * The novel engine (off by default). A null model means `routing.worker`. `dailyUsd` caps novel spend per day so a
+ * book never eats the whole daily budget; the global `budget.dailyUsd` still applies on top. `arcUsd` / `bookUsd` of 0
+ * mean no limit.
+ */
+export const NovelSchema = z.object({
+  enabled: z.boolean(),
+  models: z.object({
+    planner: RefSchema.nullable(),
+    writer: RefSchema.nullable(),
+    reviewer: RefSchema.nullable(),
+    extractor: RefSchema.nullable(),
+  }).strict(),
+  chapterChars: z.tuple([
+    z.number().int('必须是整数').min(500, '每章最少不能低于 500 字'),
+    z.number().int('必须是整数').max(20000, '每章最多不能超过 20000 字'),
+  ]),
+  maxRevisions: z.number().int('必须是整数').min(0, '不能小于 0').max(5, '不能大于 5'),
+  minScore: z.number().int('必须是整数').min(1, '不能小于 1').max(10, '不能大于 10'),
+  dailyUsd: z.number().min(0).max(100000),
+  arcUsd: z.number().min(0).max(100000),
+  bookUsd: z.number().min(0).max(1000000),
+  maxActiveBooks: z.number().int('必须是整数').min(1, '至少 1 本').max(4, '最多 4 本'),
+  extraBanned: z.array(z.string().trim().min(1).max(40)).max(200),
+}).strict().superRefine((novel, ctx) => {
+  if (novel.chapterChars[1] < novel.chapterChars[0]) {
+    ctx.addIssue({ code: 'custom', path: ['chapterChars'], message: '每章字数上限不能小于下限' })
+  }
+})
+
+/** One sub-agent role the ticket's main worker can call through Pi's `subagent` tool (see `src/executor/collab.ts`). */
+export const CollabRoleSchema = z.object({
+  id: z.string().regex(/^[a-z0-9][a-z0-9-]{0,31}$/, '角色 id 只能是小写字母、数字和连字符，且不超过 32 位'),
+  name: z.string().trim().min(1, '角色名称不能为空').max(30, '角色名称不能超过 30 个字'),
+  description: z.string().trim().min(1, '要写一句说明，主 AI 靠它决定叫谁').max(400, '说明不能超过 400 字'),
+  access: z.enum(['ask', 'read', 'shell', 'write']),
+  enabled: z.boolean(),
+  model: RefSchema.nullable(),
+  prompt: z.string().trim().max(2000, '提示词不能超过 2000 字'),
+}).strict()
+
+/** Multi-model collaboration inside a ticket. Role models are checked by the settings route, not here, so disabling a
+ * provider elsewhere never fails validation; a role whose model is unusable runs on the ticket's model. */
+export const CollabSchema = z.object({
+  enabled: z.boolean(),
+  maxConcurrent: z.number().int('必须是整数').min(1, '至少 1 个').max(4, '最多 4 个'),
+  maxCalls: z.number().int('必须是整数').min(1, '至少 1 次').max(200, '最多 200 次'),
+  roles: z.array(CollabRoleSchema).max(12, '最多 12 个角色'),
+}).strict().superRefine((collab, ctx) => {
+  const ids = new Set<string>()
+  collab.roles.forEach((role, index) => {
+    if (ids.has(role.id)) ctx.addIssue({ code: 'custom', path: ['roles', index, 'id'], message: '角色 id 重复' })
+    ids.add(role.id)
+  })
+})
+
+/** Defaults for ticket goals (see `src/goal/service.ts`); a goal given without limits takes these. */
+export const GoalSchema = z.object({
+  maxRounds: z.number().int('必须是整数').min(1, '至少 1 轮').max(50, '最多 50 轮'),
+  maxUsd: z.number().min(0.01, '至少 $0.01').max(100, '最多 $100'),
+  maxHours: z.number().min(0.1, '至少 0.1 小时').max(72, '最多 72 小时'),
+  commandTimeoutSec: z.number().int('必须是整数').min(10, '至少 10 秒').max(1800, '最多 1800 秒'),
+  judge: RefSchema.nullable(),
+}).strict()
+
 export const OptionsSchema = z.object({
   executor: z.object({
     maxWorkers: z.number().int().min(1).max(8),
@@ -216,6 +282,9 @@ export const OptionsSchema = z.object({
   github: GithubSchema,
   email: EmailSchema,
   council: CouncilSchema,
+  novel: NovelSchema,
+  collab: CollabSchema,
+  goal: GoalSchema,
 }).strict().superRefine((options, ctx) => {
   // Model references are validated against the models section, which a per-section parse cannot see. A seat may reuse
   // the moderator's model, so only explicit `model` overrides and the moderator itself are checked.
@@ -231,6 +300,10 @@ export const OptionsSchema = z.object({
   options.council.roles.forEach((role, index) => {
     if (role.model !== undefined) check(role.model, ['council', 'roles', index, 'model'], `角色「${role.name}」使用的`)
   })
+  for (const role of ['planner', 'writer', 'reviewer', 'extractor'] as const) {
+    const ref = options.novel.models[role]
+    if (ref !== null) check(ref, ['novel', 'models', role], '小说')
+  }
 })
 
 export type Price = z.infer<typeof PriceSchema>
@@ -249,6 +322,9 @@ export type EmailOptions = z.infer<typeof EmailSchema>
 export type ProjectsOptions = z.infer<typeof ProjectsSchema>
 export type CouncilOptions = z.infer<typeof CouncilSchema>
 export type CouncilRoleOptions = z.infer<typeof CouncilRoleSchema>
+export type NovelOptions = z.infer<typeof NovelSchema>
+export type CollabOptions = z.infer<typeof CollabSchema>
+export type GoalOptions = z.infer<typeof GoalSchema>
 export type PublicFeishu = Omit<FeishuOptions, 'appSecret' | 'verificationToken' | 'encryptKey'> & {
   appSecretSet: boolean
   verificationTokenSet: boolean
@@ -266,6 +342,9 @@ export interface PublicOptions {
   github: Options['github']
   email: Options['email']
   council: Options['council']
+  novel: Options['novel']
+  collab: Options['collab']
+  goal: Options['goal']
 }
 
 function publicFeishu({ appSecret, verificationToken, encryptKey, ...rest }: FeishuOptions): PublicFeishu {
@@ -295,7 +374,7 @@ export class OptionsError extends Error {
 
 type Listener = (section: OptionsSection, next: Options, changed: string[]) => void
 
-const SECTIONS: OptionsSection[] = ['executor', 'models', 'budget', 'feishu', 'preview', 'projects', 'github', 'email', 'council']
+const SECTIONS: OptionsSection[] = ['executor', 'models', 'budget', 'feishu', 'preview', 'projects', 'github', 'email', 'council', 'novel', 'collab', 'goal']
 
 function clone<T>(value: T): T {
   return structuredClone(value)
@@ -506,7 +585,7 @@ export class OptionsStore {
   }
 
   getPublic(): PublicOptions {
-    const { executor, models, budget, feishu, preview, projects, github, email, council } = this.current
+    const { executor, models, budget, feishu, preview, projects, github, email, council, novel, collab, goal } = this.current
     return {
       feishu: publicFeishu(feishu),
       executor: { ...executor },
@@ -524,6 +603,9 @@ export class OptionsStore {
       github: clone(github),
       email: clone(email),
       council: clone(council),
+      novel: clone(novel),
+      collab: clone(collab),
+      goal: clone(goal),
     }
   }
 
@@ -718,6 +800,31 @@ export function defaultOptions(env: NodeJS.ProcessEnv): Options {
       maxCharsPerTurn: 600,
       moderator: null,
       roles: defaultCouncilRoles(),
+    },
+    novel: {
+      enabled: false,
+      models: { planner: null, writer: null, reviewer: null, extractor: null },
+      chapterChars: [2500, 3500],
+      maxRevisions: 2,
+      minScore: 6,
+      dailyUsd: 0,
+      arcUsd: 0,
+      bookUsd: 0,
+      maxActiveBooks: 1,
+      extraBanned: [],
+    },
+    collab: {
+      enabled: true,
+      maxConcurrent: 2,
+      maxCalls: 20,
+      roles: defaultCollabRoles(),
+    },
+    goal: {
+      maxRounds: 8,
+      maxUsd: 3,
+      maxHours: 6,
+      commandTimeoutSec: 600,
+      judge: null,
     },
   })
 }

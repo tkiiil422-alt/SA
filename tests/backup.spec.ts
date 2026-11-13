@@ -3,7 +3,7 @@
  * and old archives are pruned to `keep`.
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -117,5 +117,33 @@ describe('state backups', () => {
 
   it('returns an empty list for a missing directory', () => {
     expect(listBackups(join(tempDir(), 'nothing-here'))).toEqual([])
+  })
+
+  it.skipIf(!hasTar)('archives each book\'s canon, chapters and summaries but not its snapshots or work files', async () => {
+    const stateDir = tempDir()
+    const backupDir = join(stateDir, 'backups')
+    const repo = stateWithDatabase(stateDir)
+    const book = join(stateDir, 'novels', 'b_test1')
+    for (const dir of ['canon', 'chapters', 'summaries', 'snapshots/0001', 'work/ch-0002']) mkdirSync(join(book, dir), { recursive: true })
+    writeFileSync(join(book, 'book.json'), '{}\n')
+    writeFileSync(join(book, 'canon', 'bible.json'), '{}\n')
+    writeFileSync(join(book, 'chapters', 'ch-0001.md'), '# 一\n\n正文\n')
+    writeFileSync(join(book, 'summaries', 'ch-0001.json'), '{}\n')
+    writeFileSync(join(book, 'snapshots', '0001', 'bible.json'), '{}\n')
+    writeFileSync(join(book, 'work', 'ch-0002', 'draft-0.md'), 'draft\n')
+    mkdirSync(join(stateDir, 'novels', 'not-a-book'), { recursive: true })
+    writeFileSync(join(stateDir, 'novels', 'not-a-book', 'x.txt'), 'x\n')
+
+    const item = await createBackup({ stateDir, backupDir, db: repo.db, novelsDir: join(stateDir, 'novels'), now: () => new Date(2026, 0, 3, 1, 0, 0) })
+    const local = process.platform === 'win32' ? ['--force-local'] : []
+    const names = execFileSync('tar', [...local, '-tzf', join(backupDir, item.name)], { encoding: 'utf8' })
+      .split(/\r?\n/).filter(Boolean).map(name => name.replace(/^\.\//, ''))
+    expect(names).toContain('novels/b_test1/book.json')
+    expect(names).toContain('novels/b_test1/canon/bible.json')
+    expect(names).toContain('novels/b_test1/chapters/ch-0001.md')
+    expect(names).toContain('novels/b_test1/summaries/ch-0001.json')
+    expect(names.some(name => name.includes('snapshots'))).toBe(false)
+    expect(names.some(name => name.includes('/work/'))).toBe(false)
+    expect(names.some(name => name.includes('not-a-book'))).toBe(false)
   })
 })

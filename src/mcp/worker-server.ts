@@ -58,6 +58,24 @@ export interface WorkerGithubPrInput {
 
 export type WorkerGithubPrResult = { ok: true; url: string; number: number } | { ok: false; message: string }
 
+/** One new email a worker asks to send from the bound mailbox. */
+export interface WorkerEmailSendInput {
+  to: string[]
+  subject: string
+  text: string
+}
+
+export type WorkerEmailSendResult = { ok: true } | { ok: false; message: string }
+
+/**
+ * What a report gate (a ticket goal) decided about a worker's report: let it through, record another report in its place
+ * and tell the worker why, or only tell the worker (nothing is recorded).
+ */
+export type WorkerReportGate =
+  | { action: 'pass' }
+  | { action: 'replace'; report: WorkerReport; reply: string }
+  | { action: 'reply'; reply: string }
+
 export interface WorkerMcpServerOptions {
   engine: WorkerEngine
   /** Resolves a bearer token to the ticket it belongs to; unknown or missing tokens never reach MCP handling. */
@@ -72,6 +90,10 @@ export interface WorkerMcpServerOptions {
   preview?: (ticketId: string, input: WorkerPreviewInput) => WorkerPreviewResult
   /** Opens a pull request with the operator's GitHub token; absent means GitHub is unavailable. */
   githubPr?: (ticketId: string, input: WorkerGithubPrInput) => Promise<WorkerGithubPrResult>
+  /** Sends a new email from the operator's bound mailbox; absent means email is unavailable. */
+  emailSend?: (ticketId: string, input: WorkerEmailSendInput) => Promise<WorkerEmailSendResult>
+  /** Sees every `sa_report` before the Engine does (ticket goals); absent means reports go straight through. */
+  gate?: (ticketId: string, report: WorkerReport) => Promise<WorkerReportGate>
   /** Interface to listen on. Default `127.0.0.1`; the endpoint is meant for local workers only. */
   host?: string
   /** Port to listen on. Default 0, which asks the OS for a free port. */
@@ -88,7 +110,7 @@ export interface WorkerMcpServer {
 /** Table ordering of the tools: fixed so an upstream prompt cache can rely on it. New tools are appended. */
 export const WORKER_TOOL_NAMES = [
   'sa_report', 'sa_ack', 'sa_handback', 'sa_thread_unrelated', 'sa_thread_follow', 'sa_secret_store', 'sa_secret_request',
-  'sa_preview', 'sa_github_pr',
+  'sa_preview', 'sa_github_pr', 'sa_email_send',
 ] as const
 
 const SecretNameSchema = z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/, 'A secret name is an environment variable name.')
@@ -146,11 +168,18 @@ function createServerFor(options: WorkerMcpServerOptions, ticketId: string): Mcp
       asked_by: z.string().min(1).optional().describe('With question: the human message that raised it.'),
       answer_to: z.string().min(1).optional().describe('The human question this report answers; never ordinary progress.'),
     }),
-  }, args => run('sa_report', () => {
+  }, args => run('sa_report', async () => {
     const report: WorkerReport = { state: args.state, summary: clean(args.summary) }
     if (args.question !== undefined) report.question = args.question === null ? null : clean(args.question)
     if (args.asked_by !== undefined) report.askedBy = clean(args.asked_by)
     if (args.answer_to !== undefined) report.answers = clean(args.answer_to)
+    // A ticket goal sees the report first: an unmet goal records progress instead and tells the worker what is missing.
+    const gated = options.gate === undefined ? undefined : await options.gate(ticketId, report)
+    if (gated?.action === 'reply') return gated.reply
+    if (gated?.action === 'replace') {
+      engine.report(ticketId, gated.report)
+      return gated.reply
+    }
     engine.report(ticketId, report)
     return { reported: true, state: args.state }
   }))
@@ -270,6 +299,21 @@ function createServerFor(options: WorkerMcpServerOptions, ticketId: string): Mcp
     })
     if (!result.ok) throw new ToolFailure(result.message)
     return { created: true, url: result.url, number: result.number }
+  }))
+
+  server.registerTool('sa_email_send', {
+    description: 'Send a new plain-text email from the operator\'s bound mailbox to one or more addresses. Use it when the task asks you to email someone; it is sent at once and cannot be recalled. Report the result afterwards.',
+    inputSchema: z.strictObject({
+      to: z.array(z.string().trim().email('Not an email address.')).min(1).max(20).describe('Recipient addresses.'),
+      subject: z.string().trim().min(1).max(200).describe('The subject line.'),
+      text: z.string().min(1).max(50_000).describe('The plain-text body.'),
+    }),
+  }, args => run('sa_email_send', async () => {
+    const hook = options.emailSend
+    if (hook === undefined) throw new ToolFailure('Email is not available.')
+    const result = await hook(ticketId, { to: args.to, subject: args.subject, text: args.text })
+    if (!result.ok) throw new ToolFailure(result.message)
+    return { sent: true, to: args.to }
   }))
 
   return server

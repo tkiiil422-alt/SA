@@ -399,16 +399,20 @@ export class Tickets extends EnginePart {
    * person writing on the ticket itself is the authority, so no Eval or Decision runs.
    * @throws UserError when the ticket is unknown, or processing is paused and the ticket would have to start again.
    */
-  instruct(ticketId: string, text: string): Ticket {
+  instruct(ticketId: string, text: string, options: { restart?: boolean } = {}): Ticket {
     const ticket = this.require(ticketId)
     const at = this.now()
     const ended = !liveTicket(ticket)
-    const stalled = !ended && (waitsForPerson(ticket) || !!ticket.delivery)
+    // `restart`: the person switched the ticket's model, so a running worker must start a fresh process on it.
+    const switched = !ended && options.restart === true && !(waitsForPerson(ticket) || !!ticket.delivery)
+    const stalled = !ended && (waitsForPerson(ticket) || !!ticket.delivery || switched)
     const body = ended
       ? `This ticket ended earlier (${ticket.ended?.outcome ?? 'ended'}). A person reopened it with a new instruction; continue in the same workspace and report ready when it is done.\n\nInstruction: ${text}`
-      : stalled
-        ? `Your last turn stopped (${latestReport(ticket)?.state ?? 'stalled'}). A person sent a new instruction; continue from where the workspace is now.\n\nInstruction: ${text}`
-        : `A person sent a new instruction on this ticket: ${text}`
+      : switched
+        ? `A person switched the model for this ticket and sent a new instruction; continue from where the workspace is now.\n\nInstruction: ${text}`
+        : stalled
+          ? `Your last turn stopped (${latestReport(ticket)?.state ?? 'stalled'}). A person sent a new instruction; continue from where the workspace is now.\n\nInstruction: ${text}`
+          : `A person sent a new instruction on this ticket: ${text}`
     const input: TicketInput = { id: key('input', ticketId, 'instruction', at, text), kind: 'text', text: body, at }
     if (!ended && !stalled) {
       // A person writing on a ticket that asked them something has answered it: the question card goes at once, instead

@@ -15,6 +15,7 @@ const GROUPS = [
   {
     title: '资源与记录',
     rows: [
+      { name: '书库', desc: '写好的小说：阅读章节、提修改意见、写下一弧、导出 TXT', href: '#/novels' },
       { name: '连接', desc: '飞书、GitHub、邮箱、密钥库、网页预览的绑定状态', href: '#/connections' },
       { name: '花费', desc: '今天、7 天、30 天的花费与调用', href: '#/usage' },
       { name: '判断记录', desc: '每次受理或忽略的理由，可回看', href: '#/decisions' },

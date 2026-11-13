@@ -19,6 +19,8 @@ export interface UsageCallInput {
   latencyMs: number
   /** Provider id; '' when not given (calls recorded before providers existed). */
   provider?: string
+  /** Sub-agent role that made the call; '' (or absent) for the ticket's main worker. */
+  agent?: string
 }
 
 export interface UsageCall extends UsageCallInput { id: number }
@@ -61,7 +63,8 @@ CREATE TABLE IF NOT EXISTS usage_calls (
   completion INTEGER NOT NULL,
   cost_usd REAL NOT NULL,
   latency_ms INTEGER NOT NULL,
-  provider TEXT NOT NULL DEFAULT ''
+  provider TEXT NOT NULL DEFAULT '',
+  agent TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS usage_calls_ticket ON usage_calls (ticket_id);
 CREATE INDEX IF NOT EXISTS usage_calls_at ON usage_calls (at);
@@ -72,6 +75,9 @@ function addProviderColumn(db: DatabaseSync): void {
   const columns = db.prepare('PRAGMA table_info(usage_calls)').all()
   if (!columns.some(column => column.name === 'provider')) {
     db.exec("ALTER TABLE usage_calls ADD COLUMN provider TEXT NOT NULL DEFAULT ''")
+  }
+  if (!columns.some(column => column.name === 'agent')) {
+    db.exec("ALTER TABLE usage_calls ADD COLUMN agent TEXT NOT NULL DEFAULT ''")
   }
 }
 
@@ -118,8 +124,8 @@ export class Ledger {
     addProviderColumn(db)
     this.insert = db.prepare(`
       INSERT INTO usage_calls
-        (at, ticket_id, model, status, prompt_hit, prompt_miss, completion, cost_usd, latency_ms, provider)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (at, ticket_id, model, status, prompt_hit, prompt_miss, completion, cost_usd, latency_ms, provider, agent)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     this.ticketAggregate = db.prepare(`${AGGREGATE}WHERE ticket_id = ?`)
     this.rangeAggregate = db.prepare(`${AGGREGATE}WHERE at >= ? AND at < ?`)
@@ -158,11 +164,18 @@ export class Ledger {
       input.costUsd,
       input.latencyMs,
       input.provider ?? '',
+      input.agent ?? '',
     )
   }
 
   ticketTotals(ticketId: string): UsageTotals {
     return this.totals(this.ticketAggregate.get(ticketId))
+  }
+
+  /** A ticket's spend split by caller: '' is the main worker, anything else a sub-agent role. */
+  ticketByAgent(ticketId: string): { agent: string; usd: number; calls: number }[] {
+    return this.db.prepare('SELECT agent, COALESCE(SUM(cost_usd), 0) AS usd, COUNT(*) AS calls FROM usage_calls WHERE ticket_id = ? GROUP BY agent ORDER BY agent')
+      .all(ticketId).map(row => ({ agent: String(row.agent ?? ''), usd: num(row.usd), calls: num(row.calls) }))
   }
 
   /** Cost of every ticket on the local calendar day, from its 00:00 to the next local 00:00. */
@@ -250,6 +263,7 @@ export class Ledger {
       completion: num(row.completion),
       costUsd: num(row.cost_usd),
       latencyMs: num(row.latency_ms),
+      agent: String(row.agent ?? ''),
     }
   }
 }

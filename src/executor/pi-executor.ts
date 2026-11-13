@@ -66,6 +66,15 @@ export interface PiExecutorOptions {
   triggers?: Pick<Repositories['triggers'], 'get'>
   /** In-memory record of each worker's recent steps, shown on the task detail page. */
   activity?: Pick<ActivityLog, 'record' | 'note'>
+  /** Base delay before retrying a turn that ended on a model error; multiplied by the attempt. Default 15s. */
+  modelErrorRetryMs?: number
+  /**
+   * A turn settled and its worker is idle: returns a message that pushes it on (a ticket goal not reached yet), or
+   * undefined to let it rest as usual.
+   */
+  afterTurn?: (ticketId: string, turnAt: string | undefined) => string | undefined
+  /** Something outside Pi still works for the ticket (a goal check inside `sa_report`): its silence is not a hang. */
+  keepAlive?: (ticketId: string) => boolean
 }
 
 interface LaunchPayload { ticketId: string; assignmentId: string }
@@ -84,7 +93,16 @@ interface ClientEntry {
   pendingRead: string[]
   /** Watchdog for a turn that stays streaming too long; cleared whenever the turn ends or the entry stops. */
   timer?: NodeJS.Timeout
+  /** When the current turn started (`agent_start`), to tell whether a report was written during it. */
+  turnAt?: string
+  /** The model error the turn's latest assistant message ended on; cleared by a later successful message. */
+  modelError?: string
+  /** Automatic retries spent on model errors since the last successful message. */
+  errorRetries?: number
 }
+
+/** Automatic retries of a turn that ended on a model error (502, 429, ...) without a report. */
+const MODEL_ERROR_RETRIES = 3
 
 /** Delay before a launch or delivery blocked on a full slot is tried again. */
 const SLOT_RETRY_MS = 50
@@ -366,6 +384,21 @@ export class PiExecutor implements Executor {
       this.clearWatchdog(entry)
       this.armWatchdog(entry)
     }
+    if (event.type === 'agent_start') {
+      entry.turnAt = new Date().toISOString()
+      entry.modelError = undefined
+    }
+    if (event.type === 'message_end') {
+      const message = typeof event.message === 'object' && event.message !== null ? event.message as Record<string, unknown> : undefined
+      if (message?.role === 'assistant') {
+        if (message.stopReason === 'error') {
+          entry.modelError = String(message.errorMessage ?? 'model error').replace(/\s+/g, ' ').slice(0, 200)
+        } else {
+          entry.modelError = undefined
+          entry.errorRetries = 0
+        }
+      }
+    }
     if (event.type !== 'agent_settled') return
     this.clearWatchdog(entry)
     entry.streaming = false
@@ -374,9 +407,116 @@ export class PiExecutor implements Executor {
     this.call(() => this.options.engine().turnEnded(entry.ticketId, entry.assignmentId))
     // The turn handed off: the slot is free for another ticket, as in the prototype's WorkerSlots.
     this.release(entry.ticketId)
+    // A turn the model service cut off (502, 429, ...) before the worker reported is not the worker's decision to stop:
+    // keep the process and try the turn again, instead of leaving the ticket "running" with nothing running.
+    if (this.erroredWithoutReport(entry)) {
+      this.recoverModelError(entry)
+      return
+    }
+    // A ticket goal not reached yet: a turn that delivered nothing is pushed on instead of resting.
+    let push: string | undefined
+    try {
+      push = this.options.afterTurn?.(entry.ticketId, entry.turnAt)
+    } catch {
+      push = undefined
+    }
+    if (push !== undefined) {
+      const text = push
+      void this.serial(entry.ticketId, async () => this.nudge(entry, text)).catch(() => undefined)
+      return
+    }
     // A worker with nothing left to do exits instead of holding its container; a later Input wakes it with `--continue`.
     // Run the check in the ticket's serial chain so it cannot race a delivery that is already reaching the process.
     void this.serial(entry.ticketId, async () => this.retireIdle(entry)).catch(() => undefined)
+  }
+
+  /** Whether the turn that just settled ended on a model error and its worker wrote no report during it. */
+  private erroredWithoutReport(entry: ClientEntry): boolean {
+    if (entry.modelError === undefined) return false
+    const ticket = this.options.tickets.get(entry.ticketId)
+    const assignment = ticket?.assignments.find(item => item.id === entry.assignmentId)
+    if (!ticket || ticket.ended || !assignment || assignment.state !== 'running') return false
+    const report = assignment.report
+    return !(report && entry.turnAt !== undefined && report.at >= entry.turnAt)
+  }
+
+  /** Retry a model-error turn after a growing delay; after the last retry, report it failed with the reason. */
+  private recoverModelError(entry: ClientEntry): void {
+    const error = entry.modelError ?? 'model error'
+    entry.modelError = undefined
+    const attempt = (entry.errorRetries ?? 0) + 1
+    entry.errorRetries = attempt
+    if (attempt > MODEL_ERROR_RETRIES) {
+      this.failed(entry.ticketId, entry.assignmentId,
+        `模型服务连续出错，这一轮没能完成（${error}）。在任务里发一条新指令就能接着干。`)
+      void this.serial(entry.ticketId, async () => this.retireIdle(entry)).catch(() => undefined)
+      return
+    }
+    this.options.activity?.note(entry.ticketId, `模型服务出错（${error}），稍后自动重试第 ${attempt} 次`)
+    const base = Math.max(1, this.options.modelErrorRetryMs ?? 15_000)
+    const timer = setTimeout(() => {
+      void this.serial(entry.ticketId, async () => this.retryTurn(entry, error)).catch(() => undefined)
+    }, base * attempt)
+    timer.unref()
+  }
+
+  private async retryTurn(entry: ClientEntry, error: string): Promise<void> {
+    if (this.closed || entry.stopped || entry.streaming || this.clients.get(entry.ticketId) !== entry || !entry.client.isRunning) return
+    if (!this.running(entry.ticketId, entry.assignmentId)) return
+    try {
+      this.reserveForDelivery(entry.ticketId, false)
+    } catch (reason) {
+      if (!(reason instanceof Later)) return
+      // Every slot is busy: try again a little later without spending an attempt.
+      const timer = setTimeout(() => {
+        void this.serial(entry.ticketId, async () => this.retryTurn(entry, error)).catch(() => undefined)
+      }, Math.max(1, this.options.modelErrorRetryMs ?? 15_000))
+      timer.unref()
+      return
+    }
+    try {
+      const disposition = await entry.client.prompt(
+        `The previous turn stopped on a model service error (${error}). Continue the assignment from where the workspace is now; do not repeat external actions that already succeeded, and report when done.`,
+      )
+      entry.streaming = disposition !== 'handled'
+      if (entry.streaming) {
+        this.activate(entry.ticketId)
+        this.armWatchdog(entry)
+      } else {
+        this.release(entry.ticketId)
+      }
+    } catch {
+      this.release(entry.ticketId)
+    }
+  }
+
+  /** Pushes an idle worker on with a message (a ticket goal not reached yet). */
+  private async nudge(entry: ClientEntry, text: string): Promise<void> {
+    if (this.closed || entry.stopped || entry.streaming || this.clients.get(entry.ticketId) !== entry || !entry.client.isRunning) return
+    if (!this.running(entry.ticketId, entry.assignmentId)) return
+    try {
+      this.reserveForDelivery(entry.ticketId, false)
+    } catch (reason) {
+      if (!(reason instanceof Later)) return
+      // Every slot is busy: push it a little later.
+      const timer = setTimeout(() => {
+        void this.serial(entry.ticketId, async () => this.nudge(entry, text)).catch(() => undefined)
+      }, Math.max(1, this.options.modelErrorRetryMs ?? 15_000))
+      timer.unref()
+      return
+    }
+    try {
+      const disposition = await entry.client.prompt(text)
+      entry.streaming = disposition !== 'handled'
+      if (entry.streaming) {
+        this.activate(entry.ticketId)
+        this.armWatchdog(entry)
+      } else {
+        this.release(entry.ticketId)
+      }
+    } catch {
+      this.release(entry.ticketId)
+    }
   }
 
   private onExit(entry: ClientEntry, exit: PiProcessExit): void {
@@ -492,6 +632,10 @@ export class PiExecutor implements Executor {
     const timer = setTimeout(() => {
       entry.timer = undefined
       if (entry.stopped || this.clients.get(entry.ticketId) !== entry || !entry.streaming) return
+      if (this.options.keepAlive?.(entry.ticketId)) {
+        this.armWatchdog(entry)
+        return
+      }
       this.stopEntry(entry)
       const minutes = Math.max(1, Math.round(this.turnTimeoutMs / 60_000))
       try {

@@ -276,6 +276,7 @@ function createSystem(path: string, options: SystemOptions = {}): System {
     },
     ...(options.prepare ? { prepare: options.prepare } : {}),
     ...(options.turnTimeoutMs !== undefined ? { turnTimeoutMs: options.turnTimeoutMs } : {}),
+    modelErrorRetryMs: 20,
     maxSlots: options.maxSlots ?? 2,
     graceMs: 200,
     atomic: work => repo.atomic(work),
@@ -506,6 +507,22 @@ describe('PiExecutor', () => {
     const report = system.repo.tickets.get(ticketId)!.assignments[0]!.report!
     expect(report.summary).toContain('执行超时')
     expect(report.summary).toContain('超过 1 分钟')
+  })
+
+  it('retries a turn that ended on a model error without a report', async () => {
+    const directory = tempDir()
+    const log = join(directory, 'pi.log')
+    const system = createSystem(':memory:', { env: () => ({ FAKE_PI_LOG: log, FAKE_PI_MODEL_ERRORS: '1' }) })
+    const ticketId = accept(system)
+    await until(() => logRecords(log).some(record => record.command === 'prompt' && record.message?.includes('model service error')), 'the retry prompt')
+    expect(system.repo.tickets.get(ticketId)!.assignments[0]?.report).toBeUndefined()
+  })
+
+  it('reports failed after the model keeps erroring', async () => {
+    const system = createSystem(':memory:', { env: () => ({ FAKE_PI_MODEL_ERRORS: '20' }) })
+    const ticketId = accept(system)
+    await until(() => system.repo.tickets.get(ticketId)!.assignments[0]?.report?.state === 'failed', 'the failed report')
+    expect(system.repo.tickets.get(ticketId)!.assignments[0]!.report!.summary).toContain('模型服务连续出错')
   })
 
   it('does not stop a long turn that keeps producing steps: the watchdog measures silence', async () => {

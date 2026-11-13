@@ -16,6 +16,8 @@ import { createSseUsageParser, extractUsage, type Usage } from './usage.ts'
 export interface Authorized {
   ticketId: string
   role: string
+  /** Sub-agent role when the token carried a `.<role>` suffix; absent for the ticket's main worker. */
+  agent?: string
 }
 
 /** An authorization result: accepted, or denied because the token is unknown or the ticket's budget is spent. */
@@ -37,6 +39,8 @@ export interface UpstreamTarget {
 export interface CallRecord {
   ticketId: string
   role: string
+  /** Sub-agent role that made the call; absent for the ticket's main worker. */
+  agent?: string
   provider: string
   model: string
   usage: Usage | undefined
@@ -71,6 +75,13 @@ export interface GatewayOptions {
    * stream idles. Defaults to 600 000. Zero disables the timer.
    */
   upstreamTimeoutMs?: number
+  /** Deadline for the upstream response headers alone; a hung upstream is cut so the client can retry. Default 150 000. */
+  headersTimeoutMs?: number
+  /**
+   * An event stream that carries only keep-alive pings (or nothing) for this long is treated as stalled and cut, even
+   * though bytes keep arriving. Default 240 000. Zero disables the check.
+   */
+  stallTimeoutMs?: number
 }
 
 export interface Gateway {
@@ -92,6 +103,20 @@ const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024
 /** How much of an over-limit body is read so its older images can be dropped; beyond this it is refused unread. */
 const HARD_BODY_CAP_BYTES = 96 * 1024 * 1024
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 600_000
+const DEFAULT_HEADERS_TIMEOUT_MS = 150_000
+const DEFAULT_STALL_TIMEOUT_MS = 240_000
+
+/** Whether an SSE chunk carries real content, not just blank lines, comments or ping events. */
+export function sseHasContent(chunk: Buffer): boolean {
+  for (const raw of chunk.toString('utf8').split('\n')) {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw
+    if (line.trim() === '' || line.startsWith(':')) continue
+    if (/^event:\s*ping\s*$/.test(line)) continue
+    if (/^data:\s*\{\s*"type"\s*:\s*"ping"\s*\}\s*$/.test(line)) continue
+    return true
+  }
+  return false
+}
 /** Client headers in this namespace are session routing, chosen by the gateway, never supplied by the caller. */
 const RESERVED_HEADER_PREFIX = 'x-opencode-'
 
@@ -292,6 +317,8 @@ export function createGateway(options: GatewayOptions): Gateway {
   const port = options.port ?? 0
   const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
   const upstreamTimeoutMs = options.upstreamTimeoutMs ?? DEFAULT_UPSTREAM_TIMEOUT_MS
+  const headersTimeoutMs = options.headersTimeoutMs ?? DEFAULT_HEADERS_TIMEOUT_MS
+  const stallTimeoutMs = options.stallTimeoutMs ?? DEFAULT_STALL_TIMEOUT_MS
 
   /** A price lookup that cannot take the gateway down; a failing lookup means no price. */
   const priceOf = (providerId: string, model: string): Price | undefined => {
@@ -333,10 +360,19 @@ export function createGateway(options: GatewayOptions): Gateway {
     let upstreamRequest: ClientRequest | undefined
     /** The SSE usage reader, once the upstream answered with an event stream; it keeps usage seen before a cut. */
     let sseParser: ReturnType<typeof createSseUsageParser> | undefined
+    let headersTimer: NodeJS.Timeout | undefined
+    let stallTimer: NodeJS.Timeout | undefined
+    const clearTimers = (): void => {
+      if (headersTimer) clearTimeout(headersTimer)
+      if (stallTimer) clearTimeout(stallTimer)
+      headersTimer = undefined
+      stallTimer = undefined
+    }
 
     const finalize = (resultStatus: number, usage: Usage | undefined): void => {
       if (finished) return
       finished = true
+      clearTimers()
       upstreamRequest?.setTimeout(0)
       let costUsd = 0
       const price = usage ? priceOf(providerId, model) : undefined
@@ -345,6 +381,7 @@ export function createGateway(options: GatewayOptions): Gateway {
         record({
           ticketId: auth.ticketId,
           role: auth.role,
+          ...(auth.agent ? { agent: auth.agent } : {}),
           provider: providerId,
           model,
           usage,
@@ -369,16 +406,30 @@ export function createGateway(options: GatewayOptions): Gateway {
     res.on('error', abortUpstream)
     req.on('error', abortUpstream)
 
+    // A stream that only pings is cut as 504 so the agent retries at once instead of waiting on a dead generation.
+    const armStall = (): void => {
+      if (stallTimeoutMs <= 0 || finished) return
+      if (stallTimer) clearTimeout(stallTimer)
+      stallTimer = setTimeout(() => {
+        if (finished) return
+        upstreamRequest?.destroy()
+        res.destroy()
+        finalize(504, sseParser?.usage())
+      }, stallTimeoutMs)
+      stallTimer.unref?.()
+    }
+
     const onResponse = (upstreamRes: IncomingMessage): void => {
+      if (headersTimer) { clearTimeout(headersTimer); headersTimer = undefined }
       status = upstreamRes.statusCode ?? 502
       res.writeHead(status, responseHeaders(upstreamRes.headers))
       res.flushHeaders()
       const contentType = String(upstreamRes.headers['content-type'] ?? '').toLowerCase()
-      if (contentType.includes('text/event-stream')) sseParser = createSseUsageParser()
+      if (contentType.includes('text/event-stream')) { sseParser = createSseUsageParser(); armStall() }
       const buffered: Buffer[] = []
 
       upstreamRes.on('data', (chunk: Buffer) => {
-        if (sseParser) sseParser.push(chunk)
+        if (sseParser) { sseParser.push(chunk); if (sseHasContent(chunk)) armStall() }
         else buffered.push(chunk)
         res.write(chunk)
       })
@@ -397,6 +448,17 @@ export function createGateway(options: GatewayOptions): Gateway {
     upstreamRequest = url.protocol === 'https:'
       ? httpsRequest(url, { method: req.method, headers }, onResponse)
       : httpRequest(url, { method: req.method, headers }, onResponse)
+
+    // Headers that never come mean a hung upstream; answer 504 early so the agent's own retry can start.
+    if (headersTimeoutMs > 0) {
+      headersTimer = setTimeout(() => {
+        if (finished || res.headersSent) return
+        upstreamRequest?.destroy()
+        if (!res.destroyed) sendJson(res, 504, { error: { type: 'upstream_timeout', message: 'Upstream sent no response headers in time' } })
+        finalize(504, undefined)
+      }, headersTimeoutMs)
+      headersTimer.unref?.()
+    }
 
     // Covers both waiting for the response headers and an idle stream. A timed-out exchange is recorded as 504.
     if (upstreamTimeoutMs > 0) {

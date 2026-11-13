@@ -39,3 +39,21 @@ describe('activity log', () => {
     expect(log.list('other').items).toEqual([])
   })
 })
+
+import { DatabaseSync } from 'node:sqlite'
+describe('ActivityLog persistence', () => {
+  it('keeps steps across a restart and marks a dangling running step as error', () => {
+    const db = new DatabaseSync(':memory:')
+    const a = new ActivityLog(undefined, db)
+    a.record('t1', { type: 'tool_execution_start', toolCallId: 'c1', toolName: 'bash', args: { command: 'ls' } } as never)
+    a.note('t1', 'hello')
+    const b = new ActivityLog(undefined, db)
+    const view = b.list('t1')
+    expect(view.items.map(i => i.summary)).toEqual(['ls', 'hello'])
+    expect(view.items[0]?.status).toBe('error')
+    b.note('t1', 'next')
+    expect(b.list('t1').last).toBeGreaterThan(view.last)
+    b.forget('t1')
+    expect(new ActivityLog(undefined, db).list('t1').items).toEqual([])
+  })
+})

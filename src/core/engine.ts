@@ -169,7 +169,9 @@ export class Engine {
    * Assignment when the ticket failed, timed out, was blocked or ended (a stopped one included).
    * @throws UserError when the ticket is unknown, or processing is paused and it would have to start again.
    */
-  instruct(ticketId: string, text: string): Ticket { return this.repo.atomic(() => this.tickets.instruct(ticketId, text)) }
+  instruct(ticketId: string, text: string, options: { restart?: boolean } = {}): Ticket {
+    return this.repo.atomic(() => this.tickets.instruct(ticketId, text, options))
+  }
 
   // The Executor
 

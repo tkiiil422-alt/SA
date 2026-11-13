@@ -1,14 +1,18 @@
 node_modules/
 dist/
-*.db
-*.db-wal
-*.db-shm
+web/dist/
+*.tsbuildinfo
 
 # Runtime state: database, vault, admin/CLI tokens, source settings, Pi configs
 /state/
 .superagent/
 cli-token
+control.json
 pi-config/
+inbox/
+*.db
+*.db-wal
+*.db-shm
 
 # Local secrets and deployment overrides
 .env

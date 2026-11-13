@@ -22,7 +22,10 @@ RUN git config --system credential.https://github.com.helper '!f() { test "$1" =
  && git config --system user.email superagent@localhost
 
 # Pin the agent version: an unpinned update would silently change the RPC protocol under the executor.
-RUN npm install -g @earendil-works/pi-coding-agent@1.5.0 \
+# PI_VERSION is set by the console's Pi version page (`podman build --build-arg PI_VERSION=x.y.z`); the default is the
+# version this repository was last verified with.
+ARG PI_VERSION=1.5.0
+RUN npm install -g @earendil-works/pi-coding-agent@${PI_VERSION} \
  && npm cache clean --force
 
 # The base image already ships uid 1000 as `node`; `--userns=keep-id` maps the host user onto it so mounted files stay

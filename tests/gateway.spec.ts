@@ -762,3 +762,45 @@ describe('pricing', () => {
     expect(cost('deepseek-v4-pro', usage, new Date('2026-11-04T20:00:00Z'))).toBeCloseTo(2.662, 12)
   })
 })
+
+describe('gateway stall detection', () => {
+  it('answers 504 early when upstream sends no headers within headersTimeoutMs', async () => {
+    const upstream = track(await startUpstream(() => { /* never respond */ }))
+    const { port, records } = await gatewayFor(upstream, { headersTimeoutMs: 80, upstreamTimeoutMs: 5000 })
+    const started = Date.now()
+    const response = await call(port, 'ticket-abc', '{"model":"deepseek-flash"}')
+    expect(response.status).toBe(504)
+    expect(Date.now() - started).toBeLessThan(2000)
+    await waitUntil(() => records.length === 1, 'the record')
+    expect(records[0]!.status).toBe(504)
+  })
+
+  it('cuts an event stream that only sends pings for stallTimeoutMs, but not one with content', async () => {
+    const upstream = track(await startUpstream((_call, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      const t = setInterval(() => { if (!res.writableEnded) res.write('event: ping\ndata: {"type": "ping"}\n\n') }, 20)
+      res.on('close', () => clearInterval(t))
+    }))
+    const { port, records } = await gatewayFor(upstream, { stallTimeoutMs: 150, upstreamTimeoutMs: 5000 })
+    const outcome = await withTimeout(new Promise<string>(resolve => {
+      const body = '{"model":"deepseek-flash","stream":true}'
+      const request = httpRequest({
+        host: '127.0.0.1', port, path: `${P}/v1/chat/completions`, method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)), authorization: 'Bearer ticket-abc' },
+      }, res => { res.on('data', () => {}); res.on('end', () => resolve('end')); res.on('close', () => resolve('closed')); res.on('error', () => resolve('closed')) })
+      request.on('error', () => resolve('closed'))
+      request.end(body)
+    }), 3000, 'the gateway kept the ping-only stream open')
+    expect(['closed', 'end']).toContain(outcome)
+    await waitUntil(() => records.length === 1, 'the stall record')
+    expect(records[0]!.status).toBe(504)
+  })
+
+  it('treats ping lines as no content and data lines as content', async () => {
+    const { sseHasContent } = await import('../src/gateway/gateway.ts')
+    expect(sseHasContent(Buffer.from('event: ping\ndata: {"type": "ping"}\n\n'))).toBe(false)
+    expect(sseHasContent(Buffer.from(': keepalive\n\n'))).toBe(false)
+    expect(sseHasContent(Buffer.from('event: content_block_delta\ndata: {"type":"content_block_delta"}\n\n'))).toBe(true)
+  })
+})
+

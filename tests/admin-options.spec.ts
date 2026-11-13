@@ -7,6 +7,7 @@ import {
   type Options, type OptionsSection,
 } from '../src/admin/options.ts'
 import { defaultCouncilRoles } from '../src/council/roles.ts'
+import { defaultCollabRoles } from '../src/executor/collab.ts'
 
 const dirs: string[] = []
 
@@ -122,6 +123,20 @@ describe('defaultOptions', () => {
         moderator: null,
         roles: defaultCouncilRoles(),
       },
+      novel: {
+        enabled: false,
+        models: { planner: null, writer: null, reviewer: null, extractor: null },
+        chapterChars: [2500, 3500],
+        maxRevisions: 2,
+        minScore: 6,
+        dailyUsd: 0,
+        arcUsd: 0,
+        bookUsd: 0,
+        maxActiveBooks: 1,
+        extraBanned: [],
+      },
+      collab: { enabled: true, maxConcurrent: 2, maxCalls: 20, roles: defaultCollabRoles() },
+      goal: { maxRounds: 8, maxUsd: 3, maxHours: 6, commandTimeoutSec: 600, judge: null },
     })
   })
 

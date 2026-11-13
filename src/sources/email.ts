@@ -384,6 +384,32 @@ export class EmailSource implements SourceScope {
     }
   }
 
+  /**
+   * Send a new mail (not a reply) from the bound address, for a worker's `sa_email_send`. Throws a message with the
+   * password scrubbed when the mailbox is off, unconfigured, or SMTP refuses.
+   */
+  async sendNew(input: { to: string[]; subject: string; text: string; ticketId?: string }): Promise<void> {
+    const config = this.options.config()
+    if (!config.enabled) throw new Error('邮箱没有启用，请先在「连接」里打开邮箱。')
+    if (config.address.trim() === '' || config.password === '') throw new Error('邮箱还没有填写地址或应用专用密码。')
+    const from = config.displayName.trim() === ''
+      ? config.address
+      : `"${config.displayName.trim().replace(/"/g, '')}" <${config.address}>`
+    try {
+      const transport = this.smtpFactory(config)
+      try {
+        await transport.send({ from, to: input.to.join(', '), subject: input.subject, text: input.text })
+      } finally {
+        transport.close?.()
+      }
+      this.emit({ kind: 'email.sent', level: 'info', text: `邮件已发送给 ${input.to.join('、')}`, data: { ticketId: input.ticketId ?? '' } })
+    } catch (error) {
+      const text = this.scrub(describe(error), config)
+      this.emit({ kind: 'email.failed', level: 'warn', text: `邮件发送失败：${text}`, data: { ticketId: input.ticketId ?? '' } })
+      throw new Error(`邮件发送失败：${text}`)
+    }
+  }
+
   private schedule(): void {
     if (!this.running) return
     if (this.timer !== undefined) clearTimeout(this.timer)

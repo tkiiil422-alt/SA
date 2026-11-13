@@ -957,6 +957,16 @@ export function mount(ctx) {
       const current = state.current
       // Same rule as the server: ended, or waiting on a person (failed / blocked / timed out), or a failed delivery.
       const restart = isEnded(current) || Boolean(current?.canRetry)
+      // The models a person can switch to; the ticket's current one is preselected, so leaving it changes nothing.
+      let options = []
+      try {
+        const list = await get('api/models')
+        options = (Array.isArray(list?.items) ? list.items : []).map((item) => ({ value: item.ref, label: `${item.providerName} · ${item.label}` }))
+      } catch { /* without the list the sheet just has no model choice */ }
+      const currentRef = current?.model?.ref ?? ''
+      if (currentRef && !options.some((option) => option.value === currentRef)) {
+        options.unshift({ value: currentRef, label: `${current?.model?.label || currentRef}（当前）` })
+      }
       const values = await bus.sheet({
         title: '给这个任务发新指令',
         text: restart
@@ -964,9 +974,16 @@ export function mount(ctx) {
           : '它正在干活，这条指令会在它的下一步送到。',
         confirmLabel: restart ? '发出并继续' : '发出',
         field: { id: 'text', label: '指令', placeholder: '例如：接着把截图测试跑完，再把视频导出来' },
+        select: options.length > 1 ? {
+          id: 'model', label: '用哪个模型执行', options, value: currentRef,
+          help: '换成别的模型时，从这一轮起改用它；工作区和之前的进度都保留。正在跑的这一轮会先停下再换。',
+        } : undefined,
       })
       const text = values?.text?.trim()
-      if (text) await act(() => post(api('/reply'), { text }), restart ? '已发出，任务重新开工' : '已发出')
+      if (!text) return
+      const model = values?.model && values.model !== currentRef ? values.model : ''
+      const message = model ? '已发出，换模型后重新开工' : restart ? '已发出，任务重新开工' : '已发出'
+      await act(() => post(api('/reply'), { text, ...(model ? { model } : {}) }), message)
       return
     }
     if (action === 'note') {

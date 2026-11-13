@@ -165,6 +165,17 @@ function openAiItem(raw: unknown): DiscoveredModel | undefined {
     const cacheRead = priceOf(pricing?.input_cache_read) ?? prompt
     model.price = { input: perMillion(prompt), cacheRead: perMillion(cacheRead), output: perMillion(completion) }
   }
+  // OpenCode-style listings publish `cost.text.{input,output}.price` already in USD per million tokens.
+  if (model.price === undefined) {
+    const text = asObject(asObject(item.cost)?.text)
+    const input = asObject(text?.input)
+    const inputPrice = priceOf(input?.price)
+    const outputPrice = priceOf(asObject(text?.output)?.price)
+    if (inputPrice !== undefined && outputPrice !== undefined) {
+      const cacheRead = priceOf(asObject(input?.cache)?.read) ?? inputPrice
+      model.price = { input: inputPrice, cacheRead, output: outputPrice }
+    }
+  }
   return model
 }
 

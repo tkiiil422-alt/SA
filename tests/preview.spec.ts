@@ -305,7 +305,7 @@ describe('sa_preview MCP tool', () => {
     const { tools } = await client.listTools()
     // New tools are appended, so the preview tool is no longer last; the order stays stable.
     expect(tools.map(tool => tool.name)).toContain('sa_preview')
-    expect(tools.at(-1)?.name).toBe('sa_github_pr')
+    expect(tools.at(-1)?.name).toBe('sa_email_send')
   })
 })
 

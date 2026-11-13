@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { AdminAuth } from '../src/admin/auth.ts'
+import { ActivityLog } from '../src/executor/activity.ts'
 import { createAdminApi } from '../src/admin/api.ts'
 import {
   AdminError,
@@ -51,6 +52,8 @@ const NOW = new Date()
 const NOW_ISO = NOW.toISOString()
 
 const dirs: string[] = []
+
+const testActivity = new ActivityLog()
 
 function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'sa-api-'))
@@ -230,9 +233,9 @@ class FakeHost implements AdminHost {
     this.notes.push({ id, text })
   }
 
-  replyTicket(id: string, text: string): void {
+  replyTicket(id: string, text: string, model?: string): void {
     this.require(id)
-    this.replies.push({ id, text })
+    this.replies.push({ id, text, ...(model === undefined ? {} : { model }) })
   }
 
   decisions(limit: number, offset = 0, kind?: string): DecisionView[] {
@@ -568,6 +571,7 @@ async function setup(options: { autoLogin?: boolean; generated?: boolean } = {})
     ledger,
     events,
     cliToken: CLI_TOKEN,
+    activity: testActivity,
     onPolicyOrSettingsChange: change => { changes.push(change) },
   })
   const server = createAdminServer({ api: apiHandler, staticHandler: () => false, port: 0 })
@@ -1568,6 +1572,83 @@ describe('admin API limits', () => {
       expect(response.status).toBe(404)
     } finally {
       await harness.close()
+    }
+  })
+})
+
+describe('activity stream', () => {
+  it('streams steps as SSE and resumes after Last-Event-ID', async () => {
+    const h = await setup()
+    try {
+      testActivity.note('t1', 'first')
+      testActivity.note('t1', 'second')
+      const read = async (headers: Record<string, string>): Promise<string> => {
+        const ctl = new AbortController()
+        const r = await fetch(`${h.base}/api/tickets/t1/activity/stream`, { headers: { cookie: h.cookie, ...headers }, signal: ctl.signal })
+        expect(r.status).toBe(200)
+        expect(r.headers.get('content-type')).toContain('text/event-stream')
+        const reader = r.body!.getReader()
+        let text = ''
+        const dec = new TextDecoder()
+        while (!text.includes('second')) {
+          const { value, done } = await reader.read()
+          if (done) break
+          text += dec.decode(value)
+        }
+        ctl.abort()
+        return text
+      }
+      const all = await read({})
+      expect(all).toContain('first')
+      expect(all).toContain('event: step')
+      const firstId = Number(/id: (\d+)/.exec(all)![1])
+      const resumed = await read({ 'last-event-id': String(firstId) })
+      expect(resumed).not.toContain('"first"')
+      expect(resumed).toContain('second')
+      expect((await h.api('/tickets/nope/activity/stream')).status).toBe(404)
+    } finally {
+      await h.close()
+    }
+  })
+})
+
+describe('live board stream', () => {
+  it('sends a board snapshot on connect with slots, open tickets and alerts', async () => {
+    const h = await setup()
+    try {
+      const ctl = new AbortController()
+      const r = await fetch(`${h.base}/api/live/stream`, { headers: { cookie: h.cookie }, signal: ctl.signal })
+      expect(r.status).toBe(200)
+      expect(r.headers.get('content-type')).toContain('text/event-stream')
+      const reader = r.body!.getReader()
+      const dec = new TextDecoder()
+      let text = ''
+      while (!/event: board\ndata: .*\n\n/.test(text)) {
+        const { value, done } = await reader.read()
+        if (done) break
+        text += dec.decode(value)
+      }
+      ctl.abort()
+      expect(text).toContain('retry:')
+      const data = JSON.parse(/event: board\ndata: (.*)\n/.exec(text)![1]!)
+      expect(data.slots).toEqual({ used: 1, max: 2, reservedForPerson: 1 })
+      expect(Array.isArray(data.open)).toBe(true)
+      expect(Array.isArray(data.ended)).toBe(true)
+      expect(Array.isArray(data.runningSteps)).toBe(true)
+      expect(Array.isArray(data.alerts)).toBe(true)
+      expect(typeof data.now).toBe('string')
+    } finally {
+      await h.close()
+    }
+  })
+
+  it('requires a session', async () => {
+    const h = await setup()
+    try {
+      const r = await fetch(`${h.base}/api/live/stream`)
+      expect(r.status).toBe(401)
+    } finally {
+      await h.close()
     }
   })
 })
