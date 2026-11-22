@@ -44,6 +44,8 @@ const P: Record<string, ReactNode> = {
   alert: <><path d="M12 4.5 20.5 19h-17z" /><path d="M12 10v4" />{dot(12, 16.6, 1.1)}</>,
   pulse: <><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="7.5" opacity=".35" /></>,
   pause: <path d="M9 6v12M15 6v12" />,
+  memory: <><path d="M9.5 4.5a3.5 3.5 0 0 0-3.5 3.5v.5A3 3 0 0 0 4 11.3a3 3 0 0 0 1.8 2.7v.5a3.5 3.5 0 0 0 3.7 3.5h.5V4.5zM14.5 4.5a3.5 3.5 0 0 1 3.5 3.5v.5A3 3 0 0 1 20 11.3a3 3 0 0 1-1.8 2.7v.5a3.5 3.5 0 0 1-3.7 3.5H14V4.5z" /></>,
+  schedules: <><circle cx="12" cy="13" r="7.5" /><path d="M12 9v4l2.8 1.8M9 3.5h6M12 3.5V5.5" /></>,
   server: <><rect x="4" y="4.5" width="16" height="15" rx="2" /><path d="M8 9h8M8 13h5" /></>,
 }
 

@@ -543,7 +543,12 @@ export { Settings } from './settings'
 
 /* ---------- 更多 ---------- */
 const MORE: [string, [string, string, string][]][] = [
-  ['工作', [['director', '总控助手', '微信与控制台共用的平台总控 AI'], ['councils', '会商', '让几个 AI 角色先讨论']]],
+  ['工作', [
+    ['director', '总控助手', '微信与控制台共用的平台总控 AI'],
+    ['schedules', '定时巡检', 'Cron 定时派单、主动巡检与 HTTP 变更监控'],
+    ['memory', '记忆技能', '三层长期记忆、SOP 技能库与子系统插件'],
+    ['councils', '会商', '让几个 AI 角色先讨论'],
+  ]],
   ['安全', [
     ['defense', '防御工作台', '应用安全代码审查、配置基线核查、直接加固与自动快照'],
     ['pentest', '渗透工作台', '内部红队测试、源码快扫、OWASP 剧本与漏洞管理'],

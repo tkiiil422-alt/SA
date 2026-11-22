@@ -12,6 +12,8 @@ import { DevEnv } from './devenv'
 import { Pentest } from './pentest'
 import { Defense } from './defense'
 import { Director } from './director'
+import { MemoryPage } from './memory'
+import { SchedulerPage } from './scheduler'
 import { Icon, Logo } from './icons'
 import { GoalCard, GoalSheet } from './goal'
 import './style.css'
@@ -518,9 +520,10 @@ function Login({ onDone }: { onDone: () => void }) {
 const PAGES: Record<string, () => JSX.Element> = {
   new: P.NewTask, director: Director, projects: P.Projects, usage: P.Usage, events: P.Events, decisions: P.Decisions, system: P.System, pi: PiVersions, devenv: DevEnv,
   connections: P.Connections, secrets: P.Secrets, novels: P.Novels, settings: P.Settings, councils: P.Councils, fanqie: Fanqie, defense: Defense, pentest: Pentest,
+  memory: MemoryPage, schedules: SchedulerPage,
 }
 const SIDE_GROUPS: [string, [string, string][]][] = [
-  ['工作', [['today', '今日'], ['director', '总控助手'], ['tickets', '任务'], ['projects', '项目'], ['councils', '会商']]],
+  ['工作', [['today', '今日'], ['director', '总控助手'], ['tickets', '任务'], ['projects', '项目'], ['councils', '会商'], ['schedules', '定时巡检'], ['memory', '记忆技能']]],
   ['安全', [['defense', '防御工作台'], ['pentest', '渗透工作台']]],
   ['写作', [['novels', '书库'], ['fanqie', '番茄发布']]],
   ['管理', [['usage', '花费'], ['secrets', '密钥'], ['connections', '连接'], ['pi', 'Pi 版本'], ['devenv', '开发环境'], ['settings', '设置']]],
@@ -529,6 +532,8 @@ const SIDE_GROUPS: [string, [string, string][]][] = [
 
 const CMD_LINKS: { label: string; hint: string; href: string; keywords: string }[] = [
   { label: '总控助手', hint: '微信与网页共用的平台总控 AI 对话、工具审计与审批', href: '#/director', keywords: 'director ai assistant 总控 助手 微信 对话' },
+  { label: '记忆与技能库', hint: '三层长期记忆（偏好/项目/复盘）、技能 SOP 与已加载插件', href: '#/memory', keywords: 'memory skill sop plugin 记忆 技能 插件 复盘' },
+  { label: '定时与巡检', hint: 'Cron 定时派单、总控巡检、零 Token HTTP 监控', href: '#/schedules', keywords: 'schedule cron watch 定时 巡检 监控 调度' },
   { label: '总控设置', hint: '总控模型、失败重试次数、主动汇报范围、高危二次确认与预算', href: '#/settings/director', keywords: 'director settings retry 总控 设置 重试' },
   { label: '发任务', hint: '新建一条 AI 执行任务', href: '#/new', keywords: 'new task ask 新建' },
   { label: '今日总览', hint: '工位、待处理、今日花费', href: '#/today', keywords: 'today home 首页' },
