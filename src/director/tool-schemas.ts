@@ -10,7 +10,7 @@ import type { PluginRegistry } from '../plugins/registry.ts'
 const BASE_QUERY_ACTIONS = [
   'platform_overview', 'system_status', 'orphans_list', 'plugins_list',
   'pi_status', 'devenv_status',
-  'tickets_list', 'ticket_detail', 'ticket_activity', 'ticket_files', 'ticket_read_file',
+  'tickets_list', 'ticket_detail', 'ticket_receipt', 'ticket_activity', 'ticket_files', 'ticket_read_file',
   'usage_summary', 'usage_calls', 'events_list', 'decisions_list',
   'projects_list', 'project_detail', 'project_files', 'project_read_file', 'project_snapshots', 'project_snapshot_diff',
   'novels_list', 'novel_detail', 'novel_chapter', 'novel_canon_get', 'fanqie_status',
@@ -87,17 +87,20 @@ export function buildDirectorToolDefinitions(plugins?: PluginRegistry): readonly
     },
     {
       name: 'dispatch_ticket',
-      description: '派发一条新任务工单到执行沙箱。请把与用户沟通明确的背景、需求与验收标准写入 prompt；可绑定项目库 projectId（projectMode=direct 时直接修改项目库原件，copy 时在副本上改）、指定模型、开启/关闭多模型协作、或附带验收目标 goal_json。若承诺任务完成后自动执行下一步（如部署、验收、发下个工单等），务必填写 onComplete 登记自动续接触发器！携带 secrets 时自动触发二次确认。',
+      description: '派发一条新任务工单到本机执行引擎。请把与用户沟通明确的背景、需求与验收标准写入 prompt；可绑定项目库 projectId（推荐同一 Git 仓库并发改造用 projectMode="worktree"；direct 直接修改项目库原件；copy 独立副本）、选择本机执行器 runnerId（默认 pi；确定性数据核对/清单优先用 0 Token script + scriptId + scriptParams_json）、指定模型、开启/关闭多模型协作、或附带结构化验收目标 goal_json。若承诺任务完成后自动执行下一步（如部署、验收、发下个工单等），务必填写 onComplete 登记自动续接触发器！携带 secrets 时自动触发二次确认。',
       parameters: {
         type: 'object',
         properties: {
           prompt: { type: 'string', description: '整理后的清晰任务说明书与验收要求' },
-          projectId: { type: 'string', description: '可选：项目库 ID（先经 projects_list 确认存在且就绪）' },
-          projectMode: { type: 'string', enum: ['copy', 'direct', 'worktree'], description: '可选：copy（默认）副本模式；worktree 推荐用于同一仓库并行开发（秒级隔离分支，改完可审 Diff 并一键合并）；direct 直接改项目原件（同一项目同时只能有一个 direct 任务）' },
+          projectId: { type: 'string', description: '可选：项目库 ID（先经 projects_list 或实时态势快照确认存在且就绪）' },
+          projectMode: { type: 'string', enum: ['copy', 'direct', 'worktree'], description: '可选：copy（默认）副本模式；worktree 推荐用于同一 Git 仓库并发开发（秒级隔离分支，改完可审 Diff 并一键合并）；direct 直接改项目原件（同一项目同时只能有一个 direct 任务）' },
+          runnerId: { type: 'string', enum: ['pi', 'script', 'claude-code', 'opencode'], description: '可选：本机执行器 ID，默认 pi；确定性零 Token 核对任务用 script' },
+          scriptId: { type: 'string', description: '可选：当 runnerId="script" 时必填的已登记脚本 ID（如 sales-report-check、workspace-manifest）' },
+          scriptParams_json: { type: 'string', description: '可选：当 runnerId="script" 时的结构化参数 JSON 对象字符串' },
           model: { type: 'string', description: '可选：指定执行模型 ref（如 provider/model）' },
           collab: { type: 'boolean', description: '可选：是否开启工单内多模型协作，默认 true' },
           secrets: { type: 'array', items: { type: 'string' }, description: '可选：需授予该工单的已有密钥名称（触发二次确认）' },
-          goal_json: { type: 'string', description: '可选：目标验收 JSON 字符串，格式 {"description":"...","criteria":["..."],"commands":["..."],"maxRounds":8,"maxUsd":3}' },
+          goal_json: { type: 'string', description: '可选：目标验收 JSON 字符串，格式 {"description":"...","criteria":["..."],"commands":["..."],"requireEvidence":true,"maxRounds":8,"maxUsd":3}' },
           onComplete: { type: 'string', description: '可选：该工单完成后自动唤醒总控执行的下一步动作说明（如“核验测试通过后执行主机部署并重启服务”）。填写后系统会在工单结束时自动唤醒你执行，无需主人再发指令！' },
           onFailure: { type: 'string', enum: ['report', 'continue'], description: '可选：配合 onComplete 使用，report（默认）表示若工单失败仅分析汇报；continue 表示无论成败都按 onComplete 继续处理' },
         },

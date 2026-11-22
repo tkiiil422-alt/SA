@@ -2108,6 +2108,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       novels,
       fanqie,
       goals,
+      contracts,
       pentest,
       piVersions,
       devEnv,

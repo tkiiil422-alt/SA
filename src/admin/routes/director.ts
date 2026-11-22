@@ -85,15 +85,20 @@ export async function handleDirectorRoutes(deps: AdminRouteDeps, { req, res, url
       if (res.writableEnded || res.destroyed) return
       res.write(`event: progress\ndata: ${JSON.stringify(ev)}\n\n`)
     }
+    const abort = new AbortController()
+    const onClose = (): void => abort.abort()
+    req.on('close', onClose)
     try {
       const resChat = await svc.chat({
         ...parsed.data,
+        signal: abort.signal,
         onProgress: ev => writeEvent(ev),
       })
       writeEvent({ type: 'done', result: { ok: true, ...resChat } })
     } catch (error) {
       writeEvent({ type: 'error', message: error instanceof Error ? error.message : String(error) })
     } finally {
+      req.off('close', onClose)
       if (!res.writableEnded) res.end()
     }
     return true

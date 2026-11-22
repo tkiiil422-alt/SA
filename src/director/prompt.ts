@@ -10,6 +10,8 @@ export interface PromptContext {
   pendingActions: readonly PendingAction[]
   pendingFollowups?: readonly DirectorFollowup[]
   extraPrompt?: string
+  /** 由 Runtime 实时采集的低开销平台态势快照（活跃工单/就绪项目/进行中 DAG），免去首轮盲查。 */
+  liveSnapshot?: string
   /** 由 PluginRegistry 动态注入的附加段落（如长期记忆、可用技能库、插件工具速查）。 */
   pluginSections?: readonly string[]
 }
@@ -20,11 +22,14 @@ export function buildDirectorSystemPrompt(ctx: PromptContext): string {
     '',
     '## 你的核心职责',
     '1. **主机与控制台全景洞察**：你可以调用工具读取宿主机与平台控制台的所有实时数据（主机 CPU/内存/磁盘/目录占用/进程/Podman 容器与镜像/systemd 服务状态与日志/非敏感文件、Pi 版本与开发环境状态、工单列表/详情/实时步骤/交付物、费用与预算、事件与决策、项目库源码与快照 Diff、小说与设定集、番茄发布、会商、防御工作台与渗透工作台、全部系统设置、模型与各通道连通性测试、密钥元数据与 SSH 配置、联网搜索）。凡是涉及现状、数据、进度、花费、日志或文件内容的问题，必须先查工具拿到真实数据再回答，绝不凭空编造。',
-    '2. **需求理解与全链路派发交付**：',
-    '   - 结合项目上下文、长期记忆和主人偏好直接开始工作；只有遇到**真正影响交付结果的歧义或缺失关键凭据**时才用 1~3 个简明问题向主人确认。',
-    '   - 简单单步任务直接调用 `dispatch_ticket`（明确附上交付物与验收标准 `goal_json`；同一 Git 仓库并发改造优先用 `projectMode:"worktree"`）；复杂多阶段或可并行需求必须调用 `subsystem_action(mission_create)` 拆成 DAG 任务计划并自动推进！',
-    '   - 主人中途纠正要求时，调用 `subsystem_action(contract_amend)` 明确区分“仅本次 (`once`) / 该项目以后都这样做 (`project`) / 主人长期偏好 (`preference`)”，保留已完成结果的原口径，只重做受影响部分。',
-    '   - 交付汇报时，必须让主人一眼看到：① 交付物在哪里、② 逐项验收条件与验证证据（测试/浏览器自检/数据校验）通过情况、③ 仍待处理的事项与是否需要主人拍板。',
+    '2. **需求理解与意图路由决策树**：',
+    '   - 结合下方「平台实时态势快照」、项目上下文、长期记忆和主人偏好直接开始工作；只有遇到**真正影响交付结果的歧义或缺失关键凭据**时才用 1~3 个简明问题向主人确认。',
+    '   - **直答 / 查证**：询问状态、进展、花费、文件、日志或知识问答 → 直接利用快照或并发调用只读工具核实后简明回复，不建多余工单。',
+    '   - **零 Token 确定性任务**：销售 CSV 口径核对、工作区文件校验和等已登记脚本任务 → 直接用 `dispatch_ticket(runnerId:"script", scriptId:"...", scriptParams_json:"...")` 零成本秒完成。',
+    '   - **单步代码或文档交付**：直接调用 `dispatch_ticket`（明确附上交付物与结构化验收标准 `goal_json`；Git 项目改动默认推荐 `projectMode:"worktree"` 隔离分支，方便审查 Diff 与安全合并；仅主人明确要求改原件时用 `direct`）。',
+    '   - **复杂多阶段或可并行需求**：调用 `subsystem_action(mission_create)` 拆成 DAG 任务计划（如「出方案 → 并行子任务 → 汇总验收 → 人工批准」），支持节点间传递真实产物和提交 SHA。',
+    '   - **中途纠正口径**：调用 `subsystem_action(contract_amend)` 明确区分“仅本次 (`once`) / 该项目以后都这样做 (`project`) / 主人长期偏好 (`preference`)”，保留已完成结果的原口径，只重做受影响部分。',
+    '   - **交付汇报**：汇总已完工工单时优先调用 `platform_query(ticket_receipt)` + `ticket_files`，让主人一眼看到：① 交付物在哪里、② 逐项验收条件与验证证据（测试/浏览器自检/数据校验）通过情况、③ 仍待处理的事项与是否需要主人拍板。',
     '   - 主人要求排查主机问题、查看日志/容器/文件、或在主机执行运维命令、重启服务、清理 Podman 镜像/容器时，使用 `host_ops`。',
     '   - 主人要求调整控制台**任何配置**（包括模型服务商增删改/模型清单增删改/API Key 设置与轮换/模型路由与自动选模、总控模型与重试次数、并发与沙箱资源、预算、受理策略与操作员白名单、飞书/邮箱/微信/GitHub 通道与凭据、联网搜索与 Exa Key、协作与会商角色、小说/目标/预览/项目限制、SSH 连接、密钥保险库、切换或删除 Pi/开发镜像、清理工作区/孤儿目录、删除/回滚项目等）时，调用 `high_risk_action`；其中模型服务商新增或同步前可先用 `platform_query(model_discover)` 自动拉取远端模型列表，改完后可用 `platform_query(model_test)` 测通。',
     '   - 需求模糊、缺少关键前提或有重大方案分歧时，先用 1~3 个简明问题与主人确认，或建议先开一次多角色会商（`council_start`）。',
@@ -38,14 +43,14 @@ export function buildDirectorSystemPrompt(ctx: PromptContext): string {
     '- `platform_query(action, params_json)` 控制台只读查询（无参传 `"{}"`）：',
     '  * 全局/设置/连通性：`platform_overview`、`system_status`、`orphans_list`、`settings_get({section?:"all"|"models"|"director"|"executor"|"budget"|"policy"|"feishu"|"email"|"wechat"|"github"|"web"|"collab"|"council"|"novel"|"goal"|"preview"|"projects"|"ssh"})`、`policy_get`、`models_list`、`model_discover({provider?|baseUrl,api?,apiKey?,sessionHeader?})`、`model_test({ref})`、`channel_test({channel:"feishu"|"email"|"wechat"|"github"})`、`wechat_qr_status`、`secrets_overview`、`ssh_list`',
     '  * Pi 与开发环境：`pi_status({force?})`、`devenv_status`',
-    '  * 工单：`tickets_list({status?,q?,limit?})`、`ticket_detail({ticketId})`、`ticket_activity({ticketId,limit?})`、`ticket_files({ticketId,dir?})`、`ticket_read_file({ticketId,path,startLine?,maxLines?})`',
+    '  * 工单：`tickets_list({status?,q?,limit?})`、`ticket_detail({ticketId})`、`ticket_receipt({ticketId})`（一键读取交付物/验收条件/证据/待办）、`ticket_activity({ticketId,limit?})`、`ticket_files({ticketId,dir?})`、`ticket_read_file({ticketId,path,startLine?,maxLines?})`',
     '  * 账本/日志：`usage_summary({range?:"today"|"7d"|"30d"})`、`usage_calls({ticketId?,limit?})`、`events_list({level?,ticketId?,limit?})`、`decisions_list({limit?})`',
     '  * 项目库：`projects_list`、`project_detail({projectId})`、`project_files({projectId,dir?})`、`project_read_file({projectId,path,startLine?,maxLines?})`、`project_snapshots({projectId,limit?})`、`project_snapshot_diff({projectId,from,to?})`',
     '  * 小说/会商/防御与渗透/搜索：`novels_list`、`novel_detail({bookId})`、`novel_chapter({bookId,chapter,includeText?})`、`novel_canon_get({bookId})`、`fanqie_status({bookId?})`、`councils_list({ticketId?,limit?})`、`council_detail({councilId})`、`pentest_list`、`pentest_detail({engagementId})`、`security_task_status({taskId?|engagementId?})`、`web_search({query,count?})`',
     '- `host_ops(action, params_json)` 宿主机与 Podman 运维：',
     '  * 只读（直接执行）：`host_inspect`、`host_logs({unit?,lines?,priority?,grep?,scope?})`、`host_files({path?})`、`host_read_file({path,startLine?,maxLines?})`、`podman_ps({all?})`、`podman_images`、`podman_logs({container,tail?})`、`service_status({unit?,scope?})`',
     '  * 运维变更（自动触发二次确认）：`host_exec({command,cwd?,timeoutSec?})`、`service_control({unit,op:"start"|"stop"|"restart",scope?})`、`podman_action({op:"stop"|"rm"|"prune_images"|"prune_containers",target?})`',
-    '- `dispatch_ticket(prompt, projectId?, projectMode?, model?, collab?, secrets?, goal_json?, onComplete?, onFailure?)`：派发新工单。`projectMode` 默认 `copy`，主人明确要求直接改项目原件时用 `direct`。若任务结束后需自动执行下一步（如部署/验收/派下个单），务必填 `onComplete` 登记自动触发！',
+    '- `dispatch_ticket(prompt, projectId?, projectMode?, runnerId?, scriptId?, scriptParams_json?, model?, collab?, secrets?, goal_json?, onComplete?, onFailure?)`：派发新工单。Git 源码项目推荐 `projectMode:"worktree"`（隔离分支可审 Diff 并安全合并），`copy` 为独立副本，`direct` 直接改原件；确定性零 Token 脚本传 `runnerId:"script"` + `scriptId` + `scriptParams_json`。若任务结束后需自动执行下一步，务必填 `onComplete` 登记自动触发！',
     '- `ticket_manage(action, ticketId, params_json)`：`ticket_reply({text,model?})`、`ticket_note({text})`、`ticket_retry`、`ticket_stop({reason?})`、`ticket_goal_set({description,criteria?,commands?})`、`ticket_goal_cancel`。',
     '- `subsystem_action(action, params_json)`：',
     '  * 自动续接：`followup_set({targetId,triggerKind?:"ticket.ended"|"council.ended",instruction,onFailure?:"report"|"continue"})`、`followup_cancel({followupId})`（配合 `platform_query(followups_list)` 查看）',
@@ -93,6 +98,10 @@ export function buildDirectorSystemPrompt(ctx: PromptContext): string {
     for (const fw of ctx.pendingFollowups) {
       lines.push(`  * #${fw.id} 等待 ${fw.targetId} (${fw.triggerKind}) → ${fw.instruction}`)
     }
+  }
+
+  if (ctx.liveSnapshot && ctx.liveSnapshot.trim()) {
+    lines.push('', '## 平台实时态势快照（已预载，可直接引用 ID）', ctx.liveSnapshot.trim())
   }
 
   if (ctx.session.summary.trim()) {

@@ -1,8 +1,9 @@
 /**
  * 总控助手 AI 指挥中心（#/director）：
- * - 流式 SSE 思考与工具调用实时进度（`POST /api/director/chat/stream`）
- * - 需求上下文快捷装配栏（目标项目 / worktree 模式 / 拆解策略 / 强制证据验收）
- * - 实时 DAG 任务计划编排看板（启动 / 暂停 / 恢复 / 幂等版本审批 / 局部重试 / 取消）+ 活跃工位与高危审批
+ * - 桌面端三栏指挥台（会话栏 · 流式对话主区 · 实时 DAG 计划板）
+ * - 手机端类原生全屏对话布局（顶部三段视图切换「对话 / 会话 / 计划板」、横向快捷芯片栏、可折叠上下文约束抽屉、吸底输入区）
+ * - 流式 SSE 思考与工具调用实时进度（`POST /api/director/chat/stream`）+ 支持中途停止（AbortController）
+ * - 实时 DAG 任务计划编排与幂等审批、高危操作二次确认与自动续接管理
  */
 import { useEffect, useRef, useState } from 'react'
 import { API, get, post } from './api'
@@ -73,31 +74,79 @@ interface PendingFollowup {
 }
 
 const CHANNEL_LABEL: Record<string, string> = { wechat: '微信', web: '网页', feishu: '飞书' }
-const SCOPE_LABEL: Record<string, string> = { all: '全平台重要动态', wechat_only: '仅微信派发任务', off: '关闭主动推送' }
+const SCOPE_LABEL: Record<string, string> = { all: '全平台动态', wechat_only: '仅微信派单', off: '已静默' }
 const MISSION_STATUS: Record<MissionRecord['status'], string> = {
-  draft: '草稿待启动',
+  draft: '草稿',
   running: '执行中',
   paused: '已暂停',
   completed: '已交付',
-  failed: '受阻失败',
+  failed: '受阻',
   cancelled: '已取消',
+}
+const MISSION_TONE: Record<MissionRecord['status'], string> = {
+  draft: 'human',
+  running: 'run',
+  paused: 'human',
+  completed: 'done',
+  failed: 'bad',
+  cancelled: 'done',
 }
 const NODE_STATUS: Record<MissionNodeRecord['status'], string> = {
   pending: '等待依赖',
   dispatching: '派单中',
   running: '执行中',
-  waiting_approval: '待人工批准',
+  waiting_approval: '待审批',
   completed: '已完成',
   failed: '失败',
   skipped: '已跳过',
   cancelled: '已取消',
 }
+const NODE_TONE: Record<MissionNodeRecord['status'], string> = {
+  pending: 'done',
+  dispatching: 'run',
+  running: 'run',
+  waiting_approval: 'human',
+  completed: 'done',
+  failed: 'bad',
+  skipped: 'done',
+  cancelled: 'done',
+}
 
-const QUICK_TEMPLATES: { label: string; prompt: string }[] = [
-  { label: '多步 DAG 拆解', prompt: '请先分析需求并用 DAG 任务计划拆解：出方案 → 并行子任务（使用 worktree 隔离分支） → 汇总测试 → 等我批准。具体需求如下：\n' },
-  { label: '网页改动+自检', prompt: '请修改指定项目的网页功能，要求提交表单后刷新页面数据仍然存在，并运行 browser_verify 完成断言与截图留证，最后提交审查与交付回执。具体修改：\n' },
-  { label: '每周五销售周报', prompt: '请创建一个每周五执行的销售周报定时任务，建立任务约定：按付款日期归集、所有金额保留两位小数，并在交付回执中附上核对证据。' },
-  { label: '全局体检', prompt: '请排查当前所有进行中任务、定时巡检状态、今日花费与异常告警，给我一份简明汇总。' },
+const STARTER_CARDS: { title: string; desc: string; tag: string; prompt: string; sendNow?: boolean }[] = [
+  {
+    title: '多步 DAG 拆解与并发开发',
+    desc: '出方案 → 并行 worktree 子任务 → 汇总测试 → 人工批准',
+    tag: 'DAG 编排',
+    prompt: '请先分析需求并用 DAG 任务计划拆解：出方案 → 并行子任务（使用 worktree 隔离分支） → 汇总测试 → 等我批准。具体需求如下：\n',
+  },
+  {
+    title: '网页改动 + 浏览器自检交付',
+    desc: '修改功能并运行 browser_verify 留证截图、生成交付回执',
+    tag: '研发工厂',
+    prompt: '请修改指定项目的网页功能，要求提交表单后刷新页面数据仍然存在，并运行 browser_verify 完成断言与截图留证，最后提交审查与交付回执。具体修改：\n',
+  },
+  {
+    title: '周期销售周报（0 Token 核对）',
+    desc: '建立可修订任务约定：按付款日期归集、金额保留两位小数',
+    tag: '定时约定',
+    prompt: '请创建一个每周五执行的销售周报定时任务，建立任务约定：按付款日期归集、所有金额保留两位小数，并在交付回执中附上核对证据。',
+  },
+  {
+    title: '全平台健康与花费体检',
+    desc: '一键查看活跃工单、主机负载、定时任务与今日花费',
+    tag: '秒查现状',
+    prompt: '请排查当前所有进行中任务、定时巡检状态、今日花费与异常告警，给我一份简明汇总。',
+    sendNow: true,
+  },
+]
+
+const QUICK_CHIPS: { label: string; cmd?: string; fill?: string }[] = [
+  { label: '/状态', cmd: '/状态' },
+  { label: '/计划', cmd: '/计划' },
+  { label: '/帮助', cmd: '/帮助' },
+  { label: 'DAG 拆解', fill: STARTER_CARDS[0]!.prompt },
+  { label: '网页+自检', fill: STARTER_CARDS[1]!.prompt },
+  { label: '周五周报', fill: STARTER_CARDS[2]!.prompt },
 ]
 
 export function Director() {
@@ -114,7 +163,10 @@ export function Director() {
   const [sending, setSending] = useState(false)
   const [streamEvents, setStreamEvents] = useState<DirectorProgressEvent[]>([])
 
-  // 需求上下文快捷装配栏
+  // 移动端三段切换视图（默认直接进入对话主区）
+  const [mobilePane, setMobilePane] = useState<'chat' | 'sessions' | 'ops'>('chat')
+  // 需求上下文约束抽屉（可折叠，保持输入区清爽）
+  const [ctxOpen, setCtxOpen] = useState(false)
   const [bindProjectId, setBindProjectId] = useState('')
   const [bindMode, setBindMode] = useState<ProjectWorkspaceMode>('worktree')
   const [strategy, setStrategy] = useState<'auto' | 'plan_first' | 'council_first'>('auto')
@@ -123,12 +175,21 @@ export function Director() {
 
   const { busy, run } = useAction()
   const bottomRef = useRef<HTMLDivElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
   const items = sessionsPoll.d?.items ?? []
   const st = sessionsPoll.d?.status
   const globalPending = sessionsPoll.d?.pendingActions ?? []
   const missions = missionsPoll.d?.items ?? []
   const readyProjects = (projectsPoll.d?.items ?? []).filter(p => p.status === 'ready')
+
+  const waitingApprovals = missions.reduce(
+    (sum, m) => sum + m.nodes.filter(n => n.status === 'waiting_approval').length,
+    0,
+  )
+  const opsAttention = waitingApprovals + globalPending.length
+  const activeMissionsCount = missions.filter(m => m.status === 'running' || m.status === 'draft').length
 
   useEffect(() => {
     if (!selectedId && items.length > 0) {
@@ -155,8 +216,11 @@ export function Director() {
     return () => clearInterval(t)
   }, [selectedId])
 
+  useEffect(() => () => { abortRef.current?.abort() }, [])
+
   const activeSession = detail?.session ?? items.find(s => s.id === selectedId)
   const messages = detail?.messages ?? []
+  const visibleMessages = messages.filter(m => m.role !== 'tool')
 
   const toolResultMap = new Map<string, DirMessage>()
   for (const m of messages) {
@@ -179,6 +243,22 @@ export function Director() {
     return `[需求上下文约束]\n- ${hints.join('\n- ')}\n\n${raw}`
   }
 
+  const activeContextTags: string[] = []
+  if (bindProjectId) {
+    const pName = readyProjects.find(p => p.id === bindProjectId)?.name || bindProjectId
+    activeContextTags.push(`${pName} · ${bindMode}`)
+  }
+  if (strategy === 'plan_first') activeContextTags.push('先出 DAG 方案')
+  if (strategy === 'council_first') activeContextTags.push('先多角色会商')
+
+  const stopSending = () => {
+    abortRef.current?.abort()
+    abortRef.current = null
+    setSending(false)
+    setStreamEvents([])
+    toast('已中止当前推理')
+  }
+
   /** 通过 SSE 流式发送消息并实时渲染思考与工具调用进度，异常时优雅回退普通 POST。 */
   const sendMessage = async (overrideText?: string) => {
     const raw = (overrideText ?? input).trim()
@@ -186,6 +266,7 @@ export function Director() {
     const text = overrideText ? raw : composeWithContext(raw)
     setSending(true)
     setStreamEvents([])
+    setMobilePane('chat')
     if (!overrideText) setInput('')
 
     const targetChannel = activeSession?.channel ?? 'web'
@@ -198,6 +279,9 @@ export function Director() {
       deliverToWechat: imChannel ? syncWechat : false,
     }
 
+    const ctl = new AbortController()
+    abortRef.current = ctl
+
     try {
       let finalResult: any = null
       const resp = await fetch(API('api/director/chat/stream'), {
@@ -205,6 +289,7 @@ export function Director() {
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json', 'x-sa-request': '1' },
         body: JSON.stringify(payload),
+        signal: ctl.signal,
       })
 
       if (resp.status === 401) {
@@ -252,9 +337,12 @@ export function Director() {
       missionsPoll.reload()
       setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }), 80)
     } catch (e: any) {
-      toast(e?.message || '发送失败', true)
-      if (!overrideText) setInput(raw)
+      if (e?.name !== 'AbortError') {
+        toast(e?.message || '发送失败', true)
+        if (!overrideText) setInput(raw)
+      }
     } finally {
+      if (abortRef.current === ctl) abortRef.current = null
       setSending(false)
       setStreamEvents([])
     }
@@ -262,8 +350,30 @@ export function Director() {
 
   const startWebChat = () => {
     const existing = items.find(s => s.channel === 'web' && s.userId === 'console')
-    if (existing) { setSelectedId(existing.id); return }
+    if (existing) {
+      setSelectedId(existing.id)
+      setMobilePane('chat')
+      return
+    }
     void sendMessage('/状态')
+  }
+
+  const pickSession = (id: string) => {
+    setSelectedId(id)
+    setMobilePane('chat')
+  }
+
+  const fillInput = (text: string) => {
+    setInput(text)
+    setMobilePane('chat')
+    setTimeout(() => textareaRef.current?.focus(), 40)
+  }
+
+  const copyText = (text: string) => {
+    navigator.clipboard?.writeText(text).then(
+      () => toast('已复制到剪贴板'),
+      () => toast('当前环境无法自动复制', true),
+    )
   }
 
   const resetCurrent = async () => {
@@ -308,257 +418,389 @@ export function Director() {
   const pendingFollowups = (detail?.followups ?? []).filter(f => f.status === 'pending' || f.status === 'running')
   const openTickets = board?.open ?? []
 
-  return <div className="dir">
-    <header className="phead">
-      <div>
-        <h1>总控指挥中心</h1>
-        <p className="phead__sub">理解复杂需求、拆解并行 DAG 计划、绑定任务约定与证据验收、实时观测总控工具推理与审批</p>
+  return <div className="dir" data-mpane={mobilePane}>
+    {/* 顶部指挥台页头 */}
+    <header className="phead dir__head">
+      <div className="dir__titlewrap">
+        <div className="dir__titlerow">
+          <h1>总控指挥中心</h1>
+          {st && <span className="pill" data-tone={st.enabled ? 'run' : 'bad'}>
+            {st.enabled ? '在线' : '已关闭'}
+          </span>}
+        </div>
+        <p className="phead__sub only-desktop">自然语言理解需求、并行拆解 DAG 计划、自动绑定任务约定与证据验收</p>
       </div>
-      <div className="quick">
-        <button type="button" className="ghost" onClick={() => setShowOps(v => !v)}>{showOps ? '收起右栏计划板' : '展开右栏计划板'}</button>
-        <a className="btn" href="#/settings/director">总控设置</a>
-        <a className="btn" href="#/memory">记忆技能</a>
-        <a className="btn" href="#/schedules">定时巡检</a>
+      <div className="dir__headactions">
+        <button type="button" className="ghost small only-desktop" onClick={() => setShowOps(v => !v)}>
+          <Icon name="sidebar" size={15} />
+          {showOps ? '收起计划板' : '展开计划板'}
+        </button>
+        <a className="btn small" href="#/settings/director"><Icon name="settings" size={14} />设置</a>
+        <a className="btn small only-desktop" href="#/memory"><Icon name="memory" size={14} />记忆进化</a>
+        <a className="btn small only-desktop" href="#/schedules"><Icon name="schedules" size={14} />定时巡检</a>
       </div>
     </header>
 
-    {st && <div className="dir__stats">
-      <div className="dir__stat"><span>状态</span><b>{st.enabled ? '已启用' : '已关闭'}</b></div>
+    {/* 顶部运行指标条（PC 网格 / 手机横向滚动胶囊条） */}
+    {st && <div className="dir__stats" aria-label="总控运行指标">
       <div className="dir__stat"><span>总控模型</span><b className="mono">{st.model || '—'}</b></div>
+      <div className="dir__stat"><span>今日花费</span><b>{money(st.todayUsd || 0)}{st.dailyUsd > 0 ? <small className="meta"> / {money(st.dailyUsd)}</small> : null}</b></div>
+      <div className="dir__stat"><span>活跃计划</span><b>{activeMissionsCount} 个</b></div>
+      <div className="dir__stat"><span>进行中工单</span><b>{openTickets.length} 张</b></div>
       <div className="dir__stat"><span>主动汇报</span><b>{SCOPE_LABEL[st.notifyScope] || st.notifyScope}</b></div>
-      <div className="dir__stat"><span>今日总控花费</span><b>{money(st.todayUsd || 0)}{st.dailyUsd > 0 ? ` / ${money(st.dailyUsd)}` : ''}</b></div>
-      <div className="dir__stat"><span>活跃 DAG 计划</span><b>{missions.filter(m => m.status === 'running' || m.status === 'draft').length}</b></div>
-      <div className="dir__stat"><span>待确认高危操作</span><b>{st.pendingActions ?? 0}</b></div>
+      <div className={opsAttention > 0 ? 'dir__stat is-alert' : 'dir__stat'}>
+        <span>待审批事项</span>
+        <b>{opsAttention > 0 ? `${opsAttention} 项待确认` : '全部畅通'}</b>
+      </div>
     </div>}
 
+    {/* 高危二次确认横幅（全局可见） */}
     {globalPending.length > 0 && <section className="dir__pending" aria-label="待确认高危操作">
-      <div className="sechead"><h2>待确认的高危操作</h2><span className="sechead__note">回复「/确认 短码」或直接点击审批</span></div>
+      <div className="sechead">
+        <h2>待确认的高危操作</h2>
+        <span className="sechead__note">回复「/确认 短码」或点击按钮</span>
+      </div>
       {globalPending.map(act => <div key={act.id} className="card dir__act">
-        <div>
-          <p><b>#{act.id} · {act.toolName}</b></p>
+        <div className="dir__actmain">
+          <p className="dir__acttitle"><span className="pill" data-tone="human">#{act.id}</span> <b>{act.toolName}</b></p>
           <p>{act.summary}</p>
-          <p className="meta">发起于 {ago(act.createdAt)} · 过期时间 {new Date(act.expiresAt).toLocaleTimeString()}</p>
+          <p className="meta">发起于 {ago(act.createdAt)} · 过期 {new Date(act.expiresAt).toLocaleTimeString()}</p>
         </div>
-        <div className="quick">
+        <div className="dir__actbtns">
           <button type="button" className="primary" disabled={busy} onClick={() => decideAction(act.id, 'approve')}>批准执行</button>
           <button type="button" className="danger" disabled={busy} onClick={() => decideAction(act.id, 'reject')}>拒绝</button>
         </div>
       </div>)}
     </section>}
 
-    <div className="dir__layout" style={showOps ? { gridTemplateColumns: 'minmax(200px, 240px) minmax(0, 1fr) minmax(280px, 340px)' } : undefined}>
-      <aside className="dir__side">
+    {/* 手机端专属三段视图切换栏（PC 端自动隐藏） */}
+    <div className="dir__mnav" role="tablist" aria-label="总控视图切换">
+      <button type="button" role="tab" aria-selected={mobilePane === 'chat'} className={mobilePane === 'chat' ? 'is-on' : ''} onClick={() => setMobilePane('chat')}>
+        对话{sending ? ' · 推理中' : ''}
+      </button>
+      <button type="button" role="tab" aria-selected={mobilePane === 'sessions'} className={mobilePane === 'sessions' ? 'is-on' : ''} onClick={() => setMobilePane('sessions')}>
+        会话 ({items.length})
+      </button>
+      <button type="button" role="tab" aria-selected={mobilePane === 'ops'} className={mobilePane === 'ops' ? 'is-on' : ''} onClick={() => setMobilePane('ops')}>
+        计划板 ({missions.length})
+        {opsAttention > 0 && <span className="nb need">{opsAttention}</span>}
+      </button>
+    </div>
+
+    {/* 主三栏工作区（纯 CSS Grid 响应式，绝不写内联 gridTemplateColumns） */}
+    <div className={showOps ? 'dir__layout has-ops' : 'dir__layout'}>
+      {/* 左栏：会话列表 */}
+      <aside className="dir__side dir__pane-sessions">
         <div className="dir__sidehead">
           <b>会话列表</b>
           <button type="button" className="ghost small" onClick={startWebChat}>＋ 网页对话</button>
         </div>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 8 }}>
-          {QUICK_TEMPLATES.map(tpl => <button
-            key={tpl.label}
-            type="button"
-            className="ghost small"
-            onClick={() => setInput(tpl.prompt)}
-            title="填充常用指令模板"
-          >
-            {tpl.label}
-          </button>)}
-        </div>
-        {items.length === 0 ? <Empty>还没有总控对话。点右上角「网页对话」直接交代任务。</Empty> : <div className="dir__sessions">
-          {items.map(s => <button key={s.id} type="button" className={s.id === selectedId ? 'row dir__sess is-on' : 'row dir__sess'} onClick={() => setSelectedId(s.id)}>
-            <div className="dir__sesstop">
-              <span className="dir__tag">{CHANNEL_LABEL[s.channel] || s.channel}</span>
-              <b>{s.title || s.userId}</b>
-              {s.pendingActions > 0 && <span className="nb need">{s.pendingActions}</span>}
-            </div>
-            <span className="meta dir__preview">{s.lastMessage || '（空会话）'}</span>
-            <span className="meta">{s.messageCount} 条 · {ago(s.updatedAt)}</span>
-          </button>)}
-        </div>}
+        {items.length === 0
+          ? <Empty>还没有总控对话。直接在对话区输入目标即可开始。</Empty>
+          : <div className="dir__sessions">
+            {items.map(s => <button
+              key={s.id}
+              type="button"
+              className={s.id === selectedId ? 'dir__sess is-on' : 'dir__sess'}
+              onClick={() => pickSession(s.id)}
+            >
+              <div className="dir__sesstop">
+                <span className="dir__tag">{CHANNEL_LABEL[s.channel] || s.channel}</span>
+                <b>{s.title || s.userId}</b>
+                {s.pendingActions > 0 && <span className="nb need">{s.pendingActions}</span>}
+              </div>
+              <span className="meta dir__preview">{s.lastMessage || '（新会话）'}</span>
+              <span className="meta">{s.messageCount} 条 · {ago(s.updatedAt)}</span>
+            </button>)}
+          </div>}
       </aside>
 
-      <section className="dir__chat">
-        {activeSession ? <>
-          <div className="dir__chathead">
-            <div>
-              <b>{activeSession.title || activeSession.userId}</b>
-              <span className="meta">
-                通道：{CHANNEL_LABEL[activeSession.channel] || activeSession.channel}
-                {activeSession.focusTicketId && <> · 聚焦工单：<a href={`#/tickets/${encodeURIComponent(activeSession.focusTicketId)}`}>{activeSession.focusTicketId}</a></>}
-              </span>
-            </div>
-            <div className="quick">
-              {(activeSession.channel === 'wechat' || activeSession.channel === 'feishu') && <label className="meta" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
-                <input type="checkbox" checked={syncWechat} onChange={e => setSyncWechat(e.target.checked)} />
-                同步推到{CHANNEL_LABEL[activeSession.channel]}
-              </label>}
-              <button type="button" className="ghost small" disabled={sending} onClick={() => void sendMessage('/状态')}>/状态</button>
-              <button type="button" className="ghost small" disabled={busy || sending} onClick={resetCurrent}>新对话</button>
-            </div>
+      {/* 中栏：核心流式对话区 */}
+      <section className="dir__chat dir__pane-chat">
+        <div className="dir__chathead">
+          <div className="dir__chatinfo">
+            <b>{activeSession ? (activeSession.title || activeSession.userId) : '新网页对话'}</b>
+            <span className="meta">
+              {activeSession ? `通道：${CHANNEL_LABEL[activeSession.channel] || activeSession.channel}` : '直接交代目标，总控自动建立会话'}
+              {activeSession?.focusTicketId && <> · 聚焦：<a href={`#/tickets/${encodeURIComponent(activeSession.focusTicketId)}`}>{activeSession.focusTicketId.slice(0, 10)}</a></>}
+            </span>
           </div>
+          <div className="dir__chattools">
+            {activeSession && (activeSession.channel === 'wechat' || activeSession.channel === 'feishu') && (
+              <label className="dir__synclabel">
+                <input type="checkbox" checked={syncWechat} onChange={e => setSyncWechat(e.target.checked)} />
+                同步{CHANNEL_LABEL[activeSession.channel]}
+              </label>
+            )}
+            <button type="button" className="ghost small" disabled={sending} onClick={() => void sendMessage('/状态')}>/状态</button>
+            {activeSession && <button type="button" className="ghost small" disabled={busy || sending} onClick={resetCurrent}>新对话</button>}
+          </div>
+        </div>
 
-          {activeSession.summary && <details className="dir__summary">
-            <summary>已压缩的早期记忆摘要</summary>
-            <p>{activeSession.summary}</p>
-          </details>}
+        {activeSession?.summary && <details className="dir__summary">
+          <summary>早期记忆摘要（已压缩）</summary>
+          <p>{activeSession.summary}</p>
+        </details>}
 
-          {pendingFollowups.length > 0 && <div className="dir__summary">
-            <b>已登记的自动续接</b>
-            {pendingFollowups.map(fw => <div key={fw.id} className="row" style={{ marginTop: 6 }}>
-              <span>
-                <span className="dir__tag">{fw.status === 'running' ? '正在续接' : '等待完工'}</span>{' '}
-                <b className="mono">{fw.targetId}</b> → {fw.instruction}
-              </span>
-              {fw.status === 'pending' && <button type="button" className="ghost small danger" disabled={busy} onClick={() => cancelFollowup(fw.id)}>取消</button>}
-            </div>)}
+        {pendingFollowups.length > 0 && <div className="dir__summary">
+          <b>已登记的自动续接（{pendingFollowups.length}）</b>
+          {pendingFollowups.map(fw => <div key={fw.id} className="dir__fwrow">
+            <span>
+              <span className="dir__tag">{fw.status === 'running' ? '续接中' : '等完工'}</span>{' '}
+              <code className="mono">{fw.targetId.slice(0, 12)}</code> → {fw.instruction}
+            </span>
+            {fw.status === 'pending' && <button type="button" className="ghost small danger" disabled={busy} onClick={() => cancelFollowup(fw.id)}>取消</button>}
+          </div>)}
+        </div>}
+
+        {detailErr && <p className="warn" style={{ margin: '4px 0' }}>{detailErr}</p>}
+
+        {/* 消息流 */}
+        <div className="dir__feed">
+          {visibleMessages.length === 0 && !sending && <div className="dir__welcome">
+            <div className="dir__welcome-head">
+              <div className="dir__avatar is-lg"><Icon name="director" size={22} /></div>
+              <div>
+                <h3>把任务目标直接交给我</h3>
+                <p className="meta">我会结合实时平台态势、项目源码和你的长期偏好自动规划、派单、自检并交付。</p>
+              </div>
+            </div>
+            <div className="dir__starters">
+              {STARTER_CARDS.map(card => <button
+                key={card.title}
+                type="button"
+                className="dir__starter"
+                onClick={() => card.sendNow ? void sendMessage(card.prompt) : fillInput(card.prompt)}
+              >
+                <div className="dir__starter-top">
+                  <b>{card.title}</b>
+                  <span className="dir__tag">{card.tag}</span>
+                </div>
+                <span className="meta">{card.desc}</span>
+              </button>)}
+            </div>
           </div>}
 
-          {detailErr && <p className="warn">{detailErr}</p>}
-
-          <div className="dir__feed">
-            {messages.filter(m => m.role !== 'tool').map(m => {
-              if (m.role === 'event') {
-                return <div key={m.id} className={m.archived ? 'dir__event is-arch' : 'dir__event'}>
+          {visibleMessages.map(m => {
+            if (m.role === 'event') {
+              return <div key={m.id} className={m.archived ? 'dir__event is-arch' : 'dir__event'}>
+                <div className="dir__eventhead">
                   <span className="dir__tag">平台动态</span>
-                  <div className="dir__eventbody"><Markdown text={m.content} /></div>
                   <span className="meta">{ago(m.createdAt)}</span>
                 </div>
-              }
-              if (m.role === 'user') {
-                return <div key={m.id} className={m.archived ? 'dir__msg is-user is-arch' : 'dir__msg is-user'}>
-                  <div className="dir__bubble">{m.content}</div>
-                  <span className="meta">{ago(m.createdAt)}</span>
-                </div>
-              }
-              const calls = m.toolCalls ?? []
-              return <div key={m.id} className={m.archived ? 'dir__msg is-ai is-arch' : 'dir__msg is-ai'}>
-                {calls.length > 0 && <details className="dir__tools">
-                  <summary>调用了 {calls.length} 个平台工具：{calls.map(c => c.name).join('、')}</summary>
-                  <div className="dir__toollist">
-                    {calls.map(c => {
-                      const res = toolResultMap.get(c.id)
-                      const ok = res?.meta?.ok !== false
-                      return <div key={c.id} className="dir__toolitem">
-                        <div className="dir__toolhead">
-                          <b className="mono">{c.name}</b>
-                          <span className="meta">{ok ? '成功' : '失败'}{typeof res?.meta?.ms === 'number' ? ` · ${res.meta.ms}ms` : ''}</span>
-                        </div>
-                        <pre className="mono">{JSON.stringify(c.arguments ?? {}, null, 2)}</pre>
-                        {res && <pre className="mono dir__toolout">{res.content.slice(0, 1200)}{res.content.length > 1200 ? '\n…（已折叠）' : ''}</pre>}
+                <div className="dir__eventbody"><Markdown text={m.content} /></div>
+              </div>
+            }
+            if (m.role === 'user') {
+              return <div key={m.id} className={m.archived ? 'dir__msg is-user is-arch' : 'dir__msg is-user'}>
+                <div className="dir__bubble">{m.content}</div>
+                <span className="meta">{ago(m.createdAt)}</span>
+              </div>
+            }
+            const calls = m.toolCalls ?? []
+            return <div key={m.id} className={m.archived ? 'dir__msg is-ai is-arch' : 'dir__msg is-ai'}>
+              {calls.length > 0 && <details className="dir__tools">
+                <summary>
+                  <span className="dir__tools-dot" aria-hidden="true" />
+                  <span>调用 {calls.length} 项工具：{calls.map(c => {
+                    const act = typeof c.arguments?.action === 'string' ? c.arguments.action : ''
+                    return act ? `${c.name}(${act})` : c.name
+                  }).join('、')}</span>
+                </summary>
+                <div className="dir__toollist">
+                  {calls.map(c => {
+                    const res = toolResultMap.get(c.id)
+                    const ok = res?.meta?.ok !== false
+                    return <div key={c.id} className="dir__toolitem">
+                      <div className="dir__toolhead">
+                        <b className="mono">{c.name}{typeof c.arguments?.action === 'string' ? `.${c.arguments.action}` : ''}</b>
+                        <span className="pill" data-tone={ok ? 'done' : 'bad'}>
+                          {ok ? '成功' : '失败'}{typeof res?.meta?.ms === 'number' ? ` · ${res.meta.ms}ms` : ''}
+                        </span>
                       </div>
-                    })}
-                  </div>
-                </details>}
-                {m.content && <div className="dir__bubble"><Markdown text={m.content} /></div>}
+                      <pre className="mono">{JSON.stringify(c.arguments ?? {}, null, 2)}</pre>
+                      {res && <pre className="mono dir__toolout">{res.content.slice(0, 1200)}{res.content.length > 1200 ? '\n…（已折叠）' : ''}</pre>}
+                    </div>
+                  })}
+                </div>
+              </details>}
+              {m.content && <div className="dir__bubble">
+                <Markdown text={m.content} />
+              </div>}
+              <div className="dir__msgfoot">
                 <span className="meta">
                   {ago(m.createdAt)}
                   {typeof m.meta?.model === 'string' && ` · ${m.meta.model}`}
-                  {typeof m.meta?.toolsCount === 'number' && m.meta.toolsCount > 0 && ` · 共查 ${m.meta.toolsCount} 次工具`}
+                  {typeof m.meta?.toolsCount === 'number' && m.meta.toolsCount > 0 && ` · ${m.meta.toolsCount} 次工具`}
                 </span>
+                {m.content && <button type="button" className="dir__copybtn" onClick={() => copyText(m.content)} title="复制回复">
+                  <Icon name="copy" size={13} />复制
+                </button>}
               </div>
-            })}
-            {sending && <div className="dir__msg is-ai">
-              <div className="dir__bubble">
-                <div className="meta"><b>总控正在实时推理与调度…</b></div>
-                {streamEvents.length > 0 && <ul style={{ margin: '6px 0 0 16px', padding: 0 }}>
-                  {streamEvents.map((ev, i) => <li key={i} className="meta" style={{ marginBottom: 2 }}>
-                    {ev.type === 'start' && `已连接总控模型 ${ev.model || ''}`}
-                    {ev.type === 'thinking' && `第 ${ev.step} 轮：${ev.message}`}
-                    {ev.type === 'tool_start' && `⏳ 调用 ${ev.name}${ev.action ? `(${ev.action})` : ''}…`}
-                    {ev.type === 'tool_done' && `${ev.ok ? '✅' : '⚠️'} ${ev.name}${ev.action ? `(${ev.action})` : ''} (${ev.ms}ms)：${ev.summary}`}
-                  </li>)}
-                </ul>}
+            </div>
+          })}
+
+          {sending && <div className="dir__msg is-ai">
+            <div className="dir__bubble dir__streamcard">
+              <div className="dir__streamhead">
+                <span className="dir__pulse" aria-hidden="true" />
+                <b>总控正在实时推理与调度…</b>
+                <button type="button" className="ghost small danger" onClick={stopSending}>停止</button>
               </div>
-            </div>}
-            <div ref={bottomRef} />
+              {streamEvents.length > 0 && <ul className="dir__streamlist">
+                {streamEvents.map((ev, i) => <li key={i}>
+                  {ev.type === 'start' && `已连接总控模型 ${ev.model || ''}`}
+                  {ev.type === 'thinking' && `第 ${ev.step} 轮：${ev.message}`}
+                  {ev.type === 'tool_start' && `调用 ${ev.name}${ev.action ? `(${ev.action})` : ''}…`}
+                  {ev.type === 'tool_done' && `${ev.ok ? '✓' : '✗'} ${ev.name}${ev.action ? `(${ev.action})` : ''} (${ev.ms}ms)：${ev.summary}`}
+                </li>)}
+              </ul>}
+            </div>
+          </div>}
+          <div ref={bottomRef} />
+        </div>
+
+        {/* 底部输入控制区（紧凑快捷芯片 + 可折叠上下文约束抽屉 + 触控输入栏） */}
+        <div className="dir__dock">
+          <div className="dir__chipbar">
+            <button
+              type="button"
+              className={ctxOpen || activeContextTags.length > 0 ? 'dir__chip is-active' : 'dir__chip'}
+              onClick={() => setCtxOpen(v => !v)}
+            >
+              <Icon name="settings" size={13} />
+              约束{activeContextTags.length > 0 ? ` (${activeContextTags.length})` : ''}
+            </button>
+            {activeContextTags.map(tag => <span key={tag} className="dir__ctxtag">{tag}</span>)}
+            {QUICK_CHIPS.map(ch => <button
+              key={ch.label}
+              type="button"
+              className="dir__chip"
+              disabled={sending}
+              onClick={() => ch.cmd ? void sendMessage(ch.cmd) : fillInput(ch.fill || '')}
+            >
+              {ch.label}
+            </button>)}
           </div>
 
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, padding: '8px 0 4px', alignItems: 'center' }}>
-            <select value={bindProjectId} onChange={e => setBindProjectId(e.target.value)} title="绑定目标项目">
-              <option value="">不限定项目</option>
-              {readyProjects.map(p => <option key={p.id} value={p.id}>📁 {p.name}</option>)}
-            </select>
-            {bindProjectId && <select value={bindMode} onChange={e => setBindMode(e.target.value as ProjectWorkspaceMode)} title="代码隔离模式">
-              <option value="worktree">worktree 隔离分支</option>
-              <option value="copy">copy 独立副本</option>
-              <option value="direct">direct 直接改原件</option>
-            </select>}
-            <select value={strategy} onChange={e => setStrategy(e.target.value as any)} title="派发策略">
-              <option value="auto">自动理解并派发</option>
-              <option value="plan_first">先出 DAG 方案确认再开工</option>
-              <option value="council_first">先多角色会商</option>
-            </select>
-            <label className="meta" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
-              <input type="checkbox" checked={requireVerify} onChange={e => setRequireVerify(e.target.checked)} />
-              要求证据验收
+          {ctxOpen && <div className="dir__ctxpanel">
+            <label className="dir__ctxfield">
+              <span>目标项目</span>
+              <select value={bindProjectId} onChange={e => setBindProjectId(e.target.value)}>
+                <option value="">不限定项目</option>
+                {readyProjects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
             </label>
-          </div>
+            {bindProjectId && <label className="dir__ctxfield">
+              <span>代码模式</span>
+              <select value={bindMode} onChange={e => setBindMode(e.target.value as ProjectWorkspaceMode)}>
+                <option value="worktree">worktree 隔离分支（推荐）</option>
+                <option value="copy">copy 独立副本</option>
+                <option value="direct">direct 直接改原件</option>
+              </select>
+            </label>}
+            <label className="dir__ctxfield">
+              <span>执行策略</span>
+              <select value={strategy} onChange={e => setStrategy(e.target.value as any)}>
+                <option value="auto">自动理解并派发</option>
+                <option value="plan_first">先出 DAG 方案确认再开工</option>
+                <option value="council_first">先多角色会商</option>
+              </select>
+            </label>
+            <label className="dir__ctxcheck">
+              <input type="checkbox" checked={requireVerify} onChange={e => setRequireVerify(e.target.checked)} />
+              <span>要求客观证据验收</span>
+            </label>
+          </div>}
 
           <div className="dir__composer">
             <textarea
+              ref={textareaRef}
               rows={2}
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && input.trim()) { e.preventDefault(); void sendMessage() } }}
-              placeholder="把你的目标直接交代给总控：我会结合项目上下文和长期偏好拆解、派发、自检并交付…（Ctrl+Enter 发送）"
+              placeholder="直接告诉总控你想办的事…（桌面端 Ctrl+Enter 发送）"
             />
-            <button type="button" className="primary" disabled={sending || !input.trim()} onClick={() => void sendMessage()}>
-              <Icon name="send" size={16} />{sending ? '执行中…' : '发送'}
-            </button>
+            {sending
+              ? <button type="button" className="dir__sendbtn is-stop" onClick={stopSending} aria-label="停止推理">
+                <Icon name="x" size={18} />
+                <span>停止</span>
+              </button>
+              : <button type="button" className="primary dir__sendbtn" disabled={!input.trim()} onClick={() => void sendMessage()} aria-label="发送消息">
+                <Icon name="send" size={17} />
+                <span>发送</span>
+              </button>}
           </div>
-        </> : <Empty>请选择左侧会话，或点「网页对话」直接向总控发消息。</Empty>}
+        </div>
       </section>
 
-      {showOps && <aside className="dir__side" style={{ maxHeight: '78vh', overflowY: 'auto' }}>
+      {/* 右栏：实时 DAG 任务计划板 + 活跃工单 */}
+      <aside className="dir__side dir__ops dir__pane-ops">
         <div className="dir__sidehead">
           <b>DAG 任务计划（{missions.length}）</b>
           <button type="button" className="ghost small" onClick={missionsPoll.reload}>刷新</button>
         </div>
         {missions.length === 0
-          ? <p className="meta">暂无多步骤 DAG 计划。遇到复杂需求时总控会自动拆成并行依赖图显示在这里。</p>
-          : <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          ? <Empty>暂无多步骤 DAG 计划。复杂需求发给总控后，会自动拆解为可审批的并行依赖图显示在这里。</Empty>
+          : <div className="dir__missions">
             {missions.map(m => {
               const done = m.nodes.filter(n => n.status === 'completed' || n.status === 'skipped').length
               const pct = m.nodes.length > 0 ? Math.round((done / m.nodes.length) * 100) : 0
-              return <div key={m.id} className="card" style={{ padding: 10 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, alignItems: 'center' }}>
-                  <b style={{ fontSize: 13 }}>{m.title}</b>
-                  <span className="pill">v{m.planVersion} · {MISSION_STATUS[m.status]}</span>
+              return <div key={m.id} className="dir__mcard">
+                <div className="dir__mhead">
+                  <b>{m.title}</b>
+                  <span className="pill" data-tone={MISSION_TONE[m.status]}>v{m.planVersion} · {MISSION_STATUS[m.status]}</span>
                 </div>
-                <div className="meta" style={{ margin: '4px 0' }}>进度 {done}/{m.nodes.length}（{pct}%）</div>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
+                <div className="dir__mprog">
+                  <div className="dir__mbar"><span style={{ width: `${pct}%` }} /></div>
+                  <span className="meta">{done}/{m.nodes.length} ({pct}%)</span>
+                </div>
+                <div className="dir__mops">
                   {m.status === 'draft' && <button type="button" className="primary small" disabled={busy} onClick={() => missionOp(m, 'start')}>开工</button>}
                   {m.status === 'running' && <button type="button" className="ghost small" disabled={busy} onClick={() => missionOp(m, 'pause')}>暂停</button>}
                   {(m.status === 'paused' || m.status === 'failed') && <button type="button" className="primary small" disabled={busy} onClick={() => missionOp(m, 'resume')}>恢复</button>}
                   {(m.status === 'draft' || m.status === 'running' || m.status === 'paused') && <button type="button" className="ghost small danger" disabled={busy} onClick={() => missionOp(m, 'cancel')}>取消</button>}
                 </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                  {m.nodes.map(n => <div key={n.id} style={{ padding: '5px 6px', borderRadius: 6, border: '1px solid var(--line, #e5e7eb)', fontSize: 12 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 4 }}>
-                      <span><code>{n.key}</code> {n.title}</span>
-                      <span className="meta">{NODE_STATUS[n.status]}</span>
+                <div className="dir__nodes">
+                  {m.nodes.map(n => <div key={n.id} className={n.status === 'waiting_approval' ? 'dir__node is-wait' : 'dir__node'}>
+                    <div className="dir__nodehead">
+                      <span><code className="mono">{n.key}</code> {n.title}</span>
+                      <span className="pill" data-tone={NODE_TONE[n.status]}>{NODE_STATUS[n.status]}</span>
                     </div>
                     {n.dependsOn.length > 0 && <div className="meta">依赖：{n.dependsOn.join(', ')}</div>}
-                    {n.ticketId && <div className="meta"><a href={`#/tickets/${encodeURIComponent(n.ticketId)}`}>工单 {n.ticketId} →</a></div>}
-                    {n.commitSha && <div className="meta">SHA: <code>{n.commitSha.slice(0, 8)}</code></div>}
+                    {n.ticketId && <div className="meta"><a href={`#/tickets/${encodeURIComponent(n.ticketId)}`}>工单 {n.ticketId.slice(0, 10)} →</a></div>}
+                    {n.commitSha && <div className="meta">提交：<code className="mono">{n.commitSha.slice(0, 8)}</code></div>}
                     {n.artifacts.length > 0 && <div className="meta">产物：{n.artifacts.slice(0, 2).join('、')}</div>}
-                    {n.status === 'waiting_approval' && <button type="button" className="primary small" style={{ marginTop: 4 }} disabled={busy} onClick={() => approveMissionNode(m, n)}>批准继续 (v{m.planVersion})</button>}
-                    {n.status === 'failed' && <button type="button" className="ghost small" style={{ marginTop: 4 }} disabled={busy} onClick={() => retryMissionNode(m, n)}>局部重试</button>}
+                    {n.status === 'waiting_approval' && (
+                      <button type="button" className="primary small wide" style={{ marginTop: 6 }} disabled={busy} onClick={() => approveMissionNode(m, n)}>
+                        批准继续 (v{m.planVersion})
+                      </button>
+                    )}
+                    {n.status === 'failed' && (
+                      <button type="button" className="ghost small" style={{ marginTop: 4 }} disabled={busy} onClick={() => retryMissionNode(m, n)}>
+                        局部重试
+                      </button>
+                    )}
                   </div>)}
                 </div>
               </div>
             })}
           </div>}
 
-        {openTickets.length > 0 && <div style={{ marginTop: 14 }}>
-          <div className="dir__sidehead"><b>活跃工单（{openTickets.length}）</b></div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {openTickets.slice(0, 6).map(t => <a key={t.id} className="row" href={`#/tickets/${encodeURIComponent(t.id)}`} style={{ fontSize: 12 }}>
+        {openTickets.length > 0 && <div className="dir__activetks">
+          <div className="dir__sidehead">
+            <b>活跃工单（{openTickets.length}）</b>
+            <a className="ghost small" href="#/tickets">全部 →</a>
+          </div>
+          <div className="dir__tklist">
+            {openTickets.slice(0, 6).map(t => <a key={t.id} className="dir__tkitem" href={`#/tickets/${encodeURIComponent(t.id)}`}>
               <b>{t.title}</b>
-              <span className="meta">{t.needsPerson ? '等你回答' : (t.stageLabel || '运行中')}</span>
+              <span className="pill" data-tone={t.needsPerson ? 'human' : 'run'}>{t.needsPerson ? '等你回答' : (t.stageLabel || '运行中')}</span>
             </a>)}
           </div>
         </div>}
-      </aside>}
+      </aside>
     </div>
   </div>
 }

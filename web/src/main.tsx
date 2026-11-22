@@ -639,12 +639,17 @@ function Shell({ h, m, k: key, logout, top }: { h: string; m: RegExpExecArray | 
   const running = b?.tickets.running ?? 0
   const Page = PAGES[key]
   const cur = (k: string) => (m ? k === 'tickets' : key === k)
-  const inMore = !m && !['today', 'tickets', 'new', 'defense'].includes(key)
+  const inMore = !m && !['today', 'director', 'tickets', 'new'].includes(key)
   const badge = (k: string) => k === 'today' && running > 0 ? <span className="nb run">{running}</span>
     : k === 'tickets' && need > 0 ? <span className="nb need">{need}</span> : null
   const liveWord = live.live ? '实时连接' : b ? '轮询中' : live.err ? '连不上后台' : '连接中'
+  const shellClass = [
+    'shell',
+    collapsed ? 'is-collapsed' : '',
+    !m && key === 'director' ? 'is-director' : '',
+  ].filter(Boolean).join(' ')
   return <LiveContext.Provider value={live}>
-    <div className={collapsed ? 'shell is-collapsed' : 'shell'}>
+    <div className={shellClass}>
       <header className="mbar">
         <a className="mbar__brand" href="#/today"><Logo size={26} /><span>superagent</span></a>
         <div className="mbar__tools">
@@ -689,6 +694,6 @@ function Shell({ h, m, k: key, logout, top }: { h: string; m: RegExpExecArray | 
   </LiveContext.Provider>
 }
 
-const TABS: [string, string][] = [['today', '今日'], ['tickets', '任务'], ['new', '发任务'], ['defense', '防御'], ['more', '更多']]
+const TABS: [string, string][] = [['today', '今日'], ['director', '总控'], ['tickets', '任务'], ['new', '发任务'], ['more', '更多']]
 
 createRoot(document.getElementById('root')!).render(<ErrorBoundary><App /></ErrorBoundary>)

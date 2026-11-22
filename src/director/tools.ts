@@ -25,6 +25,7 @@ import { keySecretName, looksLikeKey, scanHostKeys } from '../ssh/connections.ts
 import type { WebSearchService } from '../web/search.ts'
 import { formatHits } from '../web/search.ts'
 import type { PluginRegistry } from '../plugins/registry.ts'
+import type { ContractStore } from '../contracts/store.ts'
 import type { HostOpsService } from './host-ops.ts'
 import type { ToolDefinition } from './llm.ts'
 import { buildDirectorToolDefinitions, DIRECTOR_TOOL_DEFINITIONS } from './tool-schemas.ts'
@@ -50,7 +51,8 @@ export interface DirectorToolsDeps {
   councils?: CouncilService
   novels?: NovelService
   fanqie?: FanqieService
-  goals?: Pick<GoalService, 'view' | 'set' | 'cancel' | 'brief'>
+  goals?: Pick<GoalService, 'view' | 'set' | 'cancel' | 'brief'> & Partial<Pick<GoalService, 'buildReceipt'>>
+  contracts?: Pick<ContractStore, 'get'>
   pentest?: PentestService
   piVersions?: PiVersionService
   devEnv?: DevEnvService
@@ -323,6 +325,36 @@ export class DirectorToolExecutor {
             goal,
             usage,
             byAgent,
+          })
+        }
+
+        case 'ticket_receipt': {
+          const ticketId = str(args.ticketId)
+          if (!ticketId) return fail('缺少 ticketId')
+          const detail = this.deps.host.ticket(ticketId)
+          if (!detail) return fail(`找不到工单：${ticketId}`)
+          const deliverables = this.deps.host.deliverables(ticketId).slice(0, 40)
+          const contract = this.deps.contracts?.get('ticket', ticketId)
+          const receipt = this.deps.goals?.buildReceipt
+            ? this.deps.goals.buildReceipt(ticketId, {
+                deliverables: deliverables.map(d => ({ path: d.path, size: d.size, kind: d.kind })),
+                contractVersion: contract?.version ?? null,
+                ...(contract?.criteria ? { contractCriteria: contract.criteria } : {}),
+                needsPerson: Boolean(detail.attention?.question),
+                ...(detail.attention?.question ? { question: detail.attention.question } : {}),
+                ended: detail.status === 'ended',
+                ...(detail.outcome ? { outcome: detail.outcome } : {}),
+              })
+            : undefined
+          this.deps.store.updateSession(ctx.session.id, { focusTicketId: ticketId })
+          return out({
+            ticketId,
+            title: detail.title,
+            status: detail.status,
+            outcome: detail.outcome,
+            latestSummary: detail.reports.at(-1)?.summary ?? '',
+            ...(contract ? { contract: { version: contract.version, goal: contract.goal, criteria: contract.criteria } } : {}),
+            ...(receipt ? { receipt } : { deliverables }),
           })
         }
 
@@ -899,8 +931,25 @@ export class DirectorToolExecutor {
           const prompt = str(args.prompt)
           if (!prompt) return fail('缺少任务描述 prompt')
           const projectId = optStr(args.projectId)
-          const projectMode = args.projectMode === 'direct' ? 'direct' as const : args.projectMode === 'copy' ? 'copy' as const : undefined
-          if (projectMode === 'direct' && !projectId) return fail('projectMode=direct 需要同时指定 projectId')
+          const projectMode = args.projectMode === 'worktree'
+            ? 'worktree' as const
+            : args.projectMode === 'direct'
+              ? 'direct' as const
+              : args.projectMode === 'copy'
+                ? 'copy' as const
+                : undefined
+          if ((projectMode === 'direct' || projectMode === 'worktree') && !projectId) {
+            return fail(`projectMode=${projectMode} 需要同时指定 projectId`)
+          }
+          const runnerId = optStr(args.runnerId)
+          const scriptId = optStr(args.scriptId)
+          const rawScriptParams = args.scriptParams ?? parseParamsJson(args.scriptParams_json)
+          const scriptParams = (typeof rawScriptParams === 'object' && rawScriptParams !== null && !Array.isArray(rawScriptParams) && Object.keys(rawScriptParams).length > 0)
+            ? rawScriptParams as Record<string, unknown>
+            : undefined
+          const runner = runnerId && runnerId !== 'pi'
+            ? { runnerId, ...(scriptId ? { scriptId } : {}), ...(scriptParams ? { scriptParams } : {}) }
+            : undefined
           const model = optStr(args.model)
           const collab = typeof args.collab === 'boolean' ? args.collab : undefined
           const secrets = strArray(args.secrets, 20)
@@ -917,6 +966,8 @@ export class DirectorToolExecutor {
                 text: goalText,
                 commands,
                 mode: commands.length > 0 ? 'commands+ai' : 'ai',
+                ...(criteria.length > 0 ? { criteria } : {}),
+                ...(typeof g.requireEvidence === 'boolean' ? { requireEvidence: g.requireEvidence } : {}),
                 ...(g.maxRounds !== undefined ? { maxRounds: int(g.maxRounds, goalDefaults.maxRounds, 1, 50) } : {}),
                 ...(g.maxUsd !== undefined ? { maxUsd: num(g.maxUsd, goalDefaults.maxUsd, 0.01, 100) } : {}),
               }, goalDefaults)
@@ -926,11 +977,31 @@ export class DirectorToolExecutor {
           if (secrets.length > 0) {
             const gated = needConfirm(
               `派发新任务并向其授予密钥 [${secrets.join(', ')}]：${prompt.slice(0, 80)}`,
-              { prompt, ...(projectId ? { projectId } : {}), ...(projectMode ? { projectMode } : {}), ...(model ? { model } : {}), ...(collab !== undefined ? { collab } : {}), secrets, ...(goal ? { goal } : {}) },
+              {
+                prompt,
+                ...(projectId ? { projectId } : {}),
+                ...(projectMode ? { projectMode } : {}),
+                ...(runnerId ? { runnerId } : {}),
+                ...(scriptId ? { scriptId } : {}),
+                ...(scriptParams ? { scriptParams } : {}),
+                ...(model ? { model } : {}),
+                ...(collab !== undefined ? { collab } : {}),
+                secrets,
+                ...(goal ? { goal } : {}),
+              },
             )
             if (gated) return gated
           }
-          const created = await this.deps.host.createTicket(prompt, model, secrets.length > 0 ? secrets : undefined, projectId, collab, goal, projectMode)
+          const created = await this.deps.host.createTicket(
+            prompt,
+            model,
+            secrets.length > 0 ? secrets : undefined,
+            projectId,
+            collab,
+            goal,
+            projectMode,
+            ...(runner ? [runner] : []),
+          )
           const onComplete = optStr(args.onComplete)
           const onFailure = str(args.onFailure) === 'continue' ? 'continue' as const : 'report' as const
           let followupId: string | undefined

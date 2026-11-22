@@ -46,6 +46,8 @@ export interface DirectorChatInput {
   autoTrigger?: { eventKind: FollowupTriggerKind; targetId: string; followupIds?: string[] }
   /** 实时流式思考与工具调用进度回调（供 SSE `/api/director/chat/stream` 消费）。 */
   onProgress?: (ev: DirectorProgressEvent) => void
+  /** 客户端断开或点击停止时触发中止。 */
+  signal?: AbortSignal
 }
 
 export interface DirectorToolAudit {
@@ -99,8 +101,24 @@ const TYPING_PULSE_MS = 8_000
 const CONFIRM_RE = /^\/?(?:确认|同意|批准|ok|yes)(?:\s+#?([A-Za-z0-9]{4}))?$/i
 const CANCEL_RE = /^\/?(?:取消|拒绝|放弃|cancel|no)(?:\s+#?([A-Za-z0-9]{4}))?$/i
 const STATUS_RE = /^\/(?:状态|status)$/i
+const PLANS_RE = /^\/(?:计划|dag|missions?)$/i
+const HELP_RE = /^\/(?:帮助|help|\?)$/i
 const RESET_RE = /^\/(?:新对话|重置|清空|reset|new)$/i
 const DIRECT_RE = /^\/(?:直通|直接派单|task)\s+([\s\S]+)$/i
+
+const READ_ONLY_HOST_ACTIONS = new Set([
+  'host_inspect', 'host_logs', 'host_files', 'host_read_file',
+  'podman_ps', 'podman_images', 'podman_logs', 'service_status',
+])
+
+function isReadOnlyToolCall(tc: ToolCall): boolean {
+  if (tc.name === 'platform_query') return true
+  if (tc.name === 'host_ops') {
+    const act = typeof tc.arguments.action === 'string' ? tc.arguments.action.trim() : ''
+    return READ_ONLY_HOST_ACTIONS.has(act)
+  }
+  return false
+}
 
 function safeSummary(text: string, max = 140): string {
   const one = text.replace(/\s+/g, ' ').trim()
@@ -231,7 +249,7 @@ export class DirectorService {
     const key = `${channel}:${input.from}`
 
     // 快捷口令不等待防抖，立刻响应
-    const immediate = STATUS_RE.test(text) || RESET_RE.test(text) || DIRECT_RE.test(text)
+    const immediate = STATUS_RE.test(text) || PLANS_RE.test(text) || HELP_RE.test(text) || RESET_RE.test(text) || DIRECT_RE.test(text)
       || CONFIRM_RE.test(text) || CANCEL_RE.test(text) || cfg.debounceMs <= 0
 
     if (immediate) {
@@ -386,6 +404,20 @@ export class DirectorService {
       return finish({ sessionId: session.id, reply, toolsUsed: [], pendingActions: this.store.listPendingActions(session.id, true), shortcut: 'status' })
     }
 
+    if (!input.autoTrigger && PLANS_RE.test(text)) {
+      const reply = `${missedPrefix}${await this.formatQuickPlans()}`
+      this.store.addMessage({ sessionId: session.id, role: 'user', content: text })
+      this.store.addMessage({ sessionId: session.id, role: 'assistant', content: reply, meta: { shortcut: 'plans' } })
+      return finish({ sessionId: session.id, reply, toolsUsed: [], pendingActions: this.store.listPendingActions(session.id, true), shortcut: 'plans' })
+    }
+
+    if (!input.autoTrigger && HELP_RE.test(text)) {
+      const reply = `${missedPrefix}${this.formatQuickHelp()}`
+      this.store.addMessage({ sessionId: session.id, role: 'user', content: text })
+      this.store.addMessage({ sessionId: session.id, role: 'assistant', content: reply, meta: { shortcut: 'help' } })
+      return finish({ sessionId: session.id, reply, toolsUsed: [], pendingActions: this.store.listPendingActions(session.id, true), shortcut: 'help' })
+    }
+
     if (!input.autoTrigger && RESET_RE.test(text)) {
       this.store.resetSession(session.id, true)
       const reply = `${missedPrefix}已清空当前短期对话上下文，我们可以重新开始。历史记录仍保留在控制台审计中。`
@@ -497,6 +529,7 @@ export class DirectorService {
       userMessage: text,
       focusTicketId: freshSession.focusTicketId,
     })
+    const liveSnapshot = await this.buildLiveSnapshot()
     const systemPrompt = buildDirectorSystemPrompt({
       nowIso: this.doNow().toISOString(),
       channel: input.channel,
@@ -504,6 +537,7 @@ export class DirectorService {
       pendingActions: pendingBefore,
       pendingFollowups,
       extraPrompt: cfg.extraPrompt,
+      ...(liveSnapshot ? { liveSnapshot } : {}),
       ...(pluginSections && pluginSections.length > 0 ? { pluginSections } : {}),
     })
 
@@ -515,10 +549,16 @@ export class DirectorService {
     const deadline = Date.now() + turnTimeoutMs
     const maxSteps = Math.max(1, Math.min(15, cfg.maxToolSteps))
     const sessionKey = `director-${input.channel}-${input.userId}`
+    let activeModel = resolved
+    let fallbackUsed = false
     let finalReply = ''
     let modelFailed = false
 
     for (let step = 0; step <= maxSteps; step += 1) {
+      if (input.signal?.aborted) {
+        finalReply = '已按你的操作中止本轮推理。'
+        break
+      }
       const remainingMs = deadline - Date.now()
       if (remainingMs < 3_000) {
         finalReply = '本次排查调用耗时较长已达上限，以上已获取部分信息，你可以继续追问具体某一项。'
@@ -527,19 +567,19 @@ export class DirectorService {
 
       const allowTools = step < maxSteps
       if (step === 0) {
-        input.onProgress?.({ type: 'start', sessionId: session.id, model: resolved.ref })
+        input.onProgress?.({ type: 'start', sessionId: session.id, model: activeModel.ref })
       }
       input.onProgress?.({
         type: 'thinking',
         step: step + 1,
-        message: step === 0 ? '正在结合项目背景与长期偏好理解需求…' : `第 ${step + 1} 轮综合工具结果继续研判…`,
+        message: step === 0 ? '正在结合实时态势、项目背景与长期偏好理解需求…' : `第 ${step + 1} 轮综合工具结果继续研判…`,
       })
-      const result = await this.doCallTool(resolved.target, {
-        model: resolved.model,
+      let result = await this.doCallTool(activeModel.target, {
+        model: activeModel.model,
         system: systemPrompt,
         messages: conversation,
         tools: allowTools ? this.tools.definitions() : [],
-        maxTokens: Math.min(4096, resolved.maxTokens),
+        maxTokens: Math.min(4096, activeModel.maxTokens),
       }, {
         timeoutMs: Math.min(stepTimeoutMs, remainingMs),
         sessionId: sessionKey,
@@ -548,21 +588,56 @@ export class DirectorService {
         maxRetries,
       })
 
-      this.recordUsage(resolved.provider, resolved.model, result.status ?? 0, result.usage, result.latencyMs)
+      this.recordUsage(activeModel.provider, activeModel.model, result.status ?? 0, result.usage, result.latencyMs)
+
+      // 故障自动备选模型降级：主模型上游报错/超时且非工具不兼容时，自动切换另一已启用模型重试本步
+      if (!result.ok && !result.toolsUnsupported && !fallbackUsed && !input.signal?.aborted) {
+        const alt = this.resolveFallbackModel(activeModel.ref)
+        if (alt) {
+          fallbackUsed = true
+          const prevRef = activeModel.ref
+          activeModel = alt
+          this.logEvent('director.model_fallback', 'warn', `总控主模型 ${prevRef} 调用异常，自动切换备选模型 ${alt.ref}`, {
+            sessionId: session.id,
+            from: prevRef,
+            to: alt.ref,
+            error: (result.error ?? '').slice(0, 120),
+          })
+          input.onProgress?.({
+            type: 'thinking',
+            step: step + 1,
+            message: `主模型 ${prevRef} 响应异常，已自动切换至备选模型 ${alt.ref} 继续处理…`,
+          })
+          result = await this.doCallTool(activeModel.target, {
+            model: activeModel.model,
+            system: systemPrompt,
+            messages: conversation,
+            tools: allowTools ? this.tools.definitions() : [],
+            maxTokens: Math.min(4096, activeModel.maxTokens),
+          }, {
+            timeoutMs: Math.min(stepTimeoutMs, Math.max(10_000, deadline - Date.now())),
+            sessionId: `${sessionKey}-fb`,
+            stream: true,
+            cacheTtl: '5m',
+            maxRetries: Math.min(2, maxRetries),
+          })
+          this.recordUsage(activeModel.provider, activeModel.model, result.status ?? 0, result.usage, result.latencyMs)
+        }
+      }
 
       if (!result.ok) {
         modelFailed = true
-        this.logEvent('director.model_failed', 'warn', `总控模型调用失败（${resolved.ref}）：${(result.error ?? '未知错误').slice(0, 120)}`, {
+        this.logEvent('director.model_failed', 'warn', `总控模型调用失败（${activeModel.ref}）：${(result.error ?? '未知错误').slice(0, 120)}`, {
           sessionId: session.id,
-          model: resolved.ref,
+          model: activeModel.ref,
           step: step + 1,
           status: result.status ?? 0,
           latencyMs: result.latencyMs,
         })
         if (result.toolsUnsupported) {
-          finalReply = `当前总控模型（${resolved.ref}）的上游接口不支持原生工具调用（Function Calling）。请在后台「设置 → 总控助手」切换一个支持工具调用的模型（如 Claude、Gemini 或 DeepSeek 官方/兼容接口）。`
+          finalReply = `当前总控模型（${activeModel.ref}）的上游接口不支持原生工具调用（Function Calling）。请在后台「设置 → 总控助手」切换一个支持工具调用的模型（如 Claude、Gemini 或 DeepSeek 官方/兼容接口）。`
         } else {
-          finalReply = `调用总控模型（${resolved.ref}）失败：${result.error ?? '未知错误'}。你可以稍后重试，或发 /状态 查看实时面板。`
+          finalReply = `调用总控模型（${activeModel.ref}）失败：${result.error ?? '未知错误'}。你可以稍后重试，或发 /状态 查看实时面板。`
         }
         break
       }
@@ -585,13 +660,15 @@ export class DirectorService {
         role: 'assistant',
         content: result.text.trim(),
         toolCalls: sanitizedCalls,
-        meta: { model: resolved.ref, step: step + 1 },
+        meta: { model: activeModel.ref, step: step + 1 },
       })
       conversation.push({ role: 'assistant', content: result.text.trim(), toolCalls: sanitizedCalls })
 
-      for (let i = 0; i < assistantCalls.length; i += 1) {
-        const tc = assistantCalls[i]!
-        const safeArgs = sanitizedCalls[i]!.arguments
+      // 多个纯只读工具调用并发加速执行；包含任何写/派单/高危动作则严格串行执行保证顺序与一致性
+      const allReadOnly = assistantCalls.length > 1 && assistantCalls.every(isReadOnlyToolCall)
+      const execOne = async (idx: number) => {
+        const tc = assistantCalls[idx]!
+        const safeArgs = sanitizedCalls[idx]!.arguments
         const actName = typeof safeArgs.action === 'string' ? safeArgs.action : undefined
         input.onProgress?.({
           type: 'tool_start',
@@ -617,6 +694,20 @@ export class DirectorService {
           summary: sum,
           ...(runRes.pendingActionId ? { pendingActionId: runRes.pendingActionId } : {}),
         })
+        return { tc, safeArgs, runRes, ms, sum }
+      }
+
+      const outcomes = allReadOnly
+        ? await Promise.all(assistantCalls.map((_, idx) => execOne(idx)))
+        : await (async () => {
+            const list: Awaited<ReturnType<typeof execOne>>[] = []
+            for (let i = 0; i < assistantCalls.length; i += 1) {
+              list.push(await execOne(i))
+            }
+            return list
+          })()
+
+      for (const { tc, safeArgs, runRes, ms, sum } of outcomes) {
         toolsUsed.push({
           name: tc.name,
           args: safeArgs,
@@ -649,7 +740,7 @@ export class DirectorService {
       role: 'assistant',
       content: safeReply,
       meta: {
-        model: resolved.ref,
+        model: activeModel.ref,
         toolsCount: toolsUsed.length,
         tools: toolsUsed.map(t => ({ name: t.name, ok: t.ok, ms: t.ms })),
       },
@@ -663,7 +754,7 @@ export class DirectorService {
       reply: safeReply,
       toolsUsed,
       pendingActions: this.store.listPendingActions(session.id, true),
-      model: resolved.ref,
+      model: activeModel.ref,
       ...(modelFailed ? { modelFailed: true } : {}),
     })
   }
@@ -912,6 +1003,92 @@ export class DirectorService {
     return lines.join('\n')
   }
 
+  private async formatQuickPlans(): Promise<string> {
+    try {
+      const res = await this.deps.plugins?.dispatchDirectorQuery(
+        'missions_list',
+        { limit: 8 },
+        { sessionId: 'quick-plans', channel: 'web', userId: 'quick' },
+      )
+      if (!res || !res.matched) return '🗺️ 当前未启用 DAG 任务计划插件。'
+      const items = ((res.result as { items?: { id: string; title: string; status: string; planVersion: number; nodes: { key: string; title: string; status: string }[] }[] })?.items) ?? []
+      if (items.length === 0) return '🗺️ 当前暂无多步骤 DAG 任务计划。直接把复杂需求发给我，我会自动拆解并排期执行。'
+      const lines = ['🗺️ DAG 任务计划速览（最近 8 条）']
+      for (const m of items.slice(0, 8)) {
+        const done = m.nodes.filter(n => n.status === 'completed' || n.status === 'skipped').length
+        const waiting = m.nodes.filter(n => n.status === 'waiting_approval')
+        lines.push(`• [${m.status}] ${m.title}（${m.id} · v${m.planVersion} · ${done}/${m.nodes.length}）`)
+        for (const w of waiting) lines.push(`  ⏳ 待人工批准：${w.title} (${w.key})`)
+      }
+      return lines.join('\n')
+    } catch {
+      return '🗺️ 读取任务计划失败，请稍后再试。'
+    }
+  }
+
+  private formatQuickHelp(): string {
+    return [
+      '🧭 总控助手快捷口令（0 Token 秒回）',
+      '• `/状态` — 查看工位、进行中任务、今日花费与主机资源',
+      '• `/计划` — 查看多步骤 DAG 任务计划与待人工批准卡点',
+      '• `/新对话` — 清空短期上下文重新开始（保留审计日志）',
+      '• `/确认 [短码]` / `/取消 [短码]` — 批准或放弃待确认高危操作',
+      '• `/直通 <任务内容>` — 跳过总控直接建单派发',
+      '',
+      '💡 日常直接用自然语言交代即可：',
+      '• 代码改造（自动推荐 `worktree` 隔离分支审 Diff 合并）',
+      '• 复杂多步任务（自动拆解并行 DAG 并设人工审批）',
+      '• 周期定时与口径修订（自动同步任务约定与长期记忆）',
+      '• 确定性数据核对（自动派发 0 Token 注册脚本）',
+    ].join('\n')
+  }
+
+  /** 低开销采集实时平台态势快照注入系统提示词，避免首轮盲查显著提速。 */
+  private async buildLiveSnapshot(): Promise<string> {
+    const lines: string[] = []
+    try {
+      const ov = this.deps.host.overview()
+      lines.push(`- 槽位：${ov.slots.used}/${ov.slots.max}｜接单：${ov.paused ? '已暂停' : '正常'}｜开放工单 ${ov.tickets.open}（运行中 ${ov.tickets.running}，等你回答 ${ov.tickets.needsPerson}）`)
+      if (ov.attentionTickets.length > 0) {
+        lines.push(`- 待处理工单：${ov.attentionTickets.slice(0, 5).map(t => `${t.id}(${t.kind}: ${t.title.slice(0, 28)})`).join('；')}`)
+      }
+    } catch { /* mock host */ }
+
+    try {
+      const open = this.deps.host.listTickets({ status: 'open', limit: 6, offset: 0 })
+      if (open.items.length > 0) {
+        lines.push(`- 当前开放工单：${open.items.map(t => `${t.id}「${t.title.slice(0, 28)}」[${t.stage}]`).join('；')}`)
+      }
+    } catch { /* mock host */ }
+
+    try {
+      const projs = this.deps.projects?.list?.().filter(p => p.status === 'ready').slice(0, 10) ?? []
+      if (projs.length > 0) {
+        lines.push(`- 就绪项目库：${projs.map(p => `${p.name}(${p.id})`).join('、')}`)
+      }
+    } catch { /* ignore */ }
+
+    try {
+      const mRes = await this.deps.plugins?.dispatchDirectorQuery(
+        'missions_list',
+        { limit: 5 },
+        { sessionId: 'snapshot', channel: 'web', userId: 'snapshot' },
+      )
+      if (mRes?.matched) {
+        const items = ((mRes.result as { items?: { id: string; title: string; status: string; planVersion: number; nodes: { key: string; status: string }[] }[] })?.items ?? [])
+          .filter(m => m.status === 'running' || m.status === 'draft' || m.status === 'paused')
+        if (items.length > 0) {
+          lines.push(`- 活跃 DAG 计划：${items.map(m => {
+            const wait = m.nodes.filter(n => n.status === 'waiting_approval').map(n => n.key)
+            return `${m.id}「${m.title.slice(0, 24)}」[v${m.planVersion}/${m.status}${wait.length ? ` 待批:${wait.join(',')}` : ''}]`
+          }).join('；')}`)
+        }
+      }
+    } catch { /* ignore */ }
+
+    return lines.join('\n')
+  }
+
   private resolveModel(): { provider: string; model: string; ref: string; maxTokens: number; target: ModelTarget } | undefined {
     const opts = this.deps.options.get()
     const preferred: ModelRef = opts.director.model ?? opts.models.routing.worker
@@ -931,6 +1108,49 @@ export class DirectorService {
         ...(provider.sessionHeader ? { sessionHeader: provider.sessionHeader } : {}),
       },
     }
+  }
+
+  /** 主总控模型上游故障时，自动挑选一个不同的已启用模型兜底重试。 */
+  private resolveFallbackModel(excludeRef: string): { provider: string; model: string; ref: string; maxTokens: number; target: ModelTarget } | undefined {
+    const opts = this.deps.options.get()
+    const workerRef = formatRef(opts.models.routing.worker)
+    if (workerRef !== excludeRef) {
+      const w = findModel(opts.models, opts.models.routing.worker, { enabledOnly: true })
+      if (w) {
+        return {
+          provider: w.provider.id,
+          model: w.model.id,
+          ref: workerRef,
+          maxTokens: w.model.maxTokens,
+          target: {
+            api: w.provider.api,
+            baseUrl: w.provider.baseUrl,
+            apiKey: w.provider.apiKey,
+            ...(w.provider.sessionHeader ? { sessionHeader: w.provider.sessionHeader } : {}),
+          },
+        }
+      }
+    }
+    for (const provider of opts.models.providers) {
+      if (!provider.enabled) continue
+      for (const model of provider.models) {
+        const ref = formatRef({ provider: provider.id, model: model.id })
+        if (ref === excludeRef) continue
+        return {
+          provider: provider.id,
+          model: model.id,
+          ref,
+          maxTokens: model.maxTokens,
+          target: {
+            api: provider.api,
+            baseUrl: provider.baseUrl,
+            apiKey: provider.apiKey,
+            ...(provider.sessionHeader ? { sessionHeader: provider.sessionHeader } : {}),
+          },
+        }
+      }
+    }
+    return undefined
   }
 
   private directorTodayUsd(): number {
