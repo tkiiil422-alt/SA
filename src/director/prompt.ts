@@ -10,6 +10,8 @@ export interface PromptContext {
   pendingActions: readonly PendingAction[]
   pendingFollowups?: readonly DirectorFollowup[]
   extraPrompt?: string
+  /** 由 PluginRegistry 动态注入的附加段落（如长期记忆、可用技能库、插件工具速查）。 */
+  pluginSections?: readonly string[]
 }
 
 export function buildDirectorSystemPrompt(ctx: PromptContext): string {
@@ -92,6 +94,12 @@ export function buildDirectorSystemPrompt(ctx: PromptContext): string {
 
   if (ctx.session.summary.trim()) {
     lines.push('', '## 早期对话摘要（已压缩）', ctx.session.summary.trim())
+  }
+
+  if (ctx.pluginSections && ctx.pluginSections.length > 0) {
+    for (const section of ctx.pluginSections) {
+      if (section.trim()) lines.push('', section.trim())
+    }
   }
 
   if (ctx.extraPrompt && ctx.extraPrompt.trim()) {

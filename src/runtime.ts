@@ -35,9 +35,9 @@ import { BookFiles } from './novel/files.ts'
 import type { Role as NovelRole } from './novel/pipeline.ts'
 import { readProjectProfile } from './council/profile.ts'
 import { createAdminApi } from './admin/api.ts'
-import { createAdminServer, type AdminServer } from './admin/server.ts'
-import { createStaticHandler } from './admin/static.ts'
 import { createRuntimeAdminHost } from './admin/runtime-host.ts'
+import { createConsoleServer, registerBuiltinDescriptors } from './runtime/console-server.ts'
+import { PluginRegistry } from './plugins/registry.ts'
 import type { DomainEvent, Executor } from './core/index.ts'
 import type { Trigger } from './core/model.ts'
 import { allowedSender, assessmentOutcome, settingsPolicy } from './policy.ts'
@@ -131,6 +131,7 @@ export interface Runtime {
   readonly controlUrl: string
   readonly adminUrl: string
   readonly director: DirectorService
+  readonly plugins: PluginRegistry
   ask(text: string, opts?: { model?: string }): Promise<AskResult>
   /** The intake both Feishu transports use, exposed so tests exercise the same continuation path. */
   feishuIntake(trigger: Trigger): void
@@ -735,6 +736,8 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       },
       onError: error => console.error(`superagentd: assessment failed: ${error instanceof Error ? error.message : String(error)}`),
     })
+    const plugins = new PluginRegistry()
+    registerBuiltinDescriptors(plugins, optionsStore)
     const policy = () => settingsPolicy(settings, composite)
     // Track budget-blocked notifications per ticket; reset on ticket end, budget settings change, or new day.
     const budgetNotified = new Set<string>()
@@ -746,6 +749,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
           console.error(`superagentd: event log failed: ${error instanceof Error ? error.message : String(error)}`)
         }
       }
+      plugins.emitDomainEvent(event)
       if (event.type === 'ticket.ended') {
         invalidateTicket(event.data.ticketId)
         budgetNotified.delete(event.data.ticketId)
@@ -1066,8 +1070,10 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       engine,
       authorize: token => {
         const entry = tokens.get(token)
-        return entry ? { ticketId: entry.ticketId } : undefined
+        return entry ? { ticketId: entry.ticketId, assignmentId: entry.assignmentId, role: entry.role } : undefined
       },
+      plugins,
+      projectIdOf: ticketId => projects.ticketProject(ticketId)?.id,
       // A report is redacted before the Engine stores it, so the value never reaches the ticket detail or a channel.
       redact: text => vault.redactSecrets(text),
       gate: (ticketId, report) => goals.gate(ticketId, report),
@@ -1334,9 +1340,20 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         // Preview ports are allocated before the container starts; pasta forwards them from the host's loopback.
         const previewOptions = optionsStore.get().preview
         const previewPorts = previewOptions.enabled ? await previews.allocate(ticket.id) : []
+        const ticketProj = projects.ticketProject(ticket.id)
+        const originTrigger = repo.triggers.get(ticket.origin.triggerId)
+        const pluginPrompts = plugins.collectWorkerPromptSections({
+          ticketId: ticket.id,
+          title: ticket.title,
+          ...(originTrigger?.text ? { promptText: originTrigger.text } : {}),
+          ...(ticketProj ? { projectId: ticketProj.id, projectName: ticketProj.name } : {}),
+        })
+        const pluginPromptArgs = pluginPrompts.length > 0
+          ? ['--append-system-prompt', pluginPrompts.join('\n\n')]
+          : []
         return {
           command: config.launcher.command,
-          args: [...launchArgs(config.launcher.args, picked.ref, context.resume), ...goalArgs(ticket.id)],
+          args: [...launchArgs(config.launcher.args, picked.ref, context.resume), ...goalArgs(ticket.id), ...pluginPromptArgs],
           env: {
             ...config.launcher.env,
             // The console's Pi version page switches this; it wins over the config file so the switch takes effect.
@@ -1882,6 +1899,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       devEnv,
       hostOps,
       webSearch,
+      plugins,
       // executor/budget/feishu/email/wechat 的热重载均已由 optionsStore.onChange 监听器自动联动，
       // 仅当未触发 options 变更（例如只改了外置策略）时避免重复重启通道连接。
       onSettingsChanged: async (section, changed) => {
@@ -1925,56 +1943,21 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       onError: error => console.error(`superagentd: director bridge failed: ${error instanceof Error ? error.message : String(error)}`),
     })
     syncWechat()
-    const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity, novels, fanqie, piVersions, goals, devEnv, pentest, director })
-    const consoleRoot = join(dirname(fileURLToPath(import.meta.url)), 'admin', 'web-next')
-    // Public preview links sit outside `/api` too: the token is the credential, and the worker app has no session.
-    const previewProxy = createPreviewProxy({
-      store: previews,
-      publicBase: () => optionsStore.get().preview.publicBase,
-      // Once the container stopped, the link shows what the worker left in /workspace/output.
-      staticRoot: ticketId => join(workspaceRoot, ticketId, 'output'),
-    })
-    const adminServer = createAdminServer({
+    const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity, novels, fanqie, piVersions, goals, devEnv, pentest, director, plugins })
+    const adminServer = createConsoleServer({
       api: adminApi,
-      staticHandler: (() => {
-        const consoleHandler = createStaticHandler(consoleRoot)
-        const mounted = (prefix: string, req: IncomingMessage, res: ServerResponse): boolean => {
-          const original = req.url
-          req.url = (req.url ?? '/').slice(prefix.length) || '/'
-          try { return consoleHandler(req, res) } finally { req.url = original }
-        }
-        return (req: IncomingMessage, res: ServerResponse): boolean => {
-          const path = (req.url ?? '/').split('?')[0] ?? '/'
-          // 统一使用新版 React 控制台；旧 /legacy 与 /next 入口做 302 跳转兼容历史书签。
-          if (path === '/legacy' || path === '/next') { res.writeHead(302, { location: './' }); res.end(); return true }
-          if (path === '/legacy/' || path === '/next/') { res.writeHead(302, { location: '../' }); res.end(); return true }
-          if (path.startsWith('/next/')) return mounted('/next', req, res)
-          return consoleHandler(req, res)
-        }
-      })(),
-      // The Feishu and WeChat event callbacks sit outside `/api`: no login, each verifies its own signature/token.
-      callbacks: async (req, res) => {
-        // 兼容挂载在 /next/ 下的相对 API 路径。
-        const mount = /^\/next(\/api(?:\/|$|\?))/.exec(req.url ?? '')
-        if (mount) req.url = (req.url ?? '').slice(5)
-        if (await previewProxy(req, res)) return true
-        const url = new URL(req.url ?? '/', 'http://admin.invalid')
-        if (url.pathname === '/feishu/events') {
-          await feishu.handleHttp(req, res)
-          return true
-        }
-        if (url.pathname === '/wechat/events') {
-          await wechat.handleHttp(req, res)
-          return true
-        }
-        return false
-      },
-      host: '127.0.0.1',
+      previews,
+      optionsStore,
+      workspaceRoot,
+      feishu,
+      wechat,
       port: config.adminPort,
     })
     cleanup.push(() => adminServer.close())
     const adminPort = (await adminServer.listen()).port
     const adminUrl = `http://127.0.0.1:${adminPort}`
+    await plugins.startAll()
+    cleanup.push(() => plugins.stopAll())
 
     // Workers share the host network namespace, so the control port requires the CLI token, which they never see.
     const control = createControlServer({
@@ -2034,6 +2017,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       controlUrl,
       adminUrl,
       director,
+      plugins,
       ask,
       feishuIntake,
       ticket,

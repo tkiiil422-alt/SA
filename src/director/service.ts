@@ -488,6 +488,12 @@ export class DirectorService {
     const pendingBefore = this.store.listPendingActions(session.id, true)
     const pendingFollowups = this.store.listFollowups(session.id, true)
     const freshSession = this.store.getSession(session.id) ?? session
+    const pluginSections = this.deps.plugins?.collectDirectorPromptSections({
+      channel: input.channel,
+      userId: input.userId,
+      userMessage: text,
+      focusTicketId: freshSession.focusTicketId,
+    })
     const systemPrompt = buildDirectorSystemPrompt({
       nowIso: this.doNow().toISOString(),
       channel: input.channel,
@@ -495,6 +501,7 @@ export class DirectorService {
       pendingActions: pendingBefore,
       pendingFollowups,
       extraPrompt: cfg.extraPrompt,
+      ...(pluginSections && pluginSections.length > 0 ? { pluginSections } : {}),
     })
 
     const toolsUsed: DirectorToolAudit[] = []

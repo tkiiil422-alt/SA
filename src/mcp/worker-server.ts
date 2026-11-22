@@ -13,6 +13,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import { UserError } from '../core/index.ts'
 import type { EngineForExecutor, ThreadRef, WorkerReport } from '../core/index.ts'
+import type { PluginRegistry } from '../plugins/registry.ts'
 
 /** The Engine methods a worker's tools may use. */
 export type WorkerEngine = Pick<EngineForExecutor, 'report' | 'handback' | 'markUnrelated' | 'followForContext' | 'reply'>
@@ -106,7 +107,11 @@ export type WorkerReportGate =
 export interface WorkerMcpServerOptions {
   engine: WorkerEngine
   /** Resolves a bearer token to the ticket it belongs to; unknown or missing tokens never reach MCP handling. */
-  authorize: (token: string) => { ticketId: string } | undefined
+  authorize: (token: string) => { ticketId: string; assignmentId?: string; role?: string } | undefined
+  /** Optional plugin registry supplying additional Worker MCP tools (such as memory & skills). */
+  plugins?: PluginRegistry
+  /** Optional lookup returning the ticket's bound projectId, passed to plugin MCP tools. */
+  projectIdOf?: (ticketId: string) => string | undefined
   /** Optional redaction applied to report text before the Engine stores it. Never receives secret names. */
   redact?: (text: string) => string
   /** Stores an AI-created secret; absent means the tool reports that storage is unavailable. */
@@ -173,7 +178,8 @@ const threadRef = (key: string): ThreadRef => {
 const ReasonSchema = z.string().trim().min(1).max(300).describe('One sentence on why.')
 
 /** Builds the tools bound to one ticket; nothing in their schemas may name a ticket. */
-function createServerFor(options: WorkerMcpServerOptions, ticketId: string): McpServer {
+function createServerFor(options: WorkerMcpServerOptions, ticket: { ticketId: string; assignmentId?: string; role?: string }): McpServer {
+  const { ticketId } = ticket
   const { engine, onError, redact } = options
   const clean = (text: string): string => redact === undefined ? text : redact(text)
   const server = new McpServer({ name: 'superagent-worker', version: '0.1.0' })
@@ -405,6 +411,17 @@ function createServerFor(options: WorkerMcpServerOptions, ticketId: string): Mcp
     return { recorded: true, id: result.id, engagement_id: result.engagementId }
   }))
 
+  // 动态注册已启用的子系统插件工具（如长期记忆检索/写入、技能查询）
+  if (options.plugins) {
+    const projectId = options.projectIdOf?.(ticketId)
+    options.plugins.registerWorkerMcpTools(server, {
+      ticketId,
+      assignmentId: ticket.assignmentId ?? '',
+      role: ticket.role ?? 'main',
+      ...(projectId ? { projectId } : {}),
+    })
+  }
+
   return server
 }
 
@@ -434,7 +451,7 @@ export function createWorkerMcpServer(options: WorkerMcpServerOptions): WorkerMc
       sendJson(res, 405, { jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed.' }, id: null }, { allow: 'POST' })
       return
     }
-    const server = createServerFor(options, ticket.ticketId)
+    const server = createServerFor(options, ticket)
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
     const entry = { server, transport }
     active.add(entry)
