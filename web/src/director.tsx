@@ -175,6 +175,7 @@ export function Director() {
   // 会话列表与单会话消息的批量管理状态
   const [manageSessions, setManageSessions] = useState(false)
   const [pickedSessions, setPickedSessions] = useState<string[]>([])
+  const [removedSessionIds, setRemovedSessionIds] = useState<string[]>([])
   const [manageMsgs, setManageMsgs] = useState(false)
   const [pickedMsgIds, setPickedMsgIds] = useState<number[]>([])
 
@@ -183,7 +184,10 @@ export function Director() {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const abortRef = useRef<AbortController | null>(null)
 
-  const items = sessionsPoll.d?.items ?? []
+  const rawItems = sessionsPoll.d?.items ?? []
+  const items = removedSessionIds.length > 0
+    ? rawItems.filter(s => !removedSessionIds.includes(s.id))
+    : rawItems
   const st = sessionsPoll.d?.status
   const globalPending = sessionsPoll.d?.pendingActions ?? []
   const missions = missionsPoll.d?.items ?? []
@@ -195,6 +199,14 @@ export function Director() {
   )
   const opsAttention = waitingApprovals + globalPending.length
   const activeMissionsCount = missions.filter(m => m.status === 'running' || m.status === 'draft').length
+
+  // 当后端轮询数据已不再包含被删会话时，自动释放乐观隐藏集合
+  useEffect(() => {
+    if (removedSessionIds.length === 0) return
+    const rawSet = new Set(rawItems.map(s => s.id))
+    const stillPending = removedSessionIds.filter(id => rawSet.has(id))
+    if (stillPending.length !== removedSessionIds.length) setRemovedSessionIds(stillPending)
+  }, [rawItems, removedSessionIds])
 
   useEffect(() => {
     if (selectedId && items.length > 0 && !items.some(s => s.id === selectedId)) {
@@ -232,6 +244,11 @@ export function Director() {
       setDetail(res)
       setDetailErr('')
     } catch (e: any) {
+      if (e?.status === 404) {
+        setDetail(null)
+        setDetailErr('')
+        return
+      }
       setDetailErr(e?.message || '读取会话详情失败')
     }
   }
@@ -430,6 +447,7 @@ export function Director() {
       const r = await post('api/director/sessions/batch-delete', { ids: toDelete })
       toast(`已删除 ${r?.deleted ?? count} 个对话会话`)
     }, undefined, () => {
+      setRemovedSessionIds(prev => [...new Set([...prev, ...toDelete])])
       if (selectedId && toDelete.includes(selectedId)) {
         setSelectedId('')
         setDetail(null)
@@ -446,6 +464,7 @@ export function Director() {
     if (!await confirmAction(`永久删除对话「${title}」及其全部消息记录？此操作不可撤销。`, { title: '删除对话', okLabel: '永久删除', danger: true })) return
     const targetId = selectedId
     await run(() => del(`api/director/sessions/${encodeURIComponent(targetId)}`), '已删除当前对话', () => {
+      setRemovedSessionIds(prev => [...new Set([...prev, targetId])])
       setSelectedId('')
       setDetail(null)
       setPickedSessions(prev => prev.filter(x => x !== targetId))
