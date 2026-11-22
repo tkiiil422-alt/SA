@@ -764,33 +764,41 @@ a.pt-card:hover{border-color:var(--run);box-shadow:var(--lift)}
   .dir__layout.has-ops .dir__ops{grid-column:1 / -1;max-height:420px}
 }
 
-/* 手机端深度适配（< 900px）：全屏原生对话体验，零溢出，零冗余滚动 */
+/* 手机端深度适配（< 900px）：全屏原生对话体验，纯 Flex 精准锁定 100dvh，输入框永驻首屏 */
 @media(max-width:899px){
-  .shell.is-director main{max-width:none;padding:10px 10px calc(var(--tabs) + 12px + env(safe-area-inset-bottom))}
-  .dir{gap:8px}
-  .dir__head h1{font-size:1.25rem}
-  .dir__stats{display:flex;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;gap:8px;padding-bottom:2px}
+  .shell.is-director{height:100dvh;overflow:hidden;display:flex;flex-direction:column}
+  .shell.is-director .mbar{flex:none}
+  .shell.is-director main{flex:1;min-height:0;max-width:none;width:100%;display:flex;flex-direction:column;overflow:hidden;padding:8px 10px calc(var(--tabs) + 8px + env(safe-area-inset-bottom))}
+  .dir{flex:1;min-height:0;gap:6px;overflow:hidden}
+  .dir__head{margin:0!important;flex:none;flex-direction:row!important;align-items:center!important;justify-content:space-between!important;gap:8px!important}
+  .dir__head h1{font-size:1.15rem}
+  .dir__stats{flex:none;display:flex;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;gap:6px;padding-bottom:1px}
   .dir__stats::-webkit-scrollbar{display:none}
-  .dir__stat{flex:none;padding:7px 11px;border-radius:10px;min-width:108px;box-shadow:none}
-  .dir__stat span{font-size:.7rem}
-  .dir__stat b{font-size:.84rem}
+  .dir__stat{flex:none;padding:5px 10px;border-radius:10px;min-width:92px;box-shadow:none;gap:1px}
+  .dir__stat span{font-size:.68rem}
+  .dir__stat b{font-size:.8rem}
+  .dir__pending{flex:none;max-height:130px;overflow-y:auto}
 
-  .dir__mnav{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:4px;background:var(--sunk);border:1px solid var(--line);border-radius:12px}
-  .dir__mnav button{display:inline-flex!important;align-items:center;justify-content:center;gap:5px;min-height:36px!important;padding:0 6px!important;border:0!important;border-radius:9px!important;background:transparent!important;color:var(--ink2)!important;font-size:.84rem;font-weight:600;cursor:pointer}
+  .dir__mnav{flex:none;display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:3px;background:var(--sunk);border:1px solid var(--line);border-radius:11px}
+  .dir__mnav button{display:inline-flex!important;align-items:center;justify-content:center;gap:5px;min-height:34px!important;padding:0 6px!important;border:0!important;border-radius:8px!important;background:transparent!important;color:var(--ink2)!important;font-size:.82rem;font-weight:600;cursor:pointer}
   .dir__mnav button.is-on{background:var(--surface)!important;color:var(--run)!important;box-shadow:var(--lift)}
 
-  .dir__layout,.dir__layout.has-ops{grid-template-columns:1fr;gap:0}
+  .dir__layout,.dir__layout.has-ops{flex:1;min-height:0;display:flex;flex-direction:column;gap:0;overflow:hidden}
   .dir[data-mpane=chat] .dir__pane-sessions,.dir[data-mpane=chat] .dir__pane-ops{display:none}
   .dir[data-mpane=sessions] .dir__pane-chat,.dir[data-mpane=sessions] .dir__pane-ops{display:none}
   .dir[data-mpane=ops] .dir__pane-chat,.dir[data-mpane=ops] .dir__pane-sessions{display:none}
 
-  .dir__chat{height:calc(100dvh - 208px - var(--tabs) - env(safe-area-inset-bottom));min-height:400px;padding:10px 11px;border-radius:14px}
-  .dir__side{max-height:calc(100dvh - 208px - var(--tabs) - env(safe-area-inset-bottom));min-height:360px}
-  .dir__starters{grid-template-columns:1fr}
+  .dir__chat{flex:1;height:100%;min-height:0;padding:8px 10px;gap:8px;border-radius:14px}
+  .dir__chathead{padding-bottom:7px}
+  .dir__side{flex:1;height:100%;max-height:none;min-height:0;overflow-y:auto}
+  .dir__starters{grid-template-columns:1fr;gap:8px}
+  .dir__starter{padding:10px 12px!important}
   .dir__msg{max-width:95%}
   .dir__bubble{padding:10px 12px;font-size:.93rem}
+  .dir__dock{padding-top:7px;gap:6px}
+  .dir__composer textarea{min-height:42px;max-height:110px;padding:8px 11px}
   .dir__sendbtn span{display:none}
-  .dir__sendbtn{width:46px;padding:0!important;justify-content:center}
+  .dir__sendbtn{width:44px;min-height:42px!important;padding:0!important;justify-content:center}
   .dir__ctxcheck{padding-top:4px}
   .dir__actbtns{width:100%}
   .dir__actbtns button{flex:1}
