@@ -24,6 +24,7 @@ import { decisionKindLabel, reasonLabels, ticketStatusLabel } from '../labels.ts
 import type { EventLevel } from '../../ledger/events.ts'
 import type { UsageRange } from '../../ledger/ledger.ts'
 import { GoalError, resolveGoal, type GoalSpec } from '../../goal/service.ts'
+import { runBrowserVerify } from '../../verify/browser.ts'
 import type { AdminRouteDeps, AdminRouteRequest } from './types.ts'
 
 const CriterionSchema = z.union([
@@ -66,6 +67,40 @@ const CreateTicketSchema = z.object({
   goal: GoalInputSchema.optional(),
 }).strict()
 
+const ReviewPostSchema = z.object({
+  action: z.enum(['comment', 'approve', 'rework']).default('comment'),
+  file: z.string().trim().max(400).optional(),
+  line: z.number().int().min(1).max(1_000_000).optional(),
+  comment: z.string().trim().max(2000).optional(),
+  note: z.string().trim().max(2000).optional(),
+}).strict()
+
+const MergePostSchema = z.object({
+  mode: z.enum(['merge', 'pr']).default('merge'),
+  force: z.boolean().optional(),
+  repo: z.string().trim().max(200).optional(),
+  base: z.string().trim().max(120).optional(),
+  title: z.string().trim().max(200).optional(),
+  body: z.string().max(10_000).optional(),
+}).strict()
+
+const BrowserVerifyPostSchema = z.object({
+  url: z.string().url('请提供合法的 http/https 地址'),
+  steps: z.array(z.object({
+    action: z.enum(['goto', 'fill', 'click', 'submit', 'reload', 'wait', 'assertText', 'assertNotText', 'assertVisible', 'assertValue', 'assertStatus']),
+    url: z.string().max(1000).optional(),
+    selector: z.string().max(300).optional(),
+    name: z.string().max(200).optional(),
+    value: z.string().max(4000).optional(),
+    text: z.string().max(1000).optional(),
+    status: z.number().int().min(100).max(599).optional(),
+    ms: z.number().int().min(10).max(10_000).optional(),
+  }).strict()).max(40).default([]),
+  criterionId: z.string().trim().max(40).optional(),
+  artifactVersion: z.string().trim().max(80).optional(),
+  preferPlaywright: z.boolean().optional(),
+}).strict()
+
 const ArchiveQuerySchema = z.enum(['project', 'output'])
 const SecretCreateSchema = z.object({
   name: SecretNameSchema,
@@ -95,7 +130,7 @@ const BatchDeleteSchema = z.object({
 }).strict()
 
 export async function handleTicketsAndAuditRoutes(deps: AdminRouteDeps, { req, res, url, method, route }: AdminRouteRequest): Promise<boolean> {
-  const { host, store, ledger, events, councils, activity, goals, contracts, handleFiles } = deps
+  const { host, store, ledger, events, projects, councils, activity, goals, contracts, createTicketPr, handleFiles } = deps
 
   // Secrets.
   if (route === '/secrets' && method === 'GET') {
@@ -263,6 +298,150 @@ export async function handleTicketsAndAuditRoutes(deps: AdminRouteDeps, { req, r
     }
     if (method === 'DELETE') { sendJson(res, 200, { ok: goals.cancel(id) }); return true }
     sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
+    return true
+  }
+
+  const diffMatch = /^\/tickets\/([^/]+)\/diff$/.exec(route)
+  if (diffMatch !== null && method === 'GET') {
+    const id = decodeSegment(diffMatch[1] ?? '')
+    if (id === undefined) { sendJson(res, 400, { error: 'invalid_path', message: '任务票编号不合法。' }); return true }
+    if (host.ticket(id) === undefined) { sendJson(res, 404, { error: 'not_found', message: '找不到这张任务票。' }); return true }
+    if (!projects) { sendJson(res, 200, { available: false, reason: '项目服务未启用', files: [], diff: '', truncated: false }); return true }
+    const diff = await projects.ticketDiff(id)
+    sendJson(res, 200, diff)
+    return true
+  }
+
+  const reviewMatch = /^\/tickets\/([^/]+)\/review$/.exec(route)
+  if (reviewMatch !== null) {
+    const id = decodeSegment(reviewMatch[1] ?? '')
+    if (id === undefined) { sendJson(res, 400, { error: 'invalid_path', message: '任务票编号不合法。' }); return true }
+    if (host.ticket(id) === undefined) { sendJson(res, 404, { error: 'not_found', message: '找不到这张任务票。' }); return true }
+    if (!projects) throw new AdminError('not_found', '项目服务未启用。', 404)
+    if (method === 'GET') {
+      const diff = await projects.ticketDiff(id)
+      sendJson(res, 200, {
+        reviews: diff.reviews ?? [],
+        reviewState: diff.reviewState ?? null,
+        needsReverify: Boolean(diff.needsReverify),
+        ...(diff.staleReason ? { staleReason: diff.staleReason } : {}),
+        ...(diff.headSha ? { headSha: diff.headSha } : {}),
+      })
+      return true
+    }
+    if (method === 'POST') {
+      const parsed = ReviewPostSchema.safeParse(await parseJsonBody(req))
+      if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
+      const d = parsed.data
+      if (d.action === 'approve') {
+        const state = await projects.approveReview(id, d.note ?? '')
+        try { events.add({ kind: 'ticket.reviewed', level: 'info', ticketId: id, text: `审查通过（${state.reviewedSha.slice(0, 8)}）` }) } catch { /* ignore */ }
+        sendJson(res, 200, { ok: true, state })
+        return true
+      }
+      if (d.action === 'rework') {
+        if (d.file && d.comment) {
+          await projects.addReviewComment(id, { file: d.file, line: d.line ?? 1, comment: d.comment })
+        }
+        const rw = await projects.requestRework(id, d.note ?? '')
+        host.replyTicket(id, rw.prompt)
+        try { events.add({ kind: 'ticket.rework', level: 'info', ticketId: id, text: `发起一键返工（${rw.openCount} 条批注）` }) } catch { /* ignore */ }
+        sendJson(res, 200, { ok: true, ...rw })
+        return true
+      }
+      if (!d.file || !d.comment) {
+        invalid(res, [{ path: 'comment', message: '添加行级批注必须填写 file 和 comment' }])
+        return true
+      }
+      const item = await projects.addReviewComment(id, { file: d.file, line: d.line ?? 1, comment: d.comment })
+      sendJson(res, 200, { ok: true, item })
+      return true
+    }
+    sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
+    return true
+  }
+
+  const mergeMatch = /^\/tickets\/([^/]+)\/merge$/.exec(route)
+  if (mergeMatch !== null && method === 'POST') {
+    const id = decodeSegment(mergeMatch[1] ?? '')
+    if (id === undefined) { sendJson(res, 400, { error: 'invalid_path', message: '任务票编号不合法。' }); return true }
+    const ticket = host.ticket(id)
+    if (ticket === undefined) { sendJson(res, 404, { error: 'not_found', message: '找不到这张任务票。' }); return true }
+    if (!projects) throw new AdminError('not_found', '项目服务未启用。', 404)
+    const parsed = MergePostSchema.safeParse(await parseJsonBody(req))
+    if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
+
+    if (parsed.data.mode === 'pr') {
+      if (!createTicketPr) {
+        sendJson(res, 400, { error: 'github_unavailable', message: '未配置 GitHub PR 创建能力。' })
+        return true
+      }
+      if (!parsed.data.repo) {
+        invalid(res, [{ path: 'repo', message: '创建 PR 必须填写目标仓库（例如 owner/repo）' }])
+        return true
+      }
+      if (!parsed.data.force) {
+        const diff = await projects.ticketDiff(id)
+        if (diff.needsReverify) {
+          sendJson(res, 409, { error: 'needs_reverify', needsReverify: true, message: diff.staleReason ?? '审查后代码已变化，请重新校验审查后再创建 PR。' })
+          return true
+        }
+      }
+      const committed = await projects.commitTicketBranch(id)
+      if (!committed.ok) { sendJson(res, 400, { error: 'commit_failed', message: committed.message }); return true }
+      const pr = await createTicketPr(id, {
+        repo: parsed.data.repo,
+        head: committed.branch,
+        ...(parsed.data.base ? { base: parsed.data.base } : {}),
+        title: parsed.data.title || ticket.title,
+        body: parsed.data.body || `来自工单 ${id}（分支 ${committed.branch}，commit ${committed.headSha.slice(0, 10)}）`,
+      })
+      if (!pr.ok) { sendJson(res, 400, { error: 'pr_failed', message: pr.message }); return true }
+      sendJson(res, 200, { ...pr, mode: 'pr', branch: committed.branch })
+      return true
+    }
+
+    const result = await projects.mergeTicketWorktree(
+      id,
+      tid => host.ticket(tid)?.status === 'open',
+      { force: Boolean(parsed.data.force) },
+    )
+    if (!result.ok) {
+      sendJson(res, 409, { error: result.needsReverify ? 'needs_reverify' : 'merge_conflict', ...result })
+      return true
+    }
+    try {
+      events.add({
+        kind: 'ticket.merged',
+        level: 'info',
+        ticketId: id,
+        text: `已将工单分支 ${result.branch} 合并回项目主分支（${result.mergedCommit.slice(0, 8)}）`,
+      })
+    } catch { /* ignore */ }
+    sendJson(res, 200, { ...result, mode: 'merge' })
+    return true
+  }
+
+  const bvMatch = /^\/tickets\/([^/]+)\/browser-verify$/.exec(route)
+  if (bvMatch !== null && method === 'POST') {
+    const id = decodeSegment(bvMatch[1] ?? '')
+    if (id === undefined) { sendJson(res, 400, { error: 'invalid_path', message: '任务票编号不合法。' }); return true }
+    if (host.ticket(id) === undefined) { sendJson(res, 404, { error: 'not_found', message: '找不到这张任务票。' }); return true }
+    const ws = host.workspaceRoot(id)
+    if (!ws) { sendJson(res, 404, { error: 'not_found', message: '找不到该工单的工作区。' }); return true }
+    const parsed = BrowserVerifyPostSchema.safeParse(await parseJsonBody(req))
+    if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
+    const result = await runBrowserVerify({
+      url: parsed.data.url,
+      steps: parsed.data.steps,
+      outputDir: join(ws, 'output', 'browser-verify'),
+      ticketId: id,
+      ...(parsed.data.criterionId ? { criterionId: parsed.data.criterionId } : {}),
+      ...(parsed.data.artifactVersion ? { artifactVersion: parsed.data.artifactVersion } : {}),
+      ...(parsed.data.preferPlaywright !== undefined ? { preferPlaywright: parsed.data.preferPlaywright } : {}),
+      ...(goals ? { goals } : {}),
+    })
+    sendJson(res, 200, { ok: result.ok, result })
     return true
   }
 

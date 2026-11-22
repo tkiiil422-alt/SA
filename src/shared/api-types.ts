@@ -249,18 +249,89 @@ export interface TicketDiffFile {
   deletions: number
 }
 
+export interface TicketReviewComment {
+  id: string
+  ticketId: string
+  file: string
+  line: number
+  commitSha: string
+  treeFingerprint: string
+  comment: string
+  status: 'open' | 'resolved'
+  createdAt: string
+}
+
+export interface TicketReviewState {
+  ticketId: string
+  reviewedSha: string
+  reviewedFingerprint: string
+  decision: 'approved' | 'changes_requested'
+  note: string
+  reviewedAt: string
+}
+
 export interface TicketDiffResponse {
   available: boolean
   reason?: string
   mode?: ProjectWorkspaceMode
   branch?: string
   baseRef?: string
+  headSha?: string
+  treeFingerprint?: string
   projectId?: string
   projectName?: string
   canMerge?: boolean
   files: TicketDiffFile[]
   diff: string
   truncated: boolean
+  reviews?: TicketReviewComment[]
+  reviewState?: TicketReviewState | null
+  /** 审查后代码若发生变化则为 true，合并前需要重新校验。 */
+  needsReverify?: boolean
+  staleReason?: string
+}
+
+/** 浏览器自检步骤与结果。 */
+export interface BrowserVerifyStep {
+  action: 'goto' | 'fill' | 'click' | 'submit' | 'reload' | 'wait' | 'assertText' | 'assertNotText' | 'assertVisible' | 'assertValue' | 'assertStatus'
+  url?: string
+  selector?: string
+  name?: string
+  value?: string
+  text?: string
+  status?: number
+  ms?: number
+}
+
+export interface BrowserVerifyAssertion {
+  stepIndex: number
+  action: string
+  passed: boolean
+  detail: string
+}
+
+export interface BrowserVerifyResult {
+  runId: string
+  ok: boolean
+  engine: 'playwright' | 'http-dom'
+  url: string
+  finalUrl: string
+  statusCode: number
+  assertions: BrowserVerifyAssertion[]
+  consoleErrors: string[]
+  screenshots: string[]
+  tracePath?: string
+  durationMs: number
+  summary: string
+}
+
+/** 多执行器描述信息。 */
+export interface RunnerDescriptor {
+  id: string
+  name: string
+  kind: 'agent' | 'script'
+  available: boolean
+  detail?: string
 }
 
 /** 总控助手流式思考与工具调用进度事件（SSE `/api/director/chat/stream`）。 */

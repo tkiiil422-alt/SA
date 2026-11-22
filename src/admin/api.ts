@@ -74,6 +74,7 @@ export interface CreateAdminApiOptions {
   devEnv?: DevEnvService
   goals?: Pick<GoalService, 'view' | 'set' | 'cancel' | 'brief' | 'buildReceipt' | 'recordEvidence' | 'listEvidences'>
   contracts?: ContractStore
+  createTicketPr?: (ticketId: string, input: { repo: string; head: string; base?: string; title: string; body: string }) => Promise<{ ok: true; url: string; number: number } | { ok: false; message: string }>
   pentest?: PentestService
   director?: DirectorService
   /** 子系统插件注册中心（记忆、技能、定时调度及未来扩展插件）。 */
@@ -292,6 +293,7 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
     ...(options.devEnv ? { devEnv: options.devEnv } : {}),
     ...(options.goals ? { goals: options.goals } : {}),
     ...(options.contracts ? { contracts: options.contracts } : {}),
+    ...(options.createTicketPr ? { createTicketPr: options.createTicketPr } : {}),
     ...(options.pentest ? { pentest: options.pentest } : {}),
     ...(options.director ? { director: options.director } : {}),
     ...(plugins ? { plugins } : {}),

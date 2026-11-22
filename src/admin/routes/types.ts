@@ -35,6 +35,7 @@ export interface AdminRouteDeps {
   devEnv?: DevEnvService
   goals?: Pick<GoalService, 'view' | 'set' | 'cancel' | 'brief' | 'buildReceipt' | 'recordEvidence' | 'listEvidences'>
   contracts?: ContractStore
+  createTicketPr?: (ticketId: string, input: { repo: string; head: string; base?: string; title: string; body: string }) => Promise<{ ok: true; url: string; number: number } | { ok: false; message: string }>
   pentest?: PentestService
   director?: DirectorService
   plugins?: PluginRegistry

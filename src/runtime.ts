@@ -44,6 +44,7 @@ import type { MemoryStore } from './memory/store.ts'
 import type { SkillStore } from './skills/store.ts'
 import type { ContractStore } from './contracts/store.ts'
 import type { SchedulerService } from './scheduler/service.ts'
+import type { RunnerRegistry } from './executor/runner.ts'
 import type { DomainEvent, Executor } from './core/index.ts'
 import type { Trigger } from './core/model.ts'
 import { allowedSender, assessmentOutcome, settingsPolicy } from './policy.ts'
@@ -143,6 +144,7 @@ export interface Runtime {
   readonly contracts: ContractStore
   readonly scheduler: SchedulerService
   readonly goals: GoalService
+  readonly runners: RunnerRegistry
   ask(text: string, opts?: { model?: string }): Promise<AskResult>
   /** The intake both Feishu transports use, exposed so tests exercise the same continuation path. */
   feishuIntake(trigger: Trigger): void
@@ -749,22 +751,68 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     })
     let adminHostRef: ReturnType<typeof createRuntimeAdminHost> | undefined
     let goalsRef: GoalService | undefined
+    const createTicketPr = async (
+      ticketId: string,
+      input: { repo: string; head: string; base?: string; title: string; body: string },
+    ): Promise<{ ok: true; url: string; number: number } | { ok: false; message: string }> => {
+      const ticket = repo.tickets.get(ticketId)
+      if (!ticket) return { ok: false, message: '找不到这张任务票。' }
+      const cfg = optionsStore.get().github
+      if (!cfg.enabled) return { ok: false, message: 'GitHub 未启用，请先在后台打开。' }
+      if (!vault.has('GITHUB_TOKEN')) return { ok: false, message: '还没有配置 GitHub 令牌。' }
+      let token = ''
+      try {
+        token = vault.reveal('GITHUB_TOKEN')
+      } catch {
+        return { ok: false, message: '无法读取 GitHub 令牌，请重新填写。' }
+      }
+      const client = new GithubClient({ apiBase: cfg.apiBase, token, repos: cfg.repos })
+      const result = await client.createPullRequest({
+        repo: input.repo,
+        head: input.head,
+        base: input.base ?? cfg.defaultBase,
+        title: input.title,
+        body: input.body,
+      })
+      if (!result.ok) return result
+      links.add(ticketId, { kind: 'pr', url: result.url, title: input.title })
+      try {
+        events.add({
+          kind: 'github.pr', level: 'info', ticketId,
+          text: `已创建 PR：${result.url}`, data: { ticketId, number: result.number },
+        })
+      } catch { /* best effort */ }
+      const origin = repo.triggers.get(ticket.origin.triggerId)
+      const channel = origin?.channel ?? ticket.channels[0]
+      if (channel) {
+        try {
+          outbox.send({
+            id: key('github-pr', ticketId, result.url), channel,
+            text: `PR：${result.url}`, kind: 'notice', ticketId,
+          })
+        } catch { /* best effort */ }
+      }
+      return result
+    }
     const plugins = new PluginRegistry()
     registerBuiltinDescriptors(plugins, optionsStore)
-    const { memories, skills, contracts, scheduler } = wireCorePlugins({
+    const { memories, skills, contracts, scheduler, runners } = wireCorePlugins({
       db: repo.db,
       stateDir,
+      workspaceRoot,
       plugins,
       events,
       redact: text => vault.redactSecrets(text),
       isPaused: () => Boolean(settings.paused),
       getAdminHost: () => adminHostRef,
       getDirector: () => director,
+      getProjects: () => projects,
       getGoals: () => goalsRef,
       getGoalDefaults: () => optionsStore.get().goal,
       notifyTicket: (ticketId, text) => {
         try { engine.note(ticketId, text) } catch { /* ignore */ }
       },
+      createTicketPr,
       getTicketSummary: ticketId => {
         const t = repo.tickets.get(ticketId)
         if (!t?.ended) return undefined
@@ -1226,47 +1274,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         }
         return { ok: true, url: result.url, path: result.path }
       },
-      githubPr: async (ticketId, input) => {
-        const ticket = repo.tickets.get(ticketId)
-        if (!ticket) return { ok: false, message: '找不到这张任务票。' }
-        const cfg = optionsStore.get().github
-        if (!cfg.enabled) return { ok: false, message: 'GitHub 未启用，请先在后台打开。' }
-        if (!vault.has('GITHUB_TOKEN')) return { ok: false, message: '还没有配置 GitHub 令牌。' }
-        let token = ''
-        try {
-          token = vault.reveal('GITHUB_TOKEN')
-        } catch {
-          return { ok: false, message: '无法读取 GitHub 令牌，请重新填写。' }
-        }
-        const client = new GithubClient({ apiBase: cfg.apiBase, token, repos: cfg.repos })
-        const result = await client.createPullRequest({
-          repo: input.repo,
-          head: input.head,
-          base: input.base ?? cfg.defaultBase,
-          title: input.title,
-          body: input.body,
-        })
-        if (!result.ok) return result
-        links.add(ticketId, { kind: 'pr', url: result.url, title: input.title })
-        try {
-          events.add({
-            kind: 'github.pr', level: 'info', ticketId,
-            text: `已创建 PR：${result.url}`, data: { ticketId, number: result.number },
-          })
-        } catch { /* the link is stored; the log line is best effort */ }
-        // Tell the ticket's conversation where the PR is, the same way the preview tool does.
-        const origin = repo.triggers.get(ticket.origin.triggerId)
-        const channel = origin?.channel ?? ticket.channels[0]
-        if (channel) {
-          try {
-            outbox.send({
-              id: key('github-pr', ticketId, result.url), channel,
-              text: `PR：${result.url}`, kind: 'notice', ticketId,
-            })
-          } catch { /* the link is in the tool result; a channel failure must not undo the PR */ }
-        }
-        return result
-      },
+      githubPr: (ticketId, input) => createTicketPr(ticketId, input),
       emailSend: async (ticketId, input) => {
         if (!repo.tickets.get(ticketId)) return { ok: false, message: '找不到这张任务票。' }
         try {
@@ -2048,7 +2056,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       onError: error => console.error(`superagentd: director bridge failed: ${error instanceof Error ? error.message : String(error)}`),
     })
     syncWechat()
-    const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity, novels, fanqie, piVersions, goals, contracts, devEnv, pentest, director, plugins })
+    const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity, novels, fanqie, piVersions, goals, contracts, createTicketPr, devEnv, pentest, director, plugins })
     const adminServer = createConsoleServer({
       api: adminApi,
       previews,
@@ -2128,6 +2136,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       contracts,
       scheduler,
       goals,
+      runners,
       ask,
       feishuIntake,
       ticket,

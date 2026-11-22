@@ -10,6 +10,7 @@ import type { AdminHost } from '../admin/host.ts'
 import type { DirectorService } from '../director/service.ts'
 import type { EventLog } from '../ledger/events.ts'
 import type { GoalService } from '../goal/service.ts'
+import type { ProjectService } from '../projects/service.ts'
 import type { PluginRegistry } from '../plugins/registry.ts'
 import { MemoryStore } from '../memory/store.ts'
 import { SkillStore } from '../skills/store.ts'
@@ -19,19 +20,25 @@ import { createContractsPlugin } from '../contracts/plugin.ts'
 import { SchedulerStore } from '../scheduler/store.ts'
 import { SchedulerService } from '../scheduler/service.ts'
 import { createSchedulerPlugin } from '../scheduler/plugin.ts'
+import { PiRunnerDescriptor, RegisteredScriptRunner, RunnerRegistry } from '../executor/runner.ts'
+import { ClaudeCodeRunner, OpenCodeRunner } from '../executor/adapters.ts'
+import { createEngineeringFactoryPlugin } from '../verify/factory-plugin.ts'
 
 export interface WireCorePluginsOptions {
   db: DatabaseSync
   stateDir: string
+  workspaceRoot: string
   plugins: PluginRegistry
   events: EventLog
   redact: (text: string) => string
   isPaused: () => boolean
   getAdminHost: () => AdminHost | undefined
   getDirector: () => DirectorService | undefined
-  getGoals?: () => Pick<GoalService, 'view' | 'set'> | undefined
+  getProjects?: () => ProjectService | undefined
+  getGoals?: () => Pick<GoalService, 'view' | 'set' | 'recordEvidence'> | undefined
   getGoalDefaults?: () => { maxRounds: number; maxUsd: number; maxHours: number }
   notifyTicket?: (ticketId: string, text: string) => void
+  createTicketPr?: (ticketId: string, input: { repo: string; head: string; base?: string; title: string; body: string }) => Promise<{ ok: true; url: string; number: number } | { ok: false; message: string }>
   getTicketSummary: (ticketId: string) => {
     title: string
     outcome?: string
@@ -48,6 +55,8 @@ export interface CorePluginsBundle {
   readonly skills: SkillStore
   readonly contracts: ContractStore
   readonly scheduler: SchedulerService
+  readonly runners: RunnerRegistry
+  readonly scriptRunner: RegisteredScriptRunner
 }
 
 export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle {
@@ -55,6 +64,12 @@ export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle
   const skills = new SkillStore(opts.db, join(opts.stateDir, 'skills'))
   const contracts = new ContractStore(opts.db)
   const schedulerStore = new SchedulerStore(opts.db)
+  const scriptRunner = new RegisteredScriptRunner()
+  const runners = new RunnerRegistry()
+    .register(new PiRunnerDescriptor())
+    .register(scriptRunner)
+    .register(new ClaudeCodeRunner())
+    .register(new OpenCodeRunner())
 
   const scheduler = new SchedulerService({
     store: schedulerStore,
@@ -103,5 +118,15 @@ export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle
     afterCommit: opts.afterCommit,
   }))
 
-  return { memories, skills, contracts, scheduler }
+  opts.plugins.register(createEngineeringFactoryPlugin({
+    runners,
+    scriptRunner,
+    workspaceRoot: opts.workspaceRoot,
+    getProjects: () => opts.getProjects?.(),
+    getGoals: () => opts.getGoals?.(),
+    getAdminHost: opts.getAdminHost,
+    ...(opts.createTicketPr ? { createTicketPr: opts.createTicketPr } : {}),
+  }))
+
+  return { memories, skills, contracts, scheduler, runners, scriptRunner }
 }

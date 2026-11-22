@@ -17,8 +17,9 @@ import { ProjectHistory, type ChangeSummary, type DeleteSnapshotResult, type Sna
 import { materializeProject, writeAgentsFile } from './materialize.ts'
 import { buildProfile, type ProjectProfile } from './profile.ts'
 import { ProjectStore, type ProjectMode, type ProjectRecord, type ProjectStatus } from './store.ts'
-import { inspectTicketDiff, mergeWorktreeBranch, prepareWorktree } from './worktree.ts'
-import type { TicketDiffResponse } from '../shared/api-types.ts'
+import { TicketReviewStore } from './review-store.ts'
+import { commitWorktreeChanges, inspectTicketDiff, mergeWorktreeBranch, prepareWorktree } from './worktree.ts'
+import type { TicketDiffResponse, TicketReviewComment, TicketReviewState } from '../shared/api-types.ts'
 
 export type { ProjectMode } from './store.ts'
 export type { ChangeSummary, DeleteSnapshotResult, Snapshot } from './history.ts'
@@ -134,6 +135,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** Uploads, extraction, project rows and the ticket hand-off. */
 export class ProjectService {
   readonly root: string
+  readonly reviews: TicketReviewStore
   private readonly workspaceRoot: string
   private readonly uploadsDir: string
   private readonly store: ProjectStore
@@ -164,6 +166,7 @@ export class ProjectService {
     this.idFactory = options.idFactory ?? randomId
     mkdirSync(this.uploadsDir, { recursive: true, mode: 0o700 })
     this.store = new ProjectStore(options.db)
+    this.reviews = new TicketReviewStore(options.db)
     this.recover()
     this.cleanupStaleUploads()
     // The 24-hour rule is enforced while running too; unref so it never keeps the daemon alive.
@@ -771,6 +774,7 @@ export class ProjectService {
           const wt = await prepareWorktree(tree, workspace, ticketId)
           if (!wt.usedWorktree) {
             warning = wt.warning
+            this.store.bindTicket(ticketId, record.id, this.now().toISOString(), 'copy')
             await materializeProject(tree, workspace)
           }
         } finally {
@@ -980,25 +984,85 @@ export class ProjectService {
     return join(this.root, id)
   }
 
-  /** 读取工单工作区的实时 Git Diff（支持 worktree / copy / direct）。 */
+  /** 读取工单工作区的实时 Git Diff（支持 worktree / copy / direct），并附带行级批注与审查失效检测。 */
   async ticketDiff(ticketId: string): Promise<TicketDiffResponse> {
     const entry = this.store.ticketEntry(ticketId)
     const record = entry ? this.store.get(entry.projectId) : undefined
     const projectDir = record ? this.treeRoot(record.id) : undefined
-    return inspectTicketDiff({
+    const diff = await inspectTicketDiff({
       workspace: join(this.workspaceRoot, ticketId),
       ticketId,
       ...(projectDir ? { projectDir } : {}),
       ...(entry?.mode ? { mode: entry.mode } : {}),
       ...(record ? { projectId: record.id, projectName: record.name } : {}),
     })
+    const reviews = this.reviews.listComments(ticketId)
+    const stale = this.reviews.checkStale(ticketId, diff.headSha, diff.treeFingerprint)
+    return {
+      ...diff,
+      reviews,
+      reviewState: stale.state,
+      needsReverify: stale.needsReverify,
+      ...(stale.staleReason ? { staleReason: stale.staleReason } : {}),
+    }
   }
 
-  /** 将 `worktree` 模式工单的隔离分支安全合并回项目库原件（合并前自动快照）。 */
+  /** 为工单的指定文件与行号添加审查批注（自动绑定当前 commit SHA 与工作区内容指纹）。 */
+  async addReviewComment(ticketId: string, input: { file: string; line: number; comment: string }): Promise<TicketReviewComment> {
+    const diff = await this.ticketDiff(ticketId)
+    if (!diff.available) throw new AdminError('invalid', diff.reason ?? '当前工单无法添加代码批注。', 400)
+    return this.reviews.addComment({
+      ticketId,
+      file: input.file,
+      line: input.line,
+      commitSha: diff.headSha ?? 'HEAD',
+      treeFingerprint: diff.treeFingerprint ?? '',
+      comment: input.comment,
+    }, this.now())
+  }
+
+  /** 签核当前版本通过审查（绑定当前 commit SHA + 内容指纹；之后一旦代码再改动会自动触发重新校验）。 */
+  async approveReview(ticketId: string, note = ''): Promise<TicketReviewState> {
+    const diff = await this.ticketDiff(ticketId)
+    if (!diff.available) throw new AdminError('invalid', diff.reason ?? '当前工单无法审查签核。', 400)
+    this.reviews.resolveComments(ticketId)
+    return this.reviews.recordDecision({
+      ticketId,
+      reviewedSha: diff.headSha ?? 'HEAD',
+      reviewedFingerprint: diff.treeFingerprint ?? '',
+      decision: 'approved',
+      note,
+    }, this.now())
+  }
+
+  /** 将当前未解决的审查批注打包为返工指令并标记为需返工，返回给调用方发送给工单执行器。 */
+  async requestRework(ticketId: string, extraNote = ''): Promise<{ state: TicketReviewState; prompt: string; openCount: number }> {
+    const diff = await this.ticketDiff(ticketId)
+    const open = this.reviews.listComments(ticketId).filter(c => c.status === 'open')
+    const state = this.reviews.recordDecision({
+      ticketId,
+      reviewedSha: diff.headSha ?? 'HEAD',
+      reviewedFingerprint: diff.treeFingerprint ?? '',
+      decision: 'changes_requested',
+      note: extraNote || `要求返工（${open.length} 条批注）`,
+    }, this.now())
+    return { state, prompt: this.reviews.formatReworkPrompt(ticketId, extraNote), openCount: open.length }
+  }
+
+  /** 提交工单 worktree 分支改动以备创建 PR 或交接（返回分支名与最新 commit SHA）。 */
+  async commitTicketBranch(ticketId: string, message?: string): Promise<{ ok: true; branch: string; headSha: string; committed: boolean } | { ok: false; message: string }> {
+    const entry = this.store.ticketEntry(ticketId)
+    if (!entry) return { ok: false, message: '这张任务没有绑定项目库。' }
+    if (entry.mode !== 'worktree') return { ok: false, message: '只有 worktree 隔离分支模式的任务有独立分支可提交。' }
+    return commitWorktreeChanges({ workspace: join(this.workspaceRoot, ticketId), ticketId, ...(message ? { message } : {}) })
+  }
+
+  /** 将 `worktree` 模式工单的隔离分支安全合并回项目库原件（合并前自动快照；若审查后代码发生变化默认拦截要求复审）。 */
   async mergeTicketWorktree(
     ticketId: string,
     isOpen: (id: string) => boolean,
-  ): Promise<{ ok: true; branch: string; mergedCommit: string; snapshot?: string } | { ok: false; message: string; conflicts?: string[] }> {
+    opts: { force?: boolean } = {},
+  ): Promise<{ ok: true; branch: string; mergedCommit: string; snapshot?: string } | { ok: false; message: string; conflicts?: string[]; needsReverify?: boolean }> {
     const entry = this.store.ticketEntry(ticketId)
     if (!entry) throw new AdminError('not_found', '这张任务没有绑定项目库。', 404)
     if (entry.mode !== 'worktree') throw new AdminError('invalid', '只有 worktree 隔离分支模式的任务支持一键合并。', 400)
@@ -1007,6 +1071,16 @@ export class ProjectService {
     const busy = this.directTickets(entry.projectId).filter(isOpen)
     if (busy.length > 0) {
       throw new AdminError('conflict', `任务 ${busy.join('、')} 正在直接修改该项目原件，请待其结束后再合并。`, 409)
+    }
+    if (!opts.force) {
+      const diff = await this.ticketDiff(ticketId)
+      if (diff.needsReverify) {
+        return {
+          ok: false,
+          needsReverify: true,
+          message: diff.staleReason ?? '审查后代码发生变化，请重新校验审查后再合并。',
+        }
+      }
     }
     return mergeWorktreeBranch({
       treeDir,

@@ -1,19 +1,21 @@
 /**
- * Git Worktree 并发隔离、工单级 Diff 审查与安全回合并模块（SuperAgent 2.1 研发工厂）。
+ * Git Worktree 并发隔离、工单级 Diff 审查（含未追踪新文件完整 Diff）与安全回合并模块（SuperAgent 2.1 研发工厂）。
  *
  * 解决痛点：
  * - `copy` 模式复制 2GB 仓库慢、改完难合并；
  * - `direct` 模式同一仓库无法多工单并行；
  * - `worktree` 模式对 Git 仓库秒级拉出独立分支 `sa/<ticketId>`，多工单并发修改互不踩踏，
- *   审查满意后一键合并回项目主分支（合并前自动打快照，冲突时自动 abort 不破坏原仓）。
+ *   支持未追踪新文件完整行级审查、审查签核指纹校验，满意后一键合并回主分支或推送创建 PR（冲突自动 abort 不破坏主分支）。
  */
 import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ProjectHistory } from './history.ts'
 import type { ProjectWorkspaceMode, TicketDiffFile, TicketDiffResponse } from '../shared/api-types.ts'
 
-const MAX_DIFF_CHARS = 120_000
+const MAX_DIFF_CHARS = 160_000
+const MAX_UNTRACKED_FILE_BYTES = 128 * 1024
 const GIT_TIMEOUT_MS = 60_000
 
 interface ExecResult {
@@ -74,10 +76,8 @@ export async function prepareWorktree(
   }
 
   mkdirSync(workspace, { recursive: true, mode: 0o700 })
-  // 清理可能残留的失效 worktree 注册项
   await runGit(['worktree', 'prune'], treeDir)
 
-  // 若同名分支已存在（例如同票重建），直接检出该分支；否则从当前 HEAD 新建分支
   const branchExists = (await runGit(['show-ref', '--verify', `refs/heads/${branch}`], treeDir)).code === 0
   const addArgs = branchExists
     ? ['worktree', 'add', target, branch]
@@ -101,8 +101,62 @@ export async function removeWorktree(treeDir: string, workspace: string): Promis
   await runGit(['worktree', 'prune'], treeDir)
 }
 
-/** 解析 `git diff --numstat` + `git status --porcelain` 得到清晰的文件变更清单。 */
-function parseDiffFiles(statusOut: string, numstatOut: string): TicketDiffFile[] {
+/** 为未追踪的新文件合成标准 Unified Diff，确保新增文件也能完整行级审查。 */
+function synthesizeUntrackedDiff(repoDir: string, relPath: string): { diff: string; additions: number } {
+  const absPath = join(repoDir, relPath)
+  try {
+    const st = statSync(absPath)
+    if (!st.isFile()) return { diff: '', additions: 0 }
+    if (st.size > MAX_UNTRACKED_FILE_BYTES) {
+      return {
+        diff: [
+          `diff --git a/${relPath} b/${relPath}`,
+          'new file mode 100644',
+          '--- /dev/null',
+          `+++ b/${relPath}`,
+          `@@ -0,0 +1,1 @@`,
+          `+(新增文件过大：${st.size} 字节，已省略正文预览)`,
+        ].join('\n'),
+        additions: 1,
+      }
+    }
+    const buf = readFileSync(absPath)
+    // 含 NUL 字节按二进制文件处理
+    if (buf.includes(0)) {
+      return {
+        diff: [
+          `diff --git a/${relPath} b/${relPath}`,
+          'new file mode 100644',
+          `Binary files /dev/null and b/${relPath} differ`,
+        ].join('\n'),
+        additions: 0,
+      }
+    }
+    const text = buf.toString('utf8')
+    const rawLines = text.length === 0 ? [] : text.replace(/\r\n/g, '\n').split('\n')
+    // 末尾换行不计作多余空行
+    if (rawLines.length > 0 && rawLines[rawLines.length - 1] === '') rawLines.pop()
+    const count = rawLines.length
+    const header = [
+      `diff --git a/${relPath} b/${relPath}`,
+      'new file mode 100644',
+      '--- /dev/null',
+      `+++ b/${relPath}`,
+      `@@ -0,0 +1,${Math.max(1, count)} @@`,
+    ]
+    const body = count === 0 ? ['+'] : rawLines.map(l => `+${l}`)
+    return { diff: [...header, ...body].join('\n'), additions: count }
+  } catch {
+    return { diff: '', additions: 0 }
+  }
+}
+
+/** 解析 `git diff --numstat` + `git status --porcelain -uall` 得到完整文件变更清单（含未追踪新文件）。 */
+function parseDiffFiles(
+  repoDir: string,
+  statusOut: string,
+  numstatOut: string,
+): { files: TicketDiffFile[]; untrackedDiffs: string[] } {
   const stats = new Map<string, { add: number; del: number }>()
   for (const line of numstatOut.split(/\r?\n/)) {
     const parts = line.split('\t')
@@ -115,26 +169,34 @@ function parseDiffFiles(statusOut: string, numstatOut: string): TicketDiffFile[]
 
   const seen = new Set<string>()
   const files: TicketDiffFile[] = []
+  const untrackedDiffs: string[] = []
   for (const raw of statusOut.split(/\r?\n/)) {
     if (!raw.trim()) continue
     const code = raw.slice(0, 2).trim() || 'M'
-    const path = raw.slice(3).trim()
+    let path = raw.slice(3).trim()
+    if (path.startsWith('"') && path.endsWith('"')) path = path.slice(1, -1)
     if (!path || seen.has(path)) continue
     seen.add(path)
-    const st = stats.get(path)
-    files.push({ path, status: code, additions: st?.add ?? 0, deletions: st?.del ?? 0 })
+    if (code === '??') {
+      const synth = synthesizeUntrackedDiff(repoDir, path)
+      if (synth.diff) untrackedDiffs.push(synth.diff)
+      files.push({ path, status: 'A', additions: synth.additions, deletions: 0 })
+    } else {
+      const st = stats.get(path)
+      files.push({ path, status: code, additions: st?.add ?? 0, deletions: st?.del ?? 0 })
+    }
   }
   for (const [path, st] of stats.entries()) {
     if (seen.has(path)) continue
     seen.add(path)
     files.push({ path, status: 'M', additions: st.add, deletions: st.del })
   }
-  return files
+  return { files, untrackedDiffs }
 }
 
 /**
  * 读取工单工作区的实时代码改动（支持 `worktree`、`copy` 及 `direct` 模式）。
- * 若工单在 worktree 分支里已经产生了提交，同时对比基线与当前工作树，完整呈现全部改动。
+ * 同时包含：已提交改动、已修改未提交改动、以及未追踪的新增文件完整 Diff，并输出 `headSha` 与 `treeFingerprint`。
  */
 export async function inspectTicketDiff(opts: {
   workspace: string
@@ -152,10 +214,13 @@ export async function inspectTicketDiff(opts: {
     return { available: false, reason: '项目目录不是 Git 仓库，无法生成结构化代码 Diff。', files: [], diff: '', truncated: false }
   }
 
-  const branchRes = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir)
+  const [branchRes, headRes] = await Promise.all([
+    runGit(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir),
+    runGit(['rev-parse', 'HEAD'], repoDir),
+  ])
   const branch = branchRes.code === 0 ? branchRes.stdout.trim() : undefined
+  const headSha = headRes.code === 0 ? headRes.stdout.trim() : undefined
 
-  // 尝试找到主分支基线（worktree 模式下以主仓当前 HEAD 或 merge-base 为基线，捕获已 commit + 未 commit 的全部改动）
   let baseRef = 'HEAD'
   if (opts.mode === 'worktree' && opts.projectDir && (await isUsableGitRepo(opts.projectDir))) {
     const mainHead = await runGit(['rev-parse', 'HEAD'], opts.projectDir)
@@ -166,21 +231,28 @@ export async function inspectTicketDiff(opts: {
   }
 
   const [statusRes, numstatRes, diffRes] = await Promise.all([
-    runGit(['status', '--porcelain'], repoDir),
+    runGit(['status', '--porcelain', '-uall'], repoDir),
     runGit(['diff', '--numstat', baseRef], repoDir),
     runGit(['diff', '--no-color', baseRef], repoDir),
   ])
 
-  const files = parseDiffFiles(statusRes.stdout, numstatRes.stdout)
-  const rawDiff = diffRes.stdout
-  const truncated = rawDiff.length > MAX_DIFF_CHARS
-  const diff = truncated ? `${rawDiff.slice(0, MAX_DIFF_CHARS)}\n\n...（Diff 超过 ${MAX_DIFF_CHARS} 字符已截断）` : rawDiff
+  const { files, untrackedDiffs } = parseDiffFiles(repoDir, statusRes.stdout, numstatRes.stdout)
+  const combinedDiff = [diffRes.stdout.trimEnd(), ...untrackedDiffs].filter(Boolean).join('\n')
+  const treeFingerprint = createHash('sha256')
+    .update(`${headSha ?? ''}\n${statusRes.stdout}\n${combinedDiff}`)
+    .digest('hex')
+    .slice(0, 16)
+
+  const truncated = combinedDiff.length > MAX_DIFF_CHARS
+  const diff = truncated ? `${combinedDiff.slice(0, MAX_DIFF_CHARS)}\n\n...（Diff 超过 ${MAX_DIFF_CHARS} 字符已截断）` : combinedDiff
 
   return {
     available: true,
     ...(opts.mode ? { mode: opts.mode } : {}),
     ...(branch ? { branch } : {}),
     baseRef: baseRef.slice(0, 12),
+    ...(headSha ? { headSha } : {}),
+    treeFingerprint,
     ...(opts.projectId ? { projectId: opts.projectId } : {}),
     ...(opts.projectName ? { projectName: opts.projectName } : {}),
     canMerge: opts.mode === 'worktree' && files.length > 0,
@@ -190,11 +262,41 @@ export async function inspectTicketDiff(opts: {
   }
 }
 
+/** 确保工单 worktree 工作区改动已提交到专属分支 `sa/<ticketId>`，返回最新 HEAD SHA。 */
+export async function commitWorktreeChanges(opts: {
+  workspace: string
+  ticketId: string
+  message?: string
+}): Promise<{ ok: true; branch: string; headSha: string; committed: boolean } | { ok: false; message: string }> {
+  const workDir = join(opts.workspace, 'project')
+  if (!existsSync(workDir)) return { ok: false, message: '找不到工单的工作区目录。' }
+  if (!(await isUsableGitRepo(workDir))) {
+    return { ok: false, message: '工单工作区不是有效的 Git 仓库。' }
+  }
+  const branch = worktreeBranchName(opts.ticketId)
+  const dirty = await runGit(['status', '--porcelain'], workDir)
+  let committed = false
+  if (dirty.stdout.trim()) {
+    await runGit(['add', '-A'], workDir)
+    const msg = opts.message?.trim() || `feat(ticket): apply changes from ${opts.ticketId}`
+    const commit = await runGit(
+      ['-c', 'user.name=SuperAgent', '-c', 'user.email=superagent@local', 'commit', '-m', msg],
+      workDir,
+    )
+    if (commit.code !== 0 && !/nothing to commit/i.test(commit.stdout + commit.stderr)) {
+      return { ok: false, message: `提交工单分支改动失败：${commit.stderr.trim().slice(0, 200)}` }
+    }
+    committed = true
+  }
+  const head = await runGit(['rev-parse', 'HEAD'], workDir)
+  return { ok: true, branch, headSha: head.stdout.trim(), committed }
+}
+
 /**
  * 将 `worktree` 分支改动安全合并回项目库主树：
  * 1. 先给项目库主树拍一份回滚快照（若提供了 `history`）；
  * 2. 若工单工作树存在未提交改动，自动提交到工单分支 `sa/<ticketId>`；
- * 3. 在项目主树执行 `git merge --no-ff`，如发生冲突立即 `git merge --abort` 并返回冲突清单。
+ * 3. 在项目主树执行 `git merge --no-ff`，如发生冲突立即 `git merge --abort` 并返回冲突清单，确保主分支完好无损。
  */
 export async function mergeWorktreeBranch(opts: {
   treeDir: string
@@ -208,33 +310,20 @@ export async function mergeWorktreeBranch(opts: {
     return { ok: false, message: '项目原件或工单工作区不是有效的 Git Worktree，无法执行分支合并。' }
   }
 
-  const branch = worktreeBranchName(opts.ticketId)
-  // 1. 先检查工单工作树是否有未提交改动，有则自动暂存并提交到工单分支
-  const dirty = await runGit(['status', '--porcelain'], workDir)
-  if (dirty.stdout.trim()) {
-    await runGit(['add', '-A'], workDir)
-    const commit = await runGit(
-      ['-c', 'user.name=SuperAgent', '-c', 'user.email=superagent@local', 'commit', '-m', `feat(ticket): apply changes from ${opts.ticketId}`],
-      workDir,
-    )
-    if (commit.code !== 0 && !/nothing to commit/i.test(commit.stdout + commit.stderr)) {
-      return { ok: false, message: `提交工单分支改动失败：${commit.stderr.trim().slice(0, 200)}` }
-    }
-  }
+  const committed = await commitWorktreeChanges({ workspace: opts.workspace, ticketId: opts.ticketId })
+  if (!committed.ok) return committed
+  const branch = committed.branch
 
-  // 2. 合并前给项目原件拍一份可回滚快照
   let snapshot: string | undefined
   if (opts.history) {
     try { snapshot = await opts.history.snapshot(`合并工单 ${opts.ticketId} 分支前的状态`) } catch { /* best effort */ }
   }
 
-  // 3. 检查主树是否干净，避免合并误伤未提交文件
   const mainDirty = await runGit(['status', '--porcelain'], opts.treeDir)
   if (mainDirty.stdout.trim()) {
     return { ok: false, message: '项目原件当前有未提交的本地修改，请先清理或快照后再合并工单分支。' }
   }
 
-  // 4. 执行合并
   const merge = await runGit(
     ['-c', 'user.name=SuperAgent', '-c', 'user.email=superagent@local', 'merge', '--no-ff', branch, '-m', `merge: accept ticket ${opts.ticketId} (${branch})`],
     opts.treeDir,
