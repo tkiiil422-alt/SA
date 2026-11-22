@@ -1,0 +1,377 @@
+/* 文档阅读器（目录、工具条、代码块、表格、图片、打印）。只由 F4 维护。 */
+
+.reader-page { max-width: 1180px; }
+
+.reader-top { margin: 2px 0 10px; }
+.reader-back-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.reader-back { padding-left: 0; }
+.reader-back svg { flex: 0 0 auto; }
+.reader-esc-hint { font-size: 0.7812rem; color: var(--ink-3); }
+
+.reader-crumbs {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px;
+  margin-top: 6px;
+  font-size: 1.125rem; font-weight: 600; line-height: 1.35;
+  color: var(--ink-2);
+  overflow-wrap: anywhere;
+}
+.reader-crumb-kind { color: var(--ink-3); font-size: 0.8125rem; font-weight: 400; }
+.reader-crumb-sep { color: var(--ink-3); font-weight: 400; }
+.reader-crumb.is-last { color: var(--ink); }
+
+.reader-meta {
+  display: flex; flex-wrap: wrap; gap: 4px 14px;
+  margin-top: 4px;
+  font-size: 0.8125rem; color: var(--ink-3);
+}
+
+/* ---------- toolbar ---------- */
+
+.reader-tools {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  margin: 12px 0 4px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.reader-tool { min-height: 44px; }
+.reader-font {
+  display: inline-flex; align-items: stretch; gap: 2px;
+  margin-left: auto;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--paper-2);
+}
+.reader-font__btn {
+  min-height: 44px; min-width: 44px; padding: 0 10px;
+  border: 0; border-radius: 8px; background: transparent;
+  color: var(--ink-3); font-size: 0.8125rem; cursor: pointer;
+}
+.reader-font__btn[aria-pressed="true"] { background: var(--paper); color: var(--ink); font-weight: 600; box-shadow: inset 0 0 0 1px var(--line); }
+.reader-page.reader--ui .read { font-family: var(--font); }
+
+/* ---------- layout: sticky toc at >= 1200 ---------- */
+
+.reader-layout { display: block; }
+.reader-main { min-width: 0; }
+.reader-toc { display: none; }
+
+.reader-toc__title {
+  margin-bottom: 6px;
+  font-size: 0.75rem; color: var(--ink-3);
+}
+.reader-toc__nav { display: block; }
+.reader-toc__list { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.reader-toc__item { margin: 0; }
+.reader-toc__item.is-h3 { padding-left: 0.9rem; }
+.reader-toc__link {
+  display: flex; align-items: center;
+  width: 100%; min-height: 44px; padding: 4px 8px;
+  border: 0; border-left: 2px solid transparent; border-radius: 0;
+  background: transparent; color: var(--ink-3);
+  font-size: 0.8125rem; line-height: 1.4; text-align: left;
+  cursor: pointer; overflow-wrap: anywhere;
+}
+.reader-toc__link:hover { color: var(--ink); background: var(--paper-2); }
+.reader-toc__link.is-active { color: var(--ink); border-left-color: var(--ink); font-weight: 600; }
+.reader-toc__count { color: var(--ink-3); font-weight: 400; }
+
+.reader-toc-fold {
+  margin: 4px 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r6);
+  background: var(--paper);
+}
+.reader-toc-fold summary {
+  display: flex; align-items: center; gap: 8px;
+  min-height: 44px; padding: 0 12px;
+  list-style: none; cursor: pointer;
+  font-size: 0.875rem; color: var(--ink-2);
+}
+.reader-toc-fold summary::-webkit-details-marker { display: none; }
+.reader-toc-fold summary::after {
+  content: "+"; margin-left: auto;
+  font-size: 1rem; color: var(--ink-3);
+}
+.reader-toc-fold[open] summary::after { content: "−"; }
+.reader-toc-fold .reader-toc__nav { padding: 0 8px 8px; }
+
+/* ---------- reading body ---------- */
+
+.reader-body { min-width: 0; }
+.read.reader-body { max-width: 38em; }
+.reader-body h1, .reader-body h2, .reader-body h3,
+.reader-body h4, .reader-body h5, .reader-body h6 {
+  scroll-margin-top: calc(var(--barh) + 16px);
+}
+.reader-body h5, .reader-body h6 {
+  margin: 1.2em 0 0.5em; padding-left: 10px;
+  border-left: 3px solid var(--ink);
+  font-family: var(--font); font-weight: 700; line-height: 1.35;
+}
+.reader-body h5 { font-size: 1rem; }
+.reader-body h6 { font-size: 0.9375rem; }
+.reader-body p, .reader-body li { overflow-wrap: break-word; }
+.reader-body .md-hr { margin: 2.4em 0; border: 0; border-top: 1px solid var(--line-2); }
+.reader-body .md-img-link { text-decoration: underline; text-underline-offset: 2px; }
+.reader-body img {
+  display: block; max-width: 100%; height: auto;
+  margin: 1.2em 0; border: 1px solid var(--line); border-radius: var(--r6);
+}
+.reader-figure { margin: 1.4em 0; }
+.reader-figure figcaption { margin-top: 6px; font-size: 0.8125rem; color: var(--ink-3); }
+
+/* Lists: dividers instead of cards; nested lists stay tight. */
+.reader-body .md-list {
+  margin: 1em 0 1.2em;
+  padding-left: 1.35em;
+  list-style: revert;
+}
+.reader-body .md-list > li {
+  padding: 0.42em 0;
+  border-bottom: 1px solid var(--line);
+}
+.reader-body .md-list > li:last-child { border-bottom: 0; }
+.reader-body .md-list .md-list {
+  margin: 0.3em 0 0.1em;
+  padding-left: 1.2em;
+}
+.reader-body .md-list .md-list > li {
+  padding: 0.18em 0;
+  border-bottom: 0;
+}
+.reader-body .md-list li.md-task { list-style: none; margin-left: -1.3em; display: flex; align-items: flex-start; gap: 8px; }
+.reader-body .md-list li.md-task > span { flex: 1 1 auto; }
+.reader-body .md-list input[type="checkbox"] {
+  width: 1.05rem; height: 1.05rem; margin-top: 0.32em;
+  accent-color: var(--ink); flex: 0 0 auto;
+}
+
+.reader-body .md-quote {
+  margin: 1.2em 0;
+  padding: 0.15em 0 0.15em 1em;
+  border-left: 3px solid var(--line-2);
+  color: var(--ink-2);
+}
+.reader-body .md-quote .md-quote { margin: 0.6em 0 0.6em 0; }
+
+/* Highlight (==text==): neutral marker, no semantic palette colours. */
+.reader-body mark, .read mark {
+  color: var(--ink);
+  background: var(--line);
+  box-shadow: inset 0 -0.45em 0 var(--line-2);
+  padding: 0 0.15em;
+  border-radius: var(--r6);
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+.reader-body code {
+  background: var(--paper-2);
+  padding: 0.08em 0.3em; border-radius: 4px;
+  font-size: 0.875em;
+}
+
+/* ---------- code blocks ---------- */
+
+.reader-body .code-block,
+.reader-pre {
+  position: relative;
+  max-width: 100%;
+  margin: 1.3em 0;
+  padding: 1.1em 1em;
+  background: var(--paper-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r6);
+  overflow-x: auto;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.875rem; line-height: 1.65;
+  -webkit-overflow-scrolling: touch;
+}
+.reader-body .code-block { padding-top: 2.9rem; }
+.reader-body .code-block code, .reader-pre code {
+  background: transparent; padding: 0; border-radius: 0;
+  font-size: inherit; white-space: pre;
+}
+.code-copy {
+  position: absolute; top: 4px; right: 4px;
+  min-width: 44px; min-height: 44px; padding: 0 10px;
+  border: 1px solid var(--line-2); border-radius: 8px;
+  background: var(--paper); color: var(--ink-2);
+  font-size: 0.8125rem; cursor: pointer;
+}
+.code-copy[data-copied="true"] { color: var(--machine); border-color: var(--machine); }
+
+.reader-pre {
+  padding: 1em;
+  font-size: 0.875rem;
+}
+
+/* ---------- tables ---------- */
+
+.reader-body .table-wrap {
+  max-width: 100%;
+  margin: 1.3em 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.md-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font);
+  font-size: 0.9375rem;
+  line-height: 1.5;
+}
+.md-table th, .md-table td {
+  padding: 0.55em 0.7em;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.md-table th {
+  background: var(--paper-2);
+  color: var(--ink-2);
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+}
+.md-table .ta-left { text-align: left; }
+.md-table .ta-center { text-align: center; }
+.md-table .ta-right { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---------- notes, skeleton, folder, manual copy ---------- */
+
+.reader-note {
+  margin: 1em 0;
+  padding: 10px 12px;
+  border-left: 3px solid var(--warn);
+  background: var(--warn-soft);
+  color: var(--ink-2);
+  font-size: 0.875rem; line-height: 1.6;
+}
+.reader-note a { text-decoration: underline; text-underline-offset: 2px; }
+.reader-note p + p { margin-top: 8px; }
+
+.reader-skeleton { display: grid; gap: 10px; max-width: 38em; margin-top: 18px; }
+.reader-skeleton span {
+  display: block; height: 0.95rem; border-radius: 4px;
+  background: var(--paper-2);
+  animation: reader-pulse 1.4s ease-in-out infinite;
+}
+.reader-skeleton span:nth-child(1) { width: 42%; height: 1.4rem; }
+.reader-skeleton span:nth-child(2) { width: 96%; }
+.reader-skeleton span:nth-child(3) { width: 88%; }
+.reader-skeleton span:nth-child(4) { width: 92%; }
+.reader-skeleton span:nth-child(5) { width: 64%; }
+@keyframes reader-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+
+.reader-folder { max-width: 38em; }
+.reader-folder__title { margin: 8px 0 2px; font-size: 1.25rem; font-weight: 650; }
+.reader-folder__path { margin-bottom: 10px; font-size: 0.8125rem; color: var(--ink-3); overflow-wrap: anywhere; }
+.reader-folder__up {
+  display: inline-flex; align-items: center; min-height: 44px;
+  color: var(--ink-2); text-decoration: underline; text-underline-offset: 2px;
+}
+.reader-folder__list { margin-top: 8px; border-top: 1px solid var(--line); }
+.reader-folder__item {
+  display: flex; align-items: center; gap: 12px;
+  min-height: 44px; padding: 8px 2px;
+  border-bottom: 1px solid var(--line);
+}
+.reader-folder__name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.reader-folder__size { flex: 0 0 auto; font-size: 0.7812rem; color: var(--ink-3); }
+
+.reader-manual {
+  margin-top: 14px; padding: 12px;
+  border: 1px solid var(--line-2); border-radius: var(--r12);
+  background: var(--paper);
+}
+.reader-manual__title { font-size: 0.875rem; color: var(--ink-2); }
+.reader-manual__text {
+  width: 100%; min-height: 8rem; margin: 10px 0;
+  padding: 10px;
+  border: 1px solid var(--line-2); border-radius: 8px;
+  background: var(--paper-2); color: var(--ink);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.8125rem;
+}
+
+/* ---------- wide screens: sticky contents ---------- */
+
+@media (min-width: 1200px) {
+  .reader-toc-fold { display: none; }
+  .reader-page { max-width: calc(38 * 1.0625rem + 2.5rem + 14rem); margin-inline: auto; }
+  .reader-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 14rem;
+    gap: 2.5rem;
+    align-items: start;
+  }
+  .reader-toc {
+    display: block;
+    position: sticky;
+    top: calc(var(--barh) + 24px);
+    max-height: calc(100dvh - var(--barh) - 48px);
+    overflow-y: auto;
+    padding-top: 4px;
+  }
+}
+
+@media (max-width: 719px) {
+  .reader-tools { gap: 6px; }
+  .reader-font { margin-left: 0; }
+  .reader-font__btn { min-height: 44px; }
+}
+
+@media (max-width: 479px) {
+  .reader-crumbs { font-size: 1rem; }
+  .reader-tool { flex: 1 1 auto; }
+}
+
+/* ---------- print ---------- */
+
+@page { margin: 16mm; }
+
+@media print {
+  .bar, .rail, .tabs, .aside, .compose-fab, .upload-chip,
+  .reader-tools, .reader-toc, .reader-toc-fold, .reader-back-row,
+  .reader-esc-hint, .code-copy, .reader-manual, .toast-host,
+  .banner-host, .compose-host, .sheet-host {
+    display: none !important;
+  }
+  /* With the rail and tabs hidden, the shell grid would put the stage in the
+     224px column; printing wants one full-width block. */
+  .shell { display: block !important; }
+  .stage { padding: 0 !important; }
+  .reader-page { max-width: none; }
+  .reader-layout { display: block; }
+  .reader-main { max-width: none; }
+  .read.reader-body, .reader-body { max-width: none; font-size: 11pt; line-height: 1.5; }
+  .reader-crumbs { font-size: 14pt; }
+  .reader-meta { color: #333; }
+  .reader-body h1, .reader-body h2, .reader-body h3,
+  .reader-body h4, .reader-body h5, .reader-body h6 {
+    break-after: avoid; page-break-after: avoid;
+    break-inside: avoid; page-break-inside: avoid;
+  }
+  .reader-body p, .reader-body li, .reader-body blockquote { orphans: 3; widows: 3; }
+  .reader-body a[href]::after { content: " (" attr(href) ")"; font-size: 0.85em; color: #444; overflow-wrap: anywhere; }
+  .reader-body .code-block, .reader-pre {
+    overflow: visible; white-space: pre-wrap; word-break: break-word;
+    border: 1px solid #bbb; background: #f7f7f7;
+  }
+  .reader-body .code-block code, .reader-pre code { white-space: pre-wrap; }
+  .reader-body .table-wrap { overflow: visible; }
+  .md-table { font-size: 10pt; }
+  .reader-note { border: 1px solid #bbb; background: transparent; }
+  .reader-body mark, .read mark {
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reader-skeleton span { animation: none; }
+  .reader-toc__link { transition: none; }
+}

@@ -1,0 +1,64 @@
+# Development toolchain for superagent workers: what a Python or JS web-server project needs, preinstalled so a ticket
+# does not have to set it up (it cannot: the worker's root filesystem is read-only and it is not root).
+# The Pi image (`Containerfile.pi`) is built on top of this one with `--build-arg BASE_IMAGE=<this image>`.
+#
+# Build:  podman build -f deploy/Containerfile.dev -t localhost/superagent-dev:<tag> deploy/
+# The console's 开发环境 page builds it and passes EXTRA_PACKAGES (Debian package names) and FEATURES (words below).
+FROM docker.io/library/node:22-bookworm-slim
+
+# Mirrors used while building; empty values keep the official sources.
+ARG APT_MIRROR=mirrors.aliyun.com
+ARG PIP_INDEX=https://mirrors.aliyun.com/pypi/simple/
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+# Extra Debian packages, space separated.
+ARG EXTRA_PACKAGES=""
+# Optional parts, space separated: browser (Playwright + Chromium), dbserver (PostgreSQL + Redis servers), go, java.
+ARG FEATURES=""
+
+RUN set -eux; \
+  if [ -n "$APT_MIRROR" ]; then sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources; fi; \
+  extra="$EXTRA_PACKAGES"; \
+  case " $FEATURES " in *" dbserver "*) extra="$extra postgresql redis-server";; esac; \
+  case " $FEATURES " in *" java "*) extra="$extra default-jdk-headless maven";; esac; \
+  apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update; \
+  apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y --no-install-recommends \
+    ca-certificates git less procps ripgrep \
+    curl wget jq zip unzip xz-utils file tree patch \
+    build-essential pkg-config \
+    libssl-dev libffi-dev libpq-dev default-libmysqlclient-dev libsqlite3-dev \
+    python3 python3-pip python3-venv python3-dev \
+    sqlite3 postgresql-client default-mysql-client redis-tools \
+    openssh-client rsync \
+    $extra; \
+  rm -rf /var/lib/apt/lists/*
+
+# uv for Python projects and interpreters, pnpm and tsx for JS. Installed into /usr/local, which stays read-only for the
+# worker; what a worker installs globally goes to the shared tools directory instead (see pi-container.sh).
+RUN set -eux; \
+  python3 -m pip install --no-cache-dir --break-system-packages --retries 5 --timeout 30 ${PIP_INDEX:+--index-url "$PIP_INDEX"} uv; \
+  npm install -g ${NPM_REGISTRY:+--registry="$NPM_REGISTRY"} \
+    --fetch-retries=5 --fetch-retry-mintimeout=2000 --fetch-retry-maxtimeout=15000 \
+    pnpm@10 tsx; \
+  npm cache clean --force
+
+RUN set -eux; \
+  case " $FEATURES " in *" go "*) \
+    arch="$(dpkg --print-architecture)"; \
+    ver="$(curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors 'https://go.dev/VERSION?m=text' | head -1)"; \
+    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors "https://go.dev/dl/${ver}.linux-${arch}.tar.gz" | tar -xz -C /usr/local; \
+    ln -s /usr/local/go/bin/go /usr/local/bin/go; ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt;; \
+  esac; \
+  case " $FEATURES " in *" browser "*) \
+    mkdir -p /opt/playwright; \
+    for attempt in 1 2; do \
+      if PLAYWRIGHT_BROWSERS_PATH=/opt/playwright npx -y ${NPM_REGISTRY:+--registry="$NPM_REGISTRY"} playwright install --with-deps chromium; then break; fi; \
+      [ "$attempt" -eq 2 ] && exit 1; \
+      sleep 3; \
+    done; \
+    chmod -R a+rX /opt/playwright; rm -rf /var/lib/apt/lists/* /root/.npm;; \
+  esac
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+# What this build added; the console's 开发环境 page reads these (the Pi image inherits them).
+LABEL io.superagent.dev="1" io.superagent.dev.packages="${EXTRA_PACKAGES}" io.superagent.dev.features="${FEATURES}"
+CMD ["bash"]

@@ -1,0 +1,12 @@
+node_modules/
+web/node_modules/
+dist/
+*.db
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.tgz
+*.log
+.env
+.env.*
+coverage/

@@ -1,0 +1,24 @@
+{
+  "stateDir": ".superagent",
+  "maxSlots": 3,
+  "operatorId": "operator",
+  "deepseekApiKeyEnv": "DEEPSEEK_API_KEY",
+  "launcher": {
+    "command": "node",
+    "args": ["tests/fixtures/fake-pi.mjs"],
+    "env": {
+      "FAKE_PI_REPORT_READY": "1",
+      "FAKE_PI_RUN_MS": "20"
+    }
+  },
+  "policy": {
+    "policy": {
+      "sources": {
+        "cli": {
+          "allowed": [{ "id": "operator", "name": "Operator" }]
+        }
+      }
+    },
+    "eval": { "mode": "auto" }
+  }
+}

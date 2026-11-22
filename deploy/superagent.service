@@ -1,0 +1,22 @@
+[Unit]
+Description=superagent daemon (Pi workers in rootless Podman)
+Documentation=file://%h/superagent/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/superagent
+# The DeepSeek key lives only in this file, mode 0600, outside the repository.
+EnvironmentFile=%h/.config/superagent/env
+Environment=NODE_OPTIONS=--no-warnings
+ExecStart=/usr/local/bin/node --experimental-transform-types src/daemon.ts --config %h/superagent/examples/config.debian.json
+Restart=on-failure
+RestartSec=5
+
+# The daemon closes Pi clients itself (stdin, then SIGTERM, then SIGKILL), so give it room but never hang forever.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,42 @@
+/* 写小说：书库、书页、章节阅读、发任务面板的写小说模式。令牌见 style.css 和 README.md。 */
+
+.nv-book-link { color: inherit; text-decoration: none; display: block; min-width: 0; }
+.nv-flag { color: var(--human); font-size: 0.75rem; font-weight: 600; }
+.nv-row-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0; }
+.nv-arc-form { margin-top: 12px; }
+.nv-beats { padding-left: 1.2em; }
+.nv-beats li { margin: 4px 0; }
+.nv-pre { white-space: pre-wrap; font-size: 0.875rem; color: var(--ink-2); margin: 6px 0 0; }
+.nv-arc { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.nv-arc summary { cursor: pointer; display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+.nv-scroll { overflow-x: auto; }
+.nv-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; }
+.nv-table th, .nv-table td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.nv-table th { color: var(--ink-3); font-weight: 600; }
+
+/* 章节正文：宋体、首行缩进。 */
+.nv-text {
+  font-family: var(--font-read);
+  font-size: 1.0625rem;
+  line-height: 1.95;
+  color: var(--ink);
+  max-width: 40em;
+  margin: 16px 0 24px;
+}
+.nv-text p { text-indent: 2em; margin: 0 0 0.6em; }
+.nv-chapter-title { font-size: 1.25rem; font-weight: 650; text-align: center; margin: 8px 0 18px; text-indent: 0; }
+.nv-chnav { display: flex; justify-content: space-between; gap: 8px; margin-top: 12px; }
+
+/* 发任务面板的写小说模式。 */
+.mode-seg { margin-bottom: 16px; }
+.novel-row { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+.novel-next { margin: 10px 0; color: var(--ink-2); }
+
+@media (prefers-reduced-motion: reduce) {
+  .nv-arc summary, .nv-book-link { transition: none !important; }
+}
+
+.compose-form[hidden], .page[hidden], .mode-seg[hidden] { display: none !important; }
+
+/* Tap target on the library row: at least 44px tall. */
+.nv-ticket-link { display: inline-flex; align-items: center; min-height: 44px; padding: 0 6px; }
