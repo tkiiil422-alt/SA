@@ -74,8 +74,51 @@ export interface SkillRecord {
   tags: string[]
   content: string
   enabled: boolean
+  activeVersion: number
+  previousVersion: number | null
   useCount: number
   lastUsedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface SkillVersionRecord {
+  skillId: string
+  version: number
+  status: 'active' | 'previous' | 'candidate' | 'rejected' | 'rolled_back'
+  content: string
+  triggers: string[]
+  source: string
+  reason: string
+  evalReport?: Record<string, unknown> | null
+  createdAt: string
+}
+
+/** 评测业务指标汇总（持续跟踪进化效果）。 */
+export interface BenchmarkMetrics {
+  totalTasks: number
+  passedTasks: number
+  firstPassAcceptanceRate: number
+  humanInterventions: number
+  totalCostUsd: number
+  costPerPassingTaskUsd: number | null
+  postAcceptanceReworkRate: number
+}
+
+/** 插件改进提案记录。 */
+export interface PluginProposalRecord {
+  id: string
+  gapKey: string
+  pluginName: string
+  summary: string
+  occurrences: number
+  externalWritePermissions: string[]
+  irreversibleMigration: boolean
+  requiresUserApproval: boolean
+  status: 'pending_approval' | 'approved' | 'dispatched' | 'rejected' | 'rolled_out'
+  approvedBy: string | null
+  missionId: string | null
+  ticketId: string | null
   createdAt: string
   updatedAt: string
 }

@@ -825,7 +825,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       }
       return result
     }
-    const plugins = new PluginRegistry()
+    const plugins = new PluginRegistry({ db: repo.db })
     registerBuiltinDescriptors(plugins, optionsStore)
     const { memories, skills, contracts, scheduler, runners, missions, remoteNodes } = wireCorePlugins({
       db: repo.db,

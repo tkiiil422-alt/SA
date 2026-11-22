@@ -31,6 +31,10 @@ import { createMissionsPlugin } from '../missions/plugin.ts'
 import { RemoteStore } from '../remote/store.ts'
 import { RemoteNodeService } from '../remote/service.ts'
 import { createRemoteNodesPlugin } from '../remote/plugin.ts'
+import { SkillEvolutionService } from '../skills/evolution.ts'
+import { PluginEvolutionService } from '../plugins/evolution.ts'
+import { BenchmarkStore } from '../eval/benchmarks.ts'
+import { createEvolutionPlugin } from '../eval/plugin.ts'
 
 export interface WireCorePluginsOptions {
   db: DatabaseSync
@@ -75,6 +79,9 @@ export interface CorePluginsBundle {
   readonly scriptRunner: RegisteredScriptRunner
   readonly missions: MissionService
   readonly remoteNodes: RemoteNodeService
+  readonly skillEvolution: SkillEvolutionService
+  readonly pluginEvolution: PluginEvolutionService
+  readonly benchmarks: BenchmarkStore
 }
 
 export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle {
@@ -138,6 +145,12 @@ export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle
     workspaceRoot: opts.workspaceRoot,
     ...(opts.getGatewayUrl ? { gatewayUrl: opts.getGatewayUrl } : {}),
   })
+  const skillEvolution = new SkillEvolutionService(skills)
+  const pluginEvolution = new PluginEvolutionService({
+    db: opts.db,
+    missions,
+  })
+  const benchmarks = new BenchmarkStore(opts.db)
 
   const scheduler = new SchedulerService({
     store: schedulerStore,
@@ -212,6 +225,12 @@ export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle
   }))
 
   opts.plugins.register(createRemoteNodesPlugin(remoteNodes))
+  opts.plugins.register(createEvolutionPlugin({
+    skills,
+    skillEvolution,
+    pluginEvolution,
+    benchmarks,
+  }))
 
-  return { memories, skills, contracts, scheduler, runners, scriptRunner, missions, remoteNodes }
+  return { memories, skills, contracts, scheduler, runners, scriptRunner, missions, remoteNodes, skillEvolution, pluginEvolution, benchmarks }
 }

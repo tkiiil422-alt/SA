@@ -444,9 +444,29 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
       return
     }
 
-    // 已加载子系统插件清单
+    // 已加载子系统插件清单与热启停控制（停用后路由、工具、导航与后台任务同步退出）
     if (route === '/plugins' && method === 'GET') {
       sendJson(res, 200, { items: plugins ? plugins.list() : [] })
+      return
+    }
+    const pluginToggle = /^\/plugins\/([^/]+)$/.exec(route)
+    if (pluginToggle !== null && method === 'PUT') {
+      const id = decodeSegment(pluginToggle[1] ?? '')
+      if (!id || !plugins) { sendJson(res, 404, { error: 'not_found', message: '找不到这个插件。' }); return }
+      const body = await parseJsonBody(req)
+      const parsed = z.object({ enabled: z.boolean() }).strict().safeParse(body)
+      if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return }
+      const updated = await plugins.setEnabled(id, parsed.data.enabled)
+      if (!updated) { sendJson(res, 404, { error: 'not_found', message: '找不到这个插件。' }); return }
+      try {
+        events.add({
+          kind: 'plugin.toggled',
+          level: 'info',
+          text: `${parsed.data.enabled ? '启用' : '停用'}插件「${updated.name}」(${updated.id})`,
+          data: { pluginId: updated.id, enabled: updated.enabled },
+        })
+      } catch { /* ignore */ }
+      sendJson(res, 200, { ok: true, item: updated })
       return
     }
 

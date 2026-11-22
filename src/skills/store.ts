@@ -8,10 +8,10 @@ import { randomBytes } from 'node:crypto'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
-import type { SkillRecord, SkillScope } from '../shared/api-types.ts'
+import type { SkillRecord, SkillScope, SkillVersionRecord } from '../shared/api-types.ts'
 import { extractSearchTerms } from '../memory/store.ts'
 
-export type { SkillRecord, SkillScope }
+export type { SkillRecord, SkillScope, SkillVersionRecord }
 
 export interface SkillCreateInput {
   slug?: string
@@ -45,10 +45,24 @@ interface SkillRow {
   tags_json: string
   content: string
   enabled: number
+  active_version: number
+  previous_version: number | null
   use_count: number
   last_used_at: string | null
   created_at: string
   updated_at: string
+}
+
+interface SkillVersionRow {
+  skill_id: string
+  version: number
+  status: string
+  content: string
+  triggers_json: string
+  source: string
+  reason: string
+  eval_report_json: string | null
+  created_at: string
 }
 
 function makeId(): string {
@@ -100,10 +114,30 @@ function rowToSkill(row: SkillRow): SkillRecord {
     tags: parseJsonStrings(row.tags_json),
     content: row.content,
     enabled: row.enabled === 1,
+    activeVersion: row.active_version ?? 1,
+    previousVersion: row.previous_version ?? null,
     useCount: row.use_count,
     lastUsedAt: row.last_used_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  }
+}
+
+function rowToVersion(row: SkillVersionRow): SkillVersionRecord {
+  let evalReport: Record<string, unknown> | null = null
+  if (row.eval_report_json) {
+    try { evalReport = JSON.parse(row.eval_report_json) as Record<string, unknown> } catch { evalReport = null }
+  }
+  return {
+    skillId: row.skill_id,
+    version: row.version,
+    status: row.status as SkillVersionRecord['status'],
+    content: row.content,
+    triggers: parseJsonStrings(row.triggers_json),
+    source: row.source,
+    reason: row.reason,
+    evalReport,
+    createdAt: row.created_at,
   }
 }
 
@@ -143,16 +177,50 @@ export class SkillStore {
         tags_json TEXT NOT NULL DEFAULT '[]',
         content TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
+        active_version INTEGER NOT NULL DEFAULT 1,
+        previous_version INTEGER,
         use_count INTEGER NOT NULL DEFAULT 0,
         last_used_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_skills_enabled ON skills(enabled, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS skill_versions (
+        skill_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        content TEXT NOT NULL,
+        triggers_json TEXT NOT NULL DEFAULT '[]',
+        source TEXT NOT NULL DEFAULT 'manual',
+        reason TEXT NOT NULL DEFAULT '',
+        eval_report_json TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (skill_id, version)
+      );
+
+      CREATE TABLE IF NOT EXISTS ticket_skill_uses (
+        ticket_id TEXT NOT NULL,
+        skill_id TEXT NOT NULL,
+        skill_slug TEXT NOT NULL,
+        skill_version INTEGER NOT NULL,
+        used_at TEXT NOT NULL,
+        PRIMARY KEY (ticket_id, skill_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_ticket_skill_uses_skill ON ticket_skill_uses(skill_id, used_at DESC);
     `)
+    this.ensureMigrations()
     if (this.skillsDir) {
       mkdirSync(this.skillsDir, { recursive: true })
     }
+  }
+
+  private ensureMigrations(): void {
+    const cols = new Set(
+      (this.db.prepare('PRAGMA table_info(skills)').all() as unknown as { name: string }[]).map(c => c.name),
+    )
+    if (!cols.has('active_version')) this.db.exec('ALTER TABLE skills ADD COLUMN active_version INTEGER NOT NULL DEFAULT 1')
+    if (!cols.has('previous_version')) this.db.exec('ALTER TABLE skills ADD COLUMN previous_version INTEGER')
   }
 
   private syncFile(skill: SkillRecord, previousSlug?: string): void {
@@ -191,12 +259,18 @@ export class SkillStore {
 
     const existing = this.getBySlug(slug)
     if (existing) {
+      const nextVer = this.nextVersionNumber(existing.id)
+      this.db.prepare(`UPDATE skill_versions SET status = 'previous' WHERE skill_id = ? AND status = 'active'`).run(existing.id)
+      this.db.prepare(`
+        INSERT OR REPLACE INTO skill_versions (skill_id, version, status, content, triggers_json, source, reason, eval_report_json, created_at)
+        VALUES (?, ?, 'active', ?, ?, 'manual', '直接保存更新技能', NULL, ?)
+      `).run(existing.id, nextVer, content, JSON.stringify(triggers), iso)
       this.db.prepare(`
         UPDATE skills
         SET name = ?, description = ?, scope = ?, triggers_json = ?, tags_json = ?,
-            content = ?, enabled = ?, updated_at = ?
+            content = ?, enabled = ?, active_version = ?, previous_version = ?, updated_at = ?
         WHERE id = ?
-      `).run(name, description, scope, JSON.stringify(triggers), JSON.stringify(tags), content, enabled, iso, existing.id)
+      `).run(name, description, scope, JSON.stringify(triggers), JSON.stringify(tags), content, enabled, nextVer, existing.activeVersion, iso, existing.id)
       const updated = this.get(existing.id)!
       this.syncFile(updated)
       return updated
@@ -206,9 +280,13 @@ export class SkillStore {
     this.db.prepare(`
       INSERT INTO skills (
         id, slug, name, description, scope, triggers_json, tags_json,
-        content, enabled, use_count, last_used_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
+        content, enabled, active_version, previous_version, use_count, last_used_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, 0, NULL, ?, ?)
     `).run(id, slug, name, description, scope, JSON.stringify(triggers), JSON.stringify(tags), content, enabled, iso, iso)
+    this.db.prepare(`
+      INSERT OR REPLACE INTO skill_versions (skill_id, version, status, content, triggers_json, source, reason, eval_report_json, created_at)
+      VALUES (?, 1, 'active', ?, ?, 'manual', '初始版本', NULL, ?)
+    `).run(id, content, JSON.stringify(triggers), iso)
     const created = this.get(id)!
     this.syncFile(created)
     return created
@@ -328,5 +406,134 @@ export class SkillStore {
     const iso = now.toISOString()
     const stmt = this.db.prepare('UPDATE skills SET use_count = use_count + 1, last_used_at = ? WHERE id = ?')
     for (const id of ids) stmt.run(iso, id)
+  }
+
+  private nextVersionNumber(skillId: string): number {
+    const row = this.db.prepare('SELECT COALESCE(MAX(version), 0) AS m FROM skill_versions WHERE skill_id = ?').get(skillId) as { m: number }
+    return Math.max(Number(row.m), this.get(skillId)?.activeVersion ?? 0) + 1
+  }
+
+  /** 列出某个技能的所有版本（含当前生效版、上一版、候选版与回退版）。 */
+  listVersions(skillId: string): SkillVersionRecord[] {
+    const rows = this.db.prepare(
+      'SELECT * FROM skill_versions WHERE skill_id = ? ORDER BY version ASC',
+    ).all(skillId) as unknown as SkillVersionRow[]
+    return rows.map(rowToVersion)
+  }
+
+  getVersion(skillId: string, version: number): SkillVersionRecord | undefined {
+    const row = this.db.prepare(
+      'SELECT * FROM skill_versions WHERE skill_id = ? AND version = ?',
+    ).get(skillId, version) as SkillVersionRow | undefined
+    return row ? rowToVersion(row) : undefined
+  }
+
+  /** 创建一条候选技能修订（不直接覆盖当前生效版，待历史样例评测对比通过后再切换）。 */
+  createCandidateVersion(
+    skillId: string,
+    input: { content: string; triggers?: string[]; source: string; reason: string },
+    now = new Date(),
+  ): SkillVersionRecord {
+    const cur = this.get(skillId)
+    if (!cur) throw new Error(`找不到技能 ${skillId}`)
+    const version = this.nextVersionNumber(skillId)
+    const triggers = input.triggers ? cleanList(input.triggers) : cur.triggers
+    const iso = now.toISOString()
+    this.db.prepare(`
+      INSERT INTO skill_versions (skill_id, version, status, content, triggers_json, source, reason, eval_report_json, created_at)
+      VALUES (?, ?, 'candidate', ?, ?, ?, ?, NULL, ?)
+    `).run(skillId, version, input.content.trim().slice(0, 20_000), JSON.stringify(triggers), input.source.trim() || 'evolution', input.reason.trim().slice(0, 600), iso)
+    return this.getVersion(skillId, version)!
+  }
+
+  /** 激活指定候选版本，并把原生效版保留为 `previous` 以便随时回退。 */
+  promoteVersion(
+    skillId: string,
+    version: number,
+    evalReport?: Record<string, unknown>,
+    now = new Date(),
+  ): SkillRecord {
+    const cur = this.get(skillId)
+    if (!cur) throw new Error(`找不到技能 ${skillId}`)
+    const target = this.getVersion(skillId, version)
+    if (!target) throw new Error(`找不到技能 ${skillId} 的版本 v${version}`)
+    const iso = now.toISOString()
+
+    // 确保原生效版本在 skill_versions 里有完整快照
+    if (!this.getVersion(skillId, cur.activeVersion)) {
+      this.db.prepare(`
+        INSERT OR REPLACE INTO skill_versions (skill_id, version, status, content, triggers_json, source, reason, eval_report_json, created_at)
+        VALUES (?, ?, 'previous', ?, ?, 'legacy', '升级前自动归档', NULL, ?)
+      `).run(skillId, cur.activeVersion, cur.content, JSON.stringify(cur.triggers), cur.updatedAt)
+    } else {
+      this.db.prepare(`UPDATE skill_versions SET status = 'previous' WHERE skill_id = ? AND version = ?`).run(skillId, cur.activeVersion)
+    }
+
+    this.db.prepare(`
+      UPDATE skill_versions SET status = 'active', eval_report_json = ? WHERE skill_id = ? AND version = ?
+    `).run(evalReport ? JSON.stringify(evalReport) : null, skillId, version)
+
+    this.db.prepare(`
+      UPDATE skills
+      SET content = ?, triggers_json = ?, active_version = ?, previous_version = ?, updated_at = ?
+      WHERE id = ?
+    `).run(target.content, JSON.stringify(target.triggers), version, cur.activeVersion, iso, skillId)
+
+    const updated = this.get(skillId)!
+    this.syncFile(updated)
+    return updated
+  }
+
+  /** 标记某候选版本评测退化/未通过，保留当前生效版不变。 */
+  rejectVersion(skillId: string, version: number, evalReport?: Record<string, unknown>): SkillVersionRecord | undefined {
+    this.db.prepare(`
+      UPDATE skill_versions SET status = 'rejected', eval_report_json = ? WHERE skill_id = ? AND version = ?
+    `).run(evalReport ? JSON.stringify(evalReport) : null, skillId, version)
+    return this.getVersion(skillId, version)
+  }
+
+  /** 回退到上一版生效版本（发现线上或评测退化时恢复旧版）。 */
+  rollbackVersion(skillId: string, reason = '检测到退化，回退至上一稳定版', now = new Date()): SkillRecord {
+    const cur = this.get(skillId)
+    if (!cur) throw new Error(`找不到技能 ${skillId}`)
+    const prevVer = cur.previousVersion
+    if (!prevVer) throw new Error(`技能「${cur.name}」没有可回退的上一版本`)
+    const prev = this.getVersion(skillId, prevVer)
+    if (!prev) throw new Error(`找不到上一版本 v${prevVer} 的快照`)
+    const iso = now.toISOString()
+
+    this.db.prepare(`UPDATE skill_versions SET status = 'rolled_back', reason = ? WHERE skill_id = ? AND version = ?`)
+      .run(reason.slice(0, 600), skillId, cur.activeVersion)
+    this.db.prepare(`UPDATE skill_versions SET status = 'active' WHERE skill_id = ? AND version = ?`)
+      .run(skillId, prevVer)
+    this.db.prepare(`
+      UPDATE skills
+      SET content = ?, triggers_json = ?, active_version = ?, previous_version = ?, updated_at = ?
+      WHERE id = ?
+    `).run(prev.content, JSON.stringify(prev.triggers), prevVer, cur.activeVersion, iso, skillId)
+
+    const updated = this.get(skillId)!
+    this.syncFile(updated)
+    return updated
+  }
+
+  /** 记录工单实际使用的技能版本号，供审计与退化追踪。 */
+  recordTicketUse(ticketId: string, skill: Pick<SkillRecord, 'id' | 'slug' | 'activeVersion'>, now = new Date()): void {
+    this.db.prepare(`
+      INSERT OR REPLACE INTO ticket_skill_uses (ticket_id, skill_id, skill_slug, skill_version, used_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(ticketId, skill.id, skill.slug, skill.activeVersion, now.toISOString())
+  }
+
+  listTicketSkillUses(ticketId: string): { skillId: string; skillSlug: string; skillVersion: number; usedAt: string }[] {
+    const rows = this.db.prepare(
+      'SELECT skill_id, skill_slug, skill_version, used_at FROM ticket_skill_uses WHERE ticket_id = ? ORDER BY used_at ASC',
+    ).all(ticketId) as unknown as { skill_id: string; skill_slug: string; skill_version: number; used_at: string }[]
+    return rows.map(r => ({
+      skillId: r.skill_id,
+      skillSlug: r.skill_slug,
+      skillVersion: r.skill_version,
+      usedAt: r.used_at,
+    }))
   }
 }

@@ -4,6 +4,7 @@
  * 负责统一管理所有子系统插件的注册、路由分发、Director/Worker 能力聚合、
  * 领域事件隔离派发与有序启停生命周期。
  */
+import type { DatabaseSync } from 'node:sqlite'
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import type { DomainEvent } from '../core/index.ts'
 import type {
@@ -18,6 +19,8 @@ import type {
 } from './types.ts'
 
 export interface PluginRegistryOptions {
+  /** 可选 SQLite 数据库，用于持久化各插件的启用/停用覆盖状态。 */
+  db?: DatabaseSync
   /** 插件钩子异常回调；默认输出到 stderr，绝不向上抛出拖垮核心流程。 */
   onError?: (pluginId: string, phase: string, error: unknown) => void
 }
@@ -25,13 +28,27 @@ export interface PluginRegistryOptions {
 export class PluginRegistry {
   private readonly plugins: SubsystemPlugin[] = []
   private readonly byId = new Map<string, SubsystemPlugin>()
+  private readonly overrides = new Map<string, boolean>()
+  private readonly db: DatabaseSync | undefined
   private readonly onError: (pluginId: string, phase: string, error: unknown) => void
   private started = false
 
   constructor(options: PluginRegistryOptions = {}) {
+    this.db = options.db
     this.onError = options.onError ?? ((id, phase, error) => {
       console.error(`superagentd: plugin "${id}" ${phase} failed: ${error instanceof Error ? error.message : String(error)}`)
     })
+    if (this.db) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS plugin_states (
+          plugin_id TEXT PRIMARY KEY,
+          enabled INTEGER NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `)
+      const rows = this.db.prepare('SELECT plugin_id, enabled FROM plugin_states').all() as unknown as { plugin_id: string; enabled: number }[]
+      for (const r of rows) this.overrides.set(r.plugin_id, r.enabled === 1)
+    }
   }
 
   /** 注册插件；重复 ID 会抛出明确错误，避免静默覆盖。 */
@@ -49,14 +66,41 @@ export class PluginRegistry {
     return this.byId.get(id)
   }
 
-  /** 检查某个插件当前是否处于启用状态。 */
+  /** 检查某个插件当前是否处于启用状态（运行态显式停用覆盖优先）。 */
   isEnabled(plugin: SubsystemPlugin): boolean {
+    const ov = this.overrides.get(plugin.id)
+    if (ov === false) return false
     try {
-      return plugin.enabled ? plugin.enabled() : true
+      const base = plugin.enabled ? plugin.enabled() : true
+      return ov === true ? true : base
     } catch (error) {
       this.onError(plugin.id, 'enabled()', error)
       return false
     }
+  }
+
+  /**
+   * 动态启用或停用插件：
+   * - 停用时立即停止其后台任务（`stop()`），并且其 HTTP 路由、Director/Worker 工具、导航摘要与领域事件同步退出；
+   * - 重新启用且注册表处于运行中时，自动恢复启动其后台任务（`start()`）。
+   */
+  async setEnabled(id: string, enabled: boolean): Promise<PluginDescriptor | undefined> {
+    const plugin = this.byId.get(id)
+    if (!plugin) return undefined
+    const prev = this.isEnabled(plugin)
+    this.overrides.set(id, enabled)
+    if (this.db) {
+      this.db.prepare(`
+        INSERT INTO plugin_states (plugin_id, enabled, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(plugin_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at
+      `).run(id, enabled ? 1 : 0, new Date().toISOString())
+    }
+    if (prev && !enabled && plugin.stop) {
+      try { await plugin.stop() } catch (error) { this.onError(id, 'stop', error) }
+    } else if (!prev && enabled && this.started && plugin.start) {
+      try { await plugin.start() } catch (error) { this.onError(id, 'start', error) }
+    }
+    return this.list().find(p => p.id === id)
   }
 
   /** 返回所有已注册插件的运行态摘要清单（供 `/api/plugins` 与 Director 自省使用）。 */
@@ -183,12 +227,12 @@ export class PluginRegistry {
     }
   }
 
-  /** 按注册顺序启动所有插件。 */
+  /** 按注册顺序启动所有已启用插件。 */
   async startAll(): Promise<void> {
     if (this.started) return
     this.started = true
     for (const plugin of this.plugins) {
-      if (!plugin.start) continue
+      if (!plugin.start || !this.isEnabled(plugin)) continue
       try {
         await plugin.start()
       } catch (error) {

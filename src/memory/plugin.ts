@@ -483,10 +483,11 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
         lines.push('', '### 匹配的参考技能（SOP）')
         let budget = 3600
         for (const sk of matchedSkills) {
+          skills.recordTicketUse(ctx.ticketId, sk)
           const body = sk.content.slice(0, Math.min(1400, budget))
           if (!body) break
           budget -= body.length
-          lines.push(`#### ${sk.name} (\`${sk.slug}\`)`, body)
+          lines.push(`#### ${sk.name} (\`${sk.slug}@v${sk.activeVersion}\`)`, body)
         }
       }
       return lines.join('\n')
