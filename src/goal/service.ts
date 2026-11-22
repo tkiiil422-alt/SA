@@ -12,8 +12,11 @@
  * Goals are stored by the ticket's origin trigger id, so a goal given with a new request is in place before the first
  * launch, which can run before the ticket id is known.
  */
+import { randomBytes } from 'node:crypto'
 import type { DatabaseSync, StatementSync } from 'node:sqlite'
 import type { WorkerReport } from '../core/index.ts'
+import type { ContractCriterion, DeliveryReceipt, VerificationEvidence } from '../shared/api-types.ts'
+import { classifyGoalFailure, type FailureDiagnosis } from './classifier.ts'
 
 export type GoalMode = 'commands+ai' | 'commands' | 'ai'
 export type GoalStatus = 'active' | 'met' | 'paused' | 'cancelled'
@@ -26,6 +29,10 @@ export interface GoalSpec {
   maxRounds: number
   maxUsd: number
   maxHours: number
+  /** 逐项验收条件清单（每条必选条件需有具体验证证据）。 */
+  criteria?: ContractCriterion[]
+  /** 是否要求必须具备客观验证证据才允许通过（默认 true）。 */
+  requireEvidence?: boolean
 }
 
 /** A goal as a person writes it; what is left out comes from the settings. */
@@ -36,6 +43,8 @@ export interface GoalInput {
   maxRounds?: number
   maxUsd?: number
   maxHours?: number
+  criteria?: (string | ContractCriterion)[]
+  requireEvidence?: boolean
 }
 
 export interface GoalSettings {
@@ -66,6 +75,10 @@ export interface GoalCheck {
   paused?: string
   /** The workspace files whose contents the judge saw. */
   files?: string[]
+  /** 本次检查归集的结构化证据（标明执行 ID 与产物版本）。 */
+  evidences?: VerificationEvidence[]
+  /** 失败根因分类（信息不足 / 环境异常 / 推理受阻）。 */
+  diagnosis?: FailureDiagnosis
 }
 
 export interface GoalView extends GoalSpec {
@@ -79,6 +92,8 @@ export interface GoalView extends GoalSpec {
   checking: boolean
   last?: GoalCheck
   checks: GoalCheck[]
+  evidences?: VerificationEvidence[]
+  escalatedTo?: string
 }
 
 /** What the goal service needs to know about a ticket. */
@@ -121,10 +136,20 @@ export interface GoalDeps {
   /** Tells a running worker something (a goal set or cancelled while it works). */
   notify?(ticketId: string, text: string): void
   /**
-   * 模型阶梯升级钩子：当目标验收连续失败达到阈值（默认第 2 轮）时，
-   * 允许运行时自动切换至更强推理模型接管破局；返回 `{ from, to }` 表示升级成功。
+   * 模型阶梯升级钩子：仅在失败分类器判定为 `reasoning_blocked` 且预算内有余量时触发，
+   * 携带已有成果、失败证据、历史尝试记录与剩余预算交接给更强模型。
    */
-  escalateModel?(ticketId: string, round: number, reason: string): Promise<{ from: string; to: string } | undefined> | { from: string; to: string } | undefined
+  escalateModel?(ticketId: string, ctx: {
+    round: number
+    reason: string
+    diagnosis: FailureDiagnosis
+    remainingUsd: number
+    previousAttempts: string[]
+    evidences: VerificationEvidence[]
+    latestSummary: string
+  }): Promise<{ from: string; to: string } | undefined> | { from: string; to: string } | undefined
+  /** 返回当前工单工作区的产物版本号（例如 git commit SHA 或目录指纹），用于绑定验证证据。 */
+  artifactVersion?(ticketId: string): Promise<string> | string
   now?: () => Date
 }
 
@@ -151,6 +176,11 @@ export function resolveGoal(input: GoalInput, defaults: Pick<GoalSettings, 'maxR
   const commands = (input.commands ?? []).map(command => command.trim()).filter(Boolean)
   const mode: GoalMode = input.mode ?? (commands.length > 0 ? 'commands+ai' : 'ai')
   if (mode !== 'ai' && commands.length === 0) throw new GoalError('commands', '这种判定方式至少要写一条验收命令')
+  const criteria: ContractCriterion[] = (input.criteria ?? [])
+    .map((item, idx) => typeof item === 'string'
+      ? { id: `c${idx + 1}`, text: item.trim(), required: true }
+      : { id: item.id.trim() || `c${idx + 1}`, text: item.text.trim(), required: item.required !== false })
+    .filter(c => c.text.length > 0)
   return {
     text,
     commands: mode === 'ai' ? [] : commands,
@@ -158,6 +188,8 @@ export function resolveGoal(input: GoalInput, defaults: Pick<GoalSettings, 'maxR
     maxRounds: input.maxRounds ?? defaults.maxRounds,
     maxUsd: input.maxUsd ?? defaults.maxUsd,
     maxHours: input.maxHours ?? defaults.maxHours,
+    ...(criteria.length > 0 ? { criteria } : {}),
+    ...(input.requireEvidence !== undefined ? { requireEvidence: input.requireEvidence } : {}),
   }
 }
 
@@ -201,6 +233,8 @@ interface GoalState {
   asked?: string
   /** 若因连续失败触发过模型自动阶梯升级，记录已升级到的模型 ref，避免反复重复切换。 */
   escalatedTo?: string
+  /** 本工单收集到的结构化验证证据（测试命令、浏览器自检、文件/Git/数据核对）。 */
+  evidences?: VerificationEvidence[]
 }
 interface Stored { triggerId: string; spec: GoalSpec; state: GoalState; ticket?: GoalTicket }
 
@@ -271,6 +305,143 @@ export class GoalService {
       checking: this.checking.has(ticketId),
       ...(last ? { last } : {}),
       checks: state.checks.slice(-8),
+      ...(state.evidences && state.evidences.length > 0 ? { evidences: state.evidences.slice(-30) } : {}),
+      ...(state.escalatedTo ? { escalatedTo: state.escalatedTo } : {}),
+    }
+  }
+
+  /** 为工单登记一条结构化验证证据（如 `browser_verify` 浏览器断言、数据核对、文件校验、Git 检查）。 */
+  recordEvidence(
+    ticketId: string,
+    input: Omit<VerificationEvidence, 'id' | 'at'> & { at?: string },
+  ): VerificationEvidence | undefined {
+    const found = this.load(ticketId)
+    const entry: VerificationEvidence = {
+      id: `ev_${randomBytes(4).toString('hex')}`,
+      kind: input.kind,
+      ...(input.criterionId ? { criterionId: input.criterionId } : {}),
+      runId: input.runId,
+      artifactVersion: input.artifactVersion || 'working-tree',
+      passed: input.passed,
+      summary: clip(input.summary, 400),
+      ...(input.detail ? { detail: clip(input.detail, 2000) } : {}),
+      at: input.at ?? this.now().toISOString(),
+    }
+    if (!found) {
+      // 即使工单未提前设定 Goal，也建一条轻量独立证据表记录以便交付回执展示
+      this.storeStandaloneEvidence(ticketId, entry)
+      return entry
+    }
+    found.state.evidences = [...(found.state.evidences ?? []), entry].slice(-60)
+    this.write(found)
+    return entry
+  }
+
+  /** 读取工单收集到的全部结构化证据（含 Goal 证据与独立证据）。 */
+  listEvidences(ticketId: string): VerificationEvidence[] {
+    const found = this.load(ticketId)
+    const fromGoal = found?.state.evidences ?? []
+    const standalone = this.readStandaloneEvidences(ticketId)
+    const byId = new Map<string, VerificationEvidence>()
+    for (const ev of [...standalone, ...fromGoal]) byId.set(ev.id, ev)
+    return [...byId.values()].sort((a, b) => a.at.localeCompare(b.at))
+  }
+
+  /** 生成面向用户的结构化交付回执：交付物、逐条验收结果、证据及是否需要人工决定。 */
+  buildReceipt(
+    ticketId: string,
+    opts: {
+      deliverables: { path: string; size?: number; kind?: string }[]
+      contractVersion?: number | null
+      contractCriteria?: readonly ContractCriterion[]
+      needsPerson?: boolean
+      question?: string
+      ended?: boolean
+      outcome?: string
+    },
+  ): DeliveryReceipt {
+    const view = this.view(ticketId)
+    const evidences = this.listEvidences(ticketId)
+    const criteriaList = opts.contractCriteria && opts.contractCriteria.length > 0
+      ? opts.contractCriteria
+      : (view?.criteria ?? [])
+
+    const evaluatedCriteria = criteriaList.map(c => {
+      const matched = evidences.filter(ev => ev.criterionId === c.id)
+      const latest = matched.at(-1)
+      let status: 'passed' | 'failed' | 'pending' = 'pending'
+      if (latest) status = latest.passed ? 'passed' : 'failed'
+      else if (view?.status === 'met') status = 'passed'
+      else if (view?.last && !view.last.met) status = 'failed'
+      return { id: c.id, text: c.text, required: c.required, status, evidences: matched }
+    })
+
+    const pendingItems: string[] = []
+    for (const c of evaluatedCriteria) {
+      if (c.required && c.status !== 'passed') pendingItems.push(`待完成条件「${c.text}」（当前：${c.status === 'failed' ? '未通过' : '待验证'}）`)
+    }
+    if (view?.last && !view.last.met) {
+      for (const m of this.missing(view.last)) {
+        if (!pendingItems.includes(m)) pendingItems.push(m)
+      }
+    }
+    const failedEv = evidences.filter(e => !e.passed)
+    if (failedEv.length > 0 && pendingItems.length === 0) {
+      for (const fe of failedEv.slice(-3)) pendingItems.push(`未通过证据（${fe.kind}）：${fe.summary}`)
+    }
+
+    let status: DeliveryReceipt['status'] = 'pending'
+    if (opts.outcome === 'failed' || opts.outcome === 'dropped' || evaluatedCriteria.some(c => c.required && c.status === 'failed') || (view?.last && !view.last.met && view.status !== 'met')) {
+      status = evaluatedCriteria.some(c => c.status === 'passed') ? 'partial' : 'failed'
+    } else if (view?.status === 'met' || (evaluatedCriteria.length > 0 && evaluatedCriteria.every(c => !c.required || c.status === 'passed')) || (opts.ended && (opts.outcome === 'completed' || opts.outcome === 'merged') && !view)) {
+      status = 'verified'
+    } else if (evaluatedCriteria.some(c => c.status === 'passed')) {
+      status = 'partial'
+    }
+
+    const needsDecision = Boolean(opts.needsPerson || view?.status === 'paused')
+    const decisionPrompt = opts.question || view?.last?.paused
+
+    return {
+      ticketId,
+      contractVersion: opts.contractVersion ?? null,
+      status,
+      deliverables: opts.deliverables,
+      criteria: evaluatedCriteria,
+      evidences,
+      pendingItems,
+      needsDecision,
+      ...(decisionPrompt ? { decisionPrompt } : {}),
+      generatedAt: this.now().toISOString(),
+    }
+  }
+
+  private ensureEvidenceTable(): void {
+    this.deps.db.exec(`
+      CREATE TABLE IF NOT EXISTS ticket_evidences (
+        id TEXT PRIMARY KEY,
+        ticket_id TEXT NOT NULL,
+        value TEXT NOT NULL,
+        at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_ticket_evidences_ticket ON ticket_evidences(ticket_id, at ASC);
+    `)
+  }
+
+  private storeStandaloneEvidence(ticketId: string, ev: VerificationEvidence): void {
+    this.ensureEvidenceTable()
+    this.deps.db.prepare('INSERT OR REPLACE INTO ticket_evidences (id, ticket_id, value, at) VALUES (?, ?, ?, ?)')
+      .run(ev.id, ticketId, JSON.stringify(ev), ev.at)
+  }
+
+  private readStandaloneEvidences(ticketId: string): VerificationEvidence[] {
+    try {
+      this.ensureEvidenceTable()
+      const rows = this.deps.db.prepare('SELECT value FROM ticket_evidences WHERE ticket_id = ? ORDER BY at ASC LIMIT 60')
+        .all(ticketId) as unknown as { value: string }[]
+      return rows.map(r => JSON.parse(r.value) as VerificationEvidence)
+    } catch {
+      return []
     }
   }
 
@@ -428,18 +599,50 @@ export class GoalService {
     }
     this.push(state, check)
     let escalationNote = ''
-    // 目标连续 2 轮检查未通过时，自动尝试升级至更强推理模型破局（每张工单至多自动升级一次）
-    if (state.rounds >= 2 && !state.escalatedTo && this.deps.escalateModel) {
-      try {
-        const escalated = await this.deps.escalateModel(ticketId, state.rounds, check.summary)
-        if (escalated && escalated.to !== escalated.from) {
-          state.escalatedTo = escalated.to
-          escalationNote = `\n\n[系统自动升级] 连续 ${state.rounds} 轮验收未通过，已自动将本工单升级切换至更强模型 ${escalated.to}（原模型 ${escalated.from}）接管破局。`
-          this.deps.step?.(ticketId, `模型自动升级：${escalated.from} → ${escalated.to}`, check.summary, 'done')
-          this.deps.event?.(ticketId, 'info', `目标连续 ${state.rounds} 轮未达成，自动升级模型：${escalated.from} → ${escalated.to}`)
+    // 连续 2 轮检查未通过或重复出现同类错误时，先分类根因：
+    // 信息不足 → 直接提问用户；环境问题 → 提示修环境；仅推理受阻且预算允许时才升级模型！
+    const diagnosis = classifyGoalFailure(state.checks)
+    check.diagnosis = diagnosis
+    if (state.rounds >= 2) {
+      if (diagnosis.category === 'need_info') {
+        state.status = 'paused'
+        const q = `目标连续 ${state.rounds} 轮受阻，原因判定为缺少前提信息/凭据：${diagnosis.reason}。请补充相关信息或授权后回复继续。`
+        state.asked = q
+        this.write(current)
+        this.deps.step?.(ticketId, '失败分类：信息不足，暂停并向主人提问', diagnosis.reason, 'error')
+        this.deps.event?.(ticketId, 'warn', `失败原因分类为信息不足，已停止盲目重试并向主人提问`)
+        return {
+          action: 'replace',
+          report: { state: 'blocked', summary: clip(`缺少必要信息/凭据，已停下向主人确认：${diagnosis.reason}`, 600), question: clip(q, 900) },
+          reply: `系统判断当前阻塞属于【信息/凭据不足】，已暂停并向主人发起提问，请等待主人回复。`,
         }
-      } catch {
-        // 升级为尽力优化，失败不影响正常反馈流程
+      }
+      if (diagnosis.category === 'env_error') {
+        escalationNote = `\n\n[失败诊断：环境/依赖异常] ${diagnosis.reason}。请优先检查依赖、权限、网络或容器环境（不要盲目重复同样命令）；若确实缺系统包请在汇报中写明包名。`
+        this.deps.step?.(ticketId, '失败分类：环境异常，建议先修环境而非换模型', diagnosis.reason, 'error')
+      } else if (!state.escalatedTo && this.deps.escalateModel) {
+        const remainingUsd = Math.max(0, state.usdCap - (this.spendOf(ticketId) - state.usdBase))
+        if (remainingUsd > 0.05) {
+          try {
+            const escalated = await this.deps.escalateModel(ticketId, {
+              round: state.rounds,
+              reason: diagnosis.reason,
+              diagnosis,
+              remainingUsd,
+              previousAttempts: state.checks.slice(-4).map(c => `第${c.round}轮: ${c.summary}`),
+              evidences: this.listEvidences(ticketId).slice(-10),
+              latestSummary: report.summary,
+            })
+            if (escalated && escalated.to !== escalated.from) {
+              state.escalatedTo = escalated.to
+              escalationNote = `\n\n[智能模型升级] 经失败诊断属于推理受阻（剩余预算 ${money(remainingUsd)}），已自动从 ${escalated.from} 升级至更强模型 ${escalated.to}，并已保留已有成果与全部失败证据继续破局。`
+              this.deps.step?.(ticketId, `模型智能升级：${escalated.from} → ${escalated.to}`, diagnosis.reason, 'done')
+              this.deps.event?.(ticketId, 'info', `推理受阻（第 ${state.rounds} 轮），预算内自动升级模型：${escalated.from} → ${escalated.to}`)
+            }
+          } catch {
+            // 升级为尽力优化，失败不影响正常反馈流程
+          }
+        }
       }
     }
     this.write(current)
@@ -455,8 +658,14 @@ export class GoalService {
 
   private async check(ticketId: string, spec: GoalSpec, summary: string): Promise<GoalCheck> {
     const at = this.now().toISOString()
+    const runId = `chk_${randomBytes(4).toString('hex')}`
+    const artifactVersion = this.deps.artifactVersion
+      ? await Promise.resolve(this.deps.artifactVersion(ticketId)).catch(() => 'working-tree')
+      : 'working-tree'
     const timeoutSec = this.deps.settings().commandTimeoutSec
     const commands: CommandResult[] = []
+    const checkEvidences: VerificationEvidence[] = []
+
     if (spec.mode !== 'ai') {
       const started = Date.now()
       for (const command of spec.commands) {
@@ -470,27 +679,139 @@ export class GoalService {
           commands.push({ command, code: -1, ms: 0, tail: describe(error) })
         }
       }
+      for (const c of commands) {
+        checkEvidences.push({
+          id: `ev_${randomBytes(4).toString('hex')}`,
+          kind: 'command',
+          runId,
+          artifactVersion,
+          passed: c.code === 0,
+          summary: `${c.code === 0 ? '通过' : '失败'}：$ ${clip(c.command, 120)}（退出码 ${c.code}）`,
+          ...(c.tail ? { detail: clip(c.tail, 800) } : {}),
+          at,
+        })
+      }
     }
-    const base = { at, round: 0, kind: 'check' as const, commands }
+
+    // 读取本工单已登记的外部结构化证据（如 browser_verify 浏览器断言 / 数据核对结果）
+    const externalEvidences = this.listEvidences(ticketId)
+    const failedExternal = externalEvidences.filter(e => e.kind === 'browser' && !e.passed)
+    const latestBrowser = externalEvidences.filter(e => e.kind === 'browser').at(-1)
+    // 检查是否有必选验收条件关联了未通过的结构化证据
+    const failedRequiredCriteria: string[] = []
+    for (const crit of spec.criteria ?? []) {
+      if (!crit.required) continue
+      const bound = externalEvidences.filter(e => e.criterionId === crit.id)
+      const latestForCrit = bound.at(-1)
+      if (latestForCrit && !latestForCrit.passed) {
+        failedRequiredCriteria.push(`[${crit.id}] ${crit.text}（${latestForCrit.summary}）`)
+      }
+    }
+
+    const base = { at, round: 0, kind: 'check' as const, commands, evidences: checkEvidences }
     const failed = commands.filter(item => item.code !== 0)
     if (failed.length > 0) {
+      this.appendEvidences(ticketId, checkEvidences)
       return { ...base, met: false, summary: `${failed.length} 条验收命令没通过：${clip(failed.map(item => item.command).join('；'), 300)}` }
     }
-    if (spec.mode === 'commands') return { ...base, met: true, summary: `${commands.length} 条验收命令全部通过` }
+    // 若最近一次浏览器自检失败，绝不放行通过！
+    if (latestBrowser && !latestBrowser.passed) {
+      this.appendEvidences(ticketId, checkEvidences)
+      return {
+        ...base,
+        met: false,
+        summary: `浏览器自检未通过：${clip(latestBrowser.summary, 240)}`,
+        verdict: {
+          met: false,
+          evidence: [],
+          missing: [`修复浏览器自检失败项并重新通过 browser_verify：${latestBrowser.summary}`],
+          summary: `浏览器自检未通过（${failedExternal.length} 条失败记录）`,
+        },
+      }
+    }
+    if (failedRequiredCriteria.length > 0) {
+      this.appendEvidences(ticketId, checkEvidences)
+      return {
+        ...base,
+        met: false,
+        summary: `必选验收条件未通过：${clip(failedRequiredCriteria.join('；'), 240)}`,
+        verdict: {
+          met: false,
+          evidence: [],
+          missing: failedRequiredCriteria.map(x => `修复必选条件并补充通过证据：${x}`),
+          summary: `${failedRequiredCriteria.length} 条必选验收条件验证失败`,
+        },
+      }
+    }
+
+    if (spec.mode === 'commands') {
+      this.appendEvidences(ticketId, checkEvidences)
+      return { ...base, met: true, summary: `${commands.length} 条验收命令全部通过` }
+    }
+
     const names = goalFileNames(spec.text)
     const [context, files] = await Promise.all([
       this.deps.context ? this.deps.context(ticketId).catch(() => '') : Promise.resolve(''),
       names.length > 0 && this.deps.files ? this.deps.files(ticketId, names).catch(() => undefined) : Promise.resolve(undefined),
     ])
-    const input: JudgeInput = { ticketId, goal: spec, summary, commands, context, ...(files ? { files } : {}) }
+    // 把外部浏览器/数据核对证据也透传给裁判参考
+    const evContext = externalEvidences.length > 0
+      ? `\n\n## 已采集的客观验证证据\n${externalEvidences.slice(-8).map(e => `- [${e.kind}|${e.passed ? '通过' : '失败'}|run=${e.runId}|ver=${e.artifactVersion}] ${e.summary}`).join('\n')}`
+      : ''
+    const input: JudgeInput = {
+      ticketId,
+      goal: spec,
+      summary,
+      commands,
+      context: `${context}${evContext}`,
+      ...(files ? { files } : {}),
+    }
     const seen = files && files.length > 0 ? { files: files.map(file => file.path) } : {}
     let judged = await this.judge(input)
     if (!judged.ok) judged = await this.judge(input)
-    if (!judged.ok) return { ...base, ...seen, met: false, error: judged.error, summary: `判定模型出错，没能核对：${clip(judged.error, 200)}` }
-    const { verdict } = judged
+    if (!judged.ok) {
+      this.appendEvidences(ticketId, checkEvidences)
+      return { ...base, ...seen, met: false, error: judged.error, summary: `判定模型出错，没能核对：${clip(judged.error, 200)}` }
+    }
+    let { verdict } = judged
+
+    // 【关键修复 Bug 1】裁判只返回 {"met":true} 没有任何证据，且无通过的命令/外部硬证据时，绝不允许需要证据的任务凭空通过！
+    const requireEvidence = spec.requireEvidence !== false
+    const hasHardEvidence = commands.some(c => c.code === 0) || externalEvidences.some(e => e.passed)
+    const hasJudgeEvidence = verdict.evidence.some(item => item.trim().length > 0)
+    if (verdict.met && requireEvidence && !hasJudgeEvidence && !hasHardEvidence) {
+      verdict = {
+        met: false,
+        evidence: [],
+        missing: ['裁判仅返回 met:true 但未提供任何具体验证证据（测试结果、文件核对、浏览器断言或数据校验），拒绝无证据通过'],
+        summary: '缺少验证证据，拒绝凭空通过',
+      }
+    }
+
+    if (verdict.evidence.length > 0) {
+      checkEvidences.push({
+        id: `ev_${randomBytes(4).toString('hex')}`,
+        kind: 'judge',
+        runId,
+        artifactVersion,
+        passed: verdict.met,
+        summary: verdict.evidence.slice(0, 3).join('；'),
+        at,
+      })
+    }
+    this.appendEvidences(ticketId, checkEvidences)
+
     const prefix = commands.length > 0 ? '验收命令全部通过；' : ''
     const said = verdict.summary || (verdict.met ? '判定已达成' : verdict.missing[0] ?? '判定还没达成')
     return { ...base, ...seen, met: verdict.met, verdict, summary: clip(`${prefix}${said}`, 300) }
+  }
+
+  private appendEvidences(ticketId: string, list: readonly VerificationEvidence[]): void {
+    if (list.length === 0) return
+    const found = this.load(ticketId)
+    if (!found) return
+    found.state.evidences = [...(found.state.evidences ?? []), ...list].slice(-60)
+    this.write(found)
   }
 
   private async judge(input: JudgeInput): Promise<JudgeResult> {

@@ -15,6 +15,7 @@ import type { FanqieService } from '../../fanqie/service.ts'
 import type { PiVersionService } from '../../executor/pi-versions.ts'
 import type { DevEnvService } from '../../executor/dev-env.ts'
 import type { GoalService } from '../../goal/service.ts'
+import type { ContractStore } from '../../contracts/store.ts'
 import type { PentestService } from '../../pentest/service.ts'
 import type { DirectorService } from '../../director/service.ts'
 import type { PluginRegistry } from '../../plugins/registry.ts'
@@ -32,7 +33,8 @@ export interface AdminRouteDeps {
   fanqie?: FanqieService
   piVersions?: PiVersionService
   devEnv?: DevEnvService
-  goals?: Pick<GoalService, 'view' | 'set' | 'cancel' | 'brief'>
+  goals?: Pick<GoalService, 'view' | 'set' | 'cancel' | 'brief' | 'buildReceipt' | 'recordEvidence' | 'listEvidences'>
+  contracts?: ContractStore
   pentest?: PentestService
   director?: DirectorService
   plugins?: PluginRegistry

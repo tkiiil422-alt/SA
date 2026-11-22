@@ -10,6 +10,7 @@
  * authenticate with the token. The gateway and MCP endpoint resolve tokens through the same table, so a token dies with
  * its assignment.
  */
+import { execFileSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -41,6 +42,7 @@ import { wireCorePlugins } from './runtime/plugin-wiring.ts'
 import { PluginRegistry } from './plugins/registry.ts'
 import type { MemoryStore } from './memory/store.ts'
 import type { SkillStore } from './skills/store.ts'
+import type { ContractStore } from './contracts/store.ts'
 import type { SchedulerService } from './scheduler/service.ts'
 import type { DomainEvent, Executor } from './core/index.ts'
 import type { Trigger } from './core/model.ts'
@@ -138,7 +140,9 @@ export interface Runtime {
   readonly plugins: PluginRegistry
   readonly memories: MemoryStore
   readonly skills: SkillStore
+  readonly contracts: ContractStore
   readonly scheduler: SchedulerService
+  readonly goals: GoalService
   ask(text: string, opts?: { model?: string }): Promise<AskResult>
   /** The intake both Feishu transports use, exposed so tests exercise the same continuation path. */
   feishuIntake(trigger: Trigger): void
@@ -744,9 +748,10 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       onError: error => console.error(`superagentd: assessment failed: ${error instanceof Error ? error.message : String(error)}`),
     })
     let adminHostRef: ReturnType<typeof createRuntimeAdminHost> | undefined
+    let goalsRef: GoalService | undefined
     const plugins = new PluginRegistry()
     registerBuiltinDescriptors(plugins, optionsStore)
-    const { memories, skills, scheduler } = wireCorePlugins({
+    const { memories, skills, contracts, scheduler } = wireCorePlugins({
       db: repo.db,
       stateDir,
       plugins,
@@ -755,14 +760,25 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       isPaused: () => Boolean(settings.paused),
       getAdminHost: () => adminHostRef,
       getDirector: () => director,
+      getGoals: () => goalsRef,
+      getGoalDefaults: () => optionsStore.get().goal,
+      notifyTicket: (ticketId, text) => {
+        try { engine.note(ticketId, text) } catch { /* ignore */ }
+      },
       getTicketSummary: ticketId => {
         const t = repo.tickets.get(ticketId)
         if (!t?.ended) return undefined
         const summary = latestReport(t)?.summary ?? t.ended.reason ?? ''
         const proj = projects.ticketProject(ticketId)
+        const goalView = goalsRef?.view(ticketId)
+        const acceptanceStatus: 'met' | 'unmet' | 'not_checked' =
+          goalView?.status === 'met' ? 'met'
+            : goalView ? 'unmet'
+              : 'not_checked'
         return {
           title: t.title,
           outcome: t.ended.outcome,
+          acceptanceStatus,
           summary,
           ...(proj ? { projectId: proj.id } : {}),
         }
@@ -1097,7 +1113,49 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       notify: (id, text) => {
         try { engine.note(id, text) } catch { /* the ticket moved on */ }
       },
+      artifactVersion: ticketId => {
+        const wsProj = join(workspaceRoot, ticketId, 'project')
+        if (existsSync(join(wsProj, '.git'))) {
+          try {
+            const sha = execFileSync('git', ['-C', wsProj, 'rev-parse', '--short=12', 'HEAD'], { encoding: 'utf8', timeout: 3000 }).trim()
+            if (sha) return `git:${sha}`
+          } catch { /* fallback below */ }
+        }
+        return `ws:${ticketId}:${Date.now().toString(36)}`
+      },
+      escalateModel: (ticketId, ctx) => {
+        const ticket = repo.tickets.get(ticketId)
+        if (!ticket) return undefined
+        const current = resolveTicketModel(ticket)
+        const currentRef = formatRef(current.ref)
+        const modelsCfg = optionsStore.get().models
+        // 优先选择强推理/高阶模型，其次选择价格更高或不同的已启用模型
+        const candidates = modelsCfg.providers
+          .filter(p => p.enabled)
+          .flatMap(p => p.models.map(m => ({
+            ref: { provider: p.id, model: m.id },
+            refText: formatRef({ provider: p.id, model: m.id }),
+            idLower: `${p.id}/${m.id}`.toLowerCase(),
+            outputPrice: m.price?.output ?? 0,
+          })))
+          .filter(c => c.refText !== currentRef)
+        if (candidates.length === 0) return undefined
+        const tierScore = (c: { idLower: string; outputPrice: number }): number => {
+          let score = c.outputPrice
+          if (/reasoner|r1|opus|o1|o3|gpt-5|pro|sonnet|max/i.test(c.idLower)) score += 100
+          return score
+        }
+        candidates.sort((a, b) => tierScore(b) - tierScore(a))
+        const picked = candidates[0]!
+        choices.set(ticket.origin.triggerId, {
+          ...picked.ref,
+          source: 'auto',
+          reason: `第 ${ctx.round} 轮推理受阻，预算内(${ctx.remainingUsd.toFixed(2)} USD)自动升级模型：${ctx.reason.slice(0, 120)}`,
+        })
+        return { from: currentRef, to: picked.refText }
+      },
     })
+    goalsRef = goals
     /** The goal goes to the worker as an addition to its system prompt, on every launch while it is pursued. */
     const goalArgs = (ticketId: string): string[] => {
       const text = goals.systemPrompt(ticketId)
@@ -1678,6 +1736,15 @@ export async function createRuntime(config: Config): Promise<Runtime> {
           novelStore.clearPending(trigger.id)
         }
       }
+      if (result.ticketId !== undefined) {
+        try {
+          contracts.ensureDefault('ticket', result.ticketId, text, {
+            ...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
+            ...(opts.goal?.criteria ? { criteria: opts.goal.criteria } : {}),
+            ...(opts.goal?.maxUsd !== undefined ? { budgetUsd: opts.goal.maxUsd } : {}),
+          })
+        } catch { /* best effort */ }
+      }
       return result
     }
     /** A person's message directed at a ticket (works across CLI, Feishu, Email, and WeChat origins). */
@@ -1981,7 +2048,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       onError: error => console.error(`superagentd: director bridge failed: ${error instanceof Error ? error.message : String(error)}`),
     })
     syncWechat()
-    const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity, novels, fanqie, piVersions, goals, devEnv, pentest, director, plugins })
+    const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity, novels, fanqie, piVersions, goals, contracts, devEnv, pentest, director, plugins })
     const adminServer = createConsoleServer({
       api: adminApi,
       previews,
@@ -2058,7 +2125,9 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       plugins,
       memories,
       skills,
+      contracts,
       scheduler,
+      goals,
       ask,
       feishuIntake,
       ticket,

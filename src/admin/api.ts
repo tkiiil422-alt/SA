@@ -44,6 +44,7 @@ import type { FanqieService } from '../fanqie/service.ts'
 import type { PiVersionService } from '../executor/pi-versions.ts'
 import type { DevEnvService } from '../executor/dev-env.ts'
 import type { GoalService } from '../goal/service.ts'
+import type { ContractStore } from '../contracts/store.ts'
 import type { PentestService } from '../pentest/service.ts'
 import type { DirectorService } from '../director/service.ts'
 import type { PluginRegistry } from '../plugins/registry.ts'
@@ -71,7 +72,8 @@ export interface CreateAdminApiOptions {
   fanqie?: FanqieService
   piVersions?: PiVersionService
   devEnv?: DevEnvService
-  goals?: Pick<GoalService, 'view' | 'set' | 'cancel' | 'brief'>
+  goals?: Pick<GoalService, 'view' | 'set' | 'cancel' | 'brief' | 'buildReceipt' | 'recordEvidence' | 'listEvidences'>
+  contracts?: ContractStore
   pentest?: PentestService
   director?: DirectorService
   /** 子系统插件注册中心（记忆、技能、定时调度及未来扩展插件）。 */
@@ -289,6 +291,7 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
     ...(options.piVersions ? { piVersions: options.piVersions } : {}),
     ...(options.devEnv ? { devEnv: options.devEnv } : {}),
     ...(options.goals ? { goals: options.goals } : {}),
+    ...(options.contracts ? { contracts: options.contracts } : {}),
     ...(options.pentest ? { pentest: options.pentest } : {}),
     ...(options.director ? { director: options.director } : {}),
     ...(plugins ? { plugins } : {}),

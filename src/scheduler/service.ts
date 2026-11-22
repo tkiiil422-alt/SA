@@ -9,6 +9,7 @@
 import { createHash } from 'node:crypto'
 import type { EventLog } from '../ledger/events.ts'
 import type { GoalSpec } from '../goal/service.ts'
+import type { ContractStore } from '../contracts/store.ts'
 import type {
   ScheduleCreateInput,
   ScheduleRecord,
@@ -21,6 +22,8 @@ export interface SchedulerServiceDeps {
   store: SchedulerStore
   events: EventLog
   isPaused: () => boolean
+  /** 统一任务约定存储：存在时自动绑定调度约定版本、注入口径并在旧记录中保留历史口径。 */
+  contracts?: ContractStore
   dispatchTicket: (input: {
     text: string
     model?: string
@@ -102,6 +105,27 @@ export class SchedulerService {
     return this.deps.store.listRuns(scheduleId, limit)
   }
 
+  getRunContractSnapshot(runId: string): Record<string, unknown> | undefined {
+    return this.deps.store.getRunContractSnapshot(runId)
+  }
+
+  /** 工单结束时同步更新对应调度运行的“已执行 / 已验收”状态，独立于“已派发”。 */
+  onTicketSettled(
+    ticketId: string,
+    outcome: string,
+    acceptanceStatus: 'met' | 'unmet' | 'not_checked' = 'not_checked',
+  ): ScheduleRunRecord | undefined {
+    const execState: ScheduleRunRecord['executionStatus'] =
+      outcome === 'completed' || outcome === 'merged' ? 'succeeded'
+        : outcome === 'stopped' ? 'skipped'
+          : 'failed'
+    const accState: ScheduleRunRecord['acceptanceStatus'] =
+      acceptanceStatus === 'met' ? 'passed'
+        : acceptanceStatus === 'unmet' ? 'failed'
+          : (execState === 'failed' ? 'failed' : 'not_required')
+    return this.deps.store.updateTicketOutcome(ticketId, execState, accState)
+  }
+
   /** 扫描并执行所有已到期的调度任务（供后台定时器和单元测试直接调用）。 */
   async tick(): Promise<ScheduleRunRecord[]> {
     const due = this.deps.store.listDue(this.doNow())
@@ -138,14 +162,37 @@ export class SchedulerService {
   private async execute(schedule: ScheduleRecord, manual: boolean): Promise<ScheduleRunRecord | undefined> {
     this.running.add(schedule.id)
     const startedAt = this.doNow()
-    const run = this.deps.store.startRun(schedule, startedAt)
+    // 若接入了统一任务约定，在启动本次运行前锁定当前版本号与快照，确保旧运行永远保留当时口径
+    const contract = this.deps.contracts
+      ? (this.deps.contracts.get('schedule', schedule.id) ?? (
+        schedule.actionKind === 'dispatch_ticket' || schedule.actionKind === 'director_prompt'
+          ? this.deps.contracts.ensureDefault(
+            'schedule',
+            schedule.id,
+            str(schedule.actionConfig.prompt) || schedule.name,
+            { projectId: str(schedule.actionConfig.projectId) || null },
+            startedAt,
+          )
+          : undefined
+      ))
+      : undefined
+    const contractMeta = contract
+      ? { version: contract.version, snapshotJson: JSON.stringify(contract) }
+      : undefined
+    const run = this.deps.store.startRun(schedule, startedAt, contractMeta)
 
     try {
       if (!manual && schedule.respectPause && this.deps.isPaused()) {
         return this.deps.store.finishRun(
           run.id,
           schedule.id,
-          { status: 'skipped', summary: '系统处于暂停接单状态，跳过本次计划执行' },
+          {
+            status: 'skipped',
+            dispatchStatus: 'skipped',
+            executionStatus: 'skipped',
+            acceptanceStatus: 'not_required',
+            summary: '系统处于暂停接单状态，跳过本次计划执行',
+          },
           startedAt.getTime(),
           this.doNow(),
         )
@@ -154,13 +201,30 @@ export class SchedulerService {
       if (schedule.actionKind === 'dispatch_ticket') {
         const cfg = schedule.actionConfig
         const prompt = str(cfg.prompt)
+        const contractBlock = contract ? `\n\n${this.deps.contracts!.formatForPrompt(contract)}` : ''
+        const goalSpec: GoalSpec | undefined = contract && contract.criteria.length > 0
+          ? {
+            text: contract.goal,
+            commands: Array.isArray(cfg.commands) ? cfg.commands.filter((x): x is string => typeof x === 'string' && x.trim().length > 0) : [],
+            mode: Array.isArray(cfg.commands) && cfg.commands.length > 0 ? 'commands+ai' : 'ai',
+            maxRounds: Number(cfg.maxRounds) || 5,
+            maxUsd: contract.budgetUsd ?? (Number(cfg.maxUsd) || 3),
+            maxHours: Number(cfg.maxHours) || 2,
+            criteria: contract.criteria,
+            requireEvidence: true,
+          }
+          : undefined
         const res = await this.deps.dispatchTicket({
-          text: `[定时任务：${schedule.name}]\n${prompt}`,
+          text: `[定时任务：${schedule.name}${contract ? ` · 约定 v${contract.version}` : ''}]\n${prompt}${contractBlock}`,
           ...(str(cfg.model) ? { model: str(cfg.model) } : {}),
           ...(str(cfg.projectId) ? { projectId: str(cfg.projectId) } : {}),
           ...(cfg.projectMode === 'copy' || cfg.projectMode === 'direct' || cfg.projectMode === 'worktree' ? { projectMode: cfg.projectMode } : {}),
           ...(typeof cfg.collab === 'boolean' ? { collab: cfg.collab } : {}),
+          ...(goalSpec ? { goal: goalSpec } : {}),
         })
+        if (res.ticketId && contract && this.deps.contracts) {
+          this.deps.contracts.cloneToTarget(contract, 'ticket', res.ticketId, this.doNow())
+        }
         const summary = res.ticketId ? `已自动派发工单 ${res.ticketId}` : `已提交触发器 ${res.triggerId}`
         try {
           this.deps.events.add({
@@ -168,13 +232,21 @@ export class SchedulerService {
             level: 'info',
             ...(res.ticketId ? { ticketId: res.ticketId } : {}),
             text: `定时任务「${schedule.name}」${summary}`,
-            data: { scheduleId: schedule.id, runId: run.id, ticketId: res.ticketId },
+            data: { scheduleId: schedule.id, runId: run.id, ticketId: res.ticketId, contractVersion: contract?.version ?? null },
           })
         } catch { /* ignore */ }
         return this.deps.store.finishRun(
           run.id,
           schedule.id,
-          { status: 'ok', summary, ...(res.ticketId ? { ticketId: res.ticketId } : {}) },
+          {
+            status: 'ok',
+            dispatchStatus: 'dispatched',
+            executionStatus: res.ticketId ? 'running' : 'succeeded',
+            acceptanceStatus: goalSpec ? 'pending' : 'not_required',
+            ...(contract ? { contractVersion: contract.version, contractSnapshotJson: contractMeta?.snapshotJson ?? null } : {}),
+            summary,
+            ...(res.ticketId ? { ticketId: res.ticketId } : {}),
+          },
           startedAt.getTime(),
           this.doNow(),
         )
@@ -188,8 +260,9 @@ export class SchedulerService {
         const channel = cfg.channel === 'wechat' || cfg.channel === 'feishu' || cfg.channel === 'web' ? cfg.channel : 'web'
         const userId = str(cfg.userId) || 'console'
         const deliverToWechat = cfg.deliverToWechat !== false
+        const contractBlock = contract ? `\n\n${this.deps.contracts!.formatForPrompt(contract)}` : ''
         const res = await this.deps.runDirectorPrompt({
-          prompt: `[定时巡检：${schedule.name}]\n${str(cfg.prompt)}`,
+          prompt: `[定时巡检：${schedule.name}${contract ? ` · 约定 v${contract.version}` : ''}]\n${str(cfg.prompt)}${contractBlock}`,
           channel,
           userId,
           deliverToWechat,
@@ -200,13 +273,20 @@ export class SchedulerService {
             kind: 'scheduler.ran',
             level: 'info',
             text: `定时总控巡检「${schedule.name}」完成`,
-            data: { scheduleId: schedule.id, runId: run.id, sessionId: res.sessionId },
+            data: { scheduleId: schedule.id, runId: run.id, sessionId: res.sessionId, contractVersion: contract?.version ?? null },
           })
         } catch { /* ignore */ }
         return this.deps.store.finishRun(
           run.id,
           schedule.id,
-          { status: 'ok', summary },
+          {
+            status: 'ok',
+            dispatchStatus: 'dispatched',
+            executionStatus: 'succeeded',
+            acceptanceStatus: 'not_required',
+            ...(contract ? { contractVersion: contract.version, contractSnapshotJson: contractMeta?.snapshotJson ?? null } : {}),
+            summary,
+          },
           startedAt.getTime(),
           this.doNow(),
         )
@@ -214,7 +294,18 @@ export class SchedulerService {
 
       // http_watch：零空耗 Token 轻量探测，仅在状态异常或内容变更时唤醒通知/后续动作
       const outcome = await this.runHttpWatch(schedule)
-      return this.deps.store.finishRun(run.id, schedule.id, outcome, startedAt.getTime(), this.doNow())
+      return this.deps.store.finishRun(
+        run.id,
+        schedule.id,
+        {
+          ...outcome,
+          dispatchStatus: 'dispatched',
+          executionStatus: outcome.ticketId ? 'running' : 'succeeded',
+          acceptanceStatus: 'not_required',
+        },
+        startedAt.getTime(),
+        this.doNow(),
+      )
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error)
       try {
@@ -228,7 +319,14 @@ export class SchedulerService {
       return this.deps.store.finishRun(
         run.id,
         schedule.id,
-        { status: 'error', summary: `执行失败：${msg.slice(0, 200)}`, error: msg },
+        {
+          status: 'error',
+          dispatchStatus: 'failed',
+          executionStatus: 'failed',
+          acceptanceStatus: 'failed',
+          summary: `执行失败：${msg.slice(0, 200)}`,
+          error: msg,
+        },
         startedAt.getTime(),
         this.doNow(),
       )

@@ -26,6 +26,15 @@ import type { UsageRange } from '../../ledger/ledger.ts'
 import { GoalError, resolveGoal, type GoalSpec } from '../../goal/service.ts'
 import type { AdminRouteDeps, AdminRouteRequest } from './types.ts'
 
+const CriterionSchema = z.union([
+  z.string().trim().min(1).max(500),
+  z.object({
+    id: z.string().trim().max(40).default(''),
+    text: z.string().trim().min(1).max(500),
+    required: z.boolean().default(true),
+  }).strict(),
+])
+
 const GoalInputSchema = z.object({
   text: z.string().trim().min(1, '请写清目标').max(4000, '目标不能超过 4000 字'),
   commands: z.array(z.string().trim().min(1, '验收命令不能是空的').max(1000, '一条验收命令不能超过 1000 字')).max(20, '最多 20 条验收命令').optional(),
@@ -33,6 +42,18 @@ const GoalInputSchema = z.object({
   maxRounds: z.number().int('必须是整数').min(1, '至少 1 轮').max(50, '最多 50 轮').optional(),
   maxUsd: z.number().min(0.01, '至少 $0.01').max(100, '最多 $100').optional(),
   maxHours: z.number().min(0.1, '至少 0.1 小时').max(72, '最多 72 小时').optional(),
+  criteria: z.array(CriterionSchema).max(30).optional(),
+  requireEvidence: z.boolean().optional(),
+}).strict()
+
+const EvidenceInputSchema = z.object({
+  kind: z.enum(['command', 'file', 'git', 'browser', 'data', 'judge']),
+  criterionId: z.string().trim().max(40).optional(),
+  runId: z.string().trim().min(1).max(80).default('manual'),
+  artifactVersion: z.string().trim().max(80).default('working-tree'),
+  passed: z.boolean(),
+  summary: z.string().trim().min(1).max(400),
+  detail: z.string().max(2000).optional(),
 }).strict()
 
 const CreateTicketSchema = z.object({
@@ -40,7 +61,7 @@ const CreateTicketSchema = z.object({
   model: z.string().max(200, '模型名过长').optional(),
   secrets: z.array(SecretNameSchema).max(100, '一次最多授权 100 个密钥').optional(),
   projectId: z.string().regex(/^p_[A-Za-z0-9]{1,32}$/, '项目编号不合法').optional(),
-  projectMode: z.enum(['copy', 'direct']).optional(),
+  projectMode: z.enum(['copy', 'direct', 'worktree']).optional(),
   collab: z.boolean().optional(),
   goal: GoalInputSchema.optional(),
 }).strict()
@@ -74,7 +95,7 @@ const BatchDeleteSchema = z.object({
 }).strict()
 
 export async function handleTicketsAndAuditRoutes(deps: AdminRouteDeps, { req, res, url, method, route }: AdminRouteRequest): Promise<boolean> {
-  const { host, store, ledger, events, councils, activity, goals, handleFiles } = deps
+  const { host, store, ledger, events, councils, activity, goals, contracts, handleFiles } = deps
 
   // Secrets.
   if (route === '/secrets' && method === 'GET') {
@@ -245,6 +266,56 @@ export async function handleTicketsAndAuditRoutes(deps: AdminRouteDeps, { req, r
     return true
   }
 
+  const receiptMatch = /^\/tickets\/([^/]+)\/receipt$/.exec(route)
+  if (receiptMatch !== null && method === 'GET') {
+    const id = decodeSegment(receiptMatch[1] ?? '')
+    if (id === undefined) { sendJson(res, 400, { error: 'invalid_path', message: '任务票编号不合法。' }); return true }
+    const ticket = host.ticket(id)
+    if (ticket === undefined) { sendJson(res, 404, { error: 'not_found', message: '找不到这张任务票。' }); return true }
+    const contract = contracts?.get('ticket', id)
+    const deliverables = host.deliverables(id).map(d => ({ path: d.path, size: d.size, kind: d.kind }))
+    const receipt = goals?.buildReceipt(id, {
+      deliverables,
+      contractVersion: contract?.version ?? null,
+      ...(contract?.criteria ? { contractCriteria: contract.criteria } : {}),
+      needsPerson: Boolean(ticket.attention?.question),
+      ...(ticket.attention?.question ? { question: ticket.attention.question } : {}),
+      ended: ticket.status === 'ended',
+      ...(ticket.outcome ? { outcome: ticket.outcome } : {}),
+    }) ?? null
+    sendJson(res, 200, { receipt, contract: contract ?? null })
+    return true
+  }
+
+  const evMatch = /^\/tickets\/([^/]+)\/evidences$/.exec(route)
+  if (evMatch !== null) {
+    if (goals === undefined) throw new AdminError('not_found', '目标验收服务未启用。', 404)
+    const id = decodeSegment(evMatch[1] ?? '')
+    if (id === undefined) { sendJson(res, 400, { error: 'invalid_path', message: '任务票编号不合法。' }); return true }
+    if (host.ticket(id) === undefined) { sendJson(res, 404, { error: 'not_found', message: '找不到这张任务票。' }); return true }
+    if (method === 'GET') {
+      sendJson(res, 200, { items: goals.listEvidences(id) })
+      return true
+    }
+    if (method === 'POST') {
+      const parsed = EvidenceInputSchema.safeParse(await parseJsonBody(req))
+      if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
+      const item = goals.recordEvidence(id, {
+        kind: parsed.data.kind,
+        ...(parsed.data.criterionId ? { criterionId: parsed.data.criterionId } : {}),
+        runId: parsed.data.runId,
+        artifactVersion: parsed.data.artifactVersion,
+        passed: parsed.data.passed,
+        summary: parsed.data.summary,
+        ...(parsed.data.detail ? { detail: parsed.data.detail } : {}),
+      })
+      sendJson(res, 200, { ok: true, item })
+      return true
+    }
+    sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
+    return true
+  }
+
   const actionMatch = /^\/tickets\/([^/]+)\/(stop|retry|note|reply|files|secrets|deliverables|archive)$/.exec(route)
   const ticketMatch = /^\/tickets\/([^/]+)$/.exec(route)
   if (ticketMatch !== null && method === 'GET') {
@@ -257,9 +328,22 @@ export async function handleTicketsAndAuditRoutes(deps: AdminRouteDeps, { req, r
       ? { label: '正在准备项目文件', hint: '正在把项目复制到这个任务的工作区，第一次会久一点。' }
       : ticketStatusLabel(ticket)
     const council = councils?.forTicket(id)
+    const contract = contracts?.get('ticket', id)
+    const deliverables = host.deliverables(id).map(d => ({ path: d.path, size: d.size, kind: d.kind }))
+    const receipt = goals?.buildReceipt(id, {
+      deliverables,
+      contractVersion: contract?.version ?? null,
+      ...(contract?.criteria ? { contractCriteria: contract.criteria } : {}),
+      needsPerson: Boolean(ticket.attention?.question),
+      ...(ticket.attention?.question ? { question: ticket.attention.question } : {}),
+      ended: ticket.status === 'ended',
+      ...(ticket.outcome ? { outcome: ticket.outcome } : {}),
+    })
     sendJson(res, 200, {
       ...ticket,
       ...(council === undefined ? {} : { council }),
+      ...(contract === undefined ? {} : { contract }),
+      ...(receipt === undefined ? {} : { receipt }),
       secrets: host.ticketSecrets(id),
       previews: host.ticketPreviews(id),
       links: host.ticketLinks(id),

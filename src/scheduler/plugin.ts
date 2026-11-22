@@ -37,7 +37,15 @@ const PreviewCronSchema = z.object({
 
 const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
 
-export function createSchedulerPlugin(scheduler: SchedulerService): SubsystemPlugin {
+export interface SchedulerPluginOpts {
+  getTicketSummary?: (ticketId: string) => {
+    outcome?: string
+    acceptanceStatus?: 'met' | 'unmet' | 'not_checked'
+  } | undefined
+  afterCommit?: (fn: () => void) => void
+}
+
+export function createSchedulerPlugin(scheduler: SchedulerService, opts: SchedulerPluginOpts = {}): SubsystemPlugin {
   return {
     id: 'scheduler',
     name: '主动定时与巡检调度',
@@ -240,6 +248,17 @@ export function createSchedulerPlugin(scheduler: SchedulerService): SubsystemPlu
         }
       }
       return lines.join('\n')
+    },
+
+    onDomainEvent: event => {
+      if (event.type !== 'ticket.ended' || !opts.getTicketSummary) return
+      const sync = (): void => {
+        const info = opts.getTicketSummary?.(event.data.ticketId)
+        if (!info) return
+        scheduler.onTicketSettled(event.data.ticketId, info.outcome ?? 'closed', info.acceptanceStatus ?? 'not_checked')
+      }
+      if (opts.afterCommit) opts.afterCommit(sync)
+      else sync()
     },
   }
 }

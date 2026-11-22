@@ -1,6 +1,7 @@
 /**
  * SuperAgent 2.0 一等能力插件装配模块：
  * - 长期记忆与可进化技能库（`MemoryStore` + `SkillStore` + `memory-skills` 插件）
+ * - 统一任务约定与版本修订（`ContractStore` + `contracts` 插件）
  * - 主动定时与巡检调度引擎（`SchedulerStore` + `SchedulerService` + `scheduler` 插件）
  */
 import { join } from 'node:path'
@@ -8,10 +9,13 @@ import type { DatabaseSync } from 'node:sqlite'
 import type { AdminHost } from '../admin/host.ts'
 import type { DirectorService } from '../director/service.ts'
 import type { EventLog } from '../ledger/events.ts'
+import type { GoalService } from '../goal/service.ts'
 import type { PluginRegistry } from '../plugins/registry.ts'
 import { MemoryStore } from '../memory/store.ts'
 import { SkillStore } from '../skills/store.ts'
 import { createMemoryAndSkillsPlugin } from '../memory/plugin.ts'
+import { ContractStore } from '../contracts/store.ts'
+import { createContractsPlugin } from '../contracts/plugin.ts'
 import { SchedulerStore } from '../scheduler/store.ts'
 import { SchedulerService } from '../scheduler/service.ts'
 import { createSchedulerPlugin } from '../scheduler/plugin.ts'
@@ -25,9 +29,13 @@ export interface WireCorePluginsOptions {
   isPaused: () => boolean
   getAdminHost: () => AdminHost | undefined
   getDirector: () => DirectorService | undefined
+  getGoals?: () => Pick<GoalService, 'view' | 'set'> | undefined
+  getGoalDefaults?: () => { maxRounds: number; maxUsd: number; maxHours: number }
+  notifyTicket?: (ticketId: string, text: string) => void
   getTicketSummary: (ticketId: string) => {
     title: string
     outcome?: string
+    acceptanceStatus?: 'met' | 'unmet' | 'not_checked'
     summary?: string
     projectId?: string
   } | undefined
@@ -38,18 +46,21 @@ export interface WireCorePluginsOptions {
 export interface CorePluginsBundle {
   readonly memories: MemoryStore
   readonly skills: SkillStore
+  readonly contracts: ContractStore
   readonly scheduler: SchedulerService
 }
 
 export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle {
   const memories = new MemoryStore(opts.db)
   const skills = new SkillStore(opts.db, join(opts.stateDir, 'skills'))
+  const contracts = new ContractStore(opts.db)
   const schedulerStore = new SchedulerStore(opts.db)
 
   const scheduler = new SchedulerService({
     store: schedulerStore,
     events: opts.events,
     isPaused: opts.isPaused,
+    contracts,
     dispatchTicket: async input => {
       const host = opts.getAdminHost()
       if (!host) throw new Error('控制台宿主尚未就绪')
@@ -78,7 +89,19 @@ export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle
     afterCommit: opts.afterCommit,
   }))
 
-  opts.plugins.register(createSchedulerPlugin(scheduler))
+  opts.plugins.register(createContractsPlugin({
+    contracts,
+    memories,
+    redact: opts.redact,
+    ...(opts.getGoals ? { getGoals: opts.getGoals } : {}),
+    ...(opts.getGoalDefaults ? { getGoalDefaults: opts.getGoalDefaults } : {}),
+    ...(opts.notifyTicket ? { notifyTicket: opts.notifyTicket } : {}),
+  }))
 
-  return { memories, skills, scheduler }
+  opts.plugins.register(createSchedulerPlugin(scheduler, {
+    getTicketSummary: opts.getTicketSummary,
+    afterCommit: opts.afterCommit,
+  }))
+
+  return { memories, skills, contracts, scheduler }
 }

@@ -76,6 +76,11 @@ interface RunRow {
   started_at: string
   finished_at: string | null
   status: string
+  dispatch_status: string
+  execution_status: string
+  acceptance_status: string
+  contract_version: number | null
+  contract_snapshot_json: string | null
   summary: string
   ticket_id: string | null
   error: string | null
@@ -126,6 +131,10 @@ function rowToRun(row: RunRow): ScheduleRunRecord {
     startedAt: row.started_at,
     finishedAt: row.finished_at,
     status: row.status as ScheduleRunRecord['status'],
+    dispatchStatus: (row.dispatch_status || 'pending') as ScheduleRunRecord['dispatchStatus'],
+    executionStatus: (row.execution_status || 'pending') as ScheduleRunRecord['executionStatus'],
+    acceptanceStatus: (row.acceptance_status || 'not_required') as ScheduleRunRecord['acceptanceStatus'],
+    contractVersion: row.contract_version ?? null,
     summary: row.summary,
     ticketId: row.ticket_id,
     error: row.error,
@@ -192,12 +201,18 @@ export class SchedulerStore {
         started_at TEXT NOT NULL,
         finished_at TEXT,
         status TEXT NOT NULL,
+        dispatch_status TEXT NOT NULL DEFAULT 'pending',
+        execution_status TEXT NOT NULL DEFAULT 'pending',
+        acceptance_status TEXT NOT NULL DEFAULT 'not_required',
+        contract_version INTEGER,
+        contract_snapshot_json TEXT,
         summary TEXT NOT NULL DEFAULT '',
         ticket_id TEXT,
         error TEXT,
         duration_ms INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_schedule_runs_sched ON schedule_runs(schedule_id, started_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_schedule_runs_ticket ON schedule_runs(ticket_id);
 
       CREATE TABLE IF NOT EXISTS schedule_watch_state (
         schedule_id TEXT PRIMARY KEY,
@@ -208,6 +223,21 @@ export class SchedulerStore {
         updated_at TEXT NOT NULL
       );
     `)
+    this.ensureRunMigrations()
+  }
+
+  private ensureRunMigrations(): void {
+    const cols = new Set(
+      (this.db.prepare('PRAGMA table_info(schedule_runs)').all() as unknown as { name: string }[]).map(c => c.name),
+    )
+    const add = (name: string, ddl: string): void => {
+      if (!cols.has(name)) this.db.exec(`ALTER TABLE schedule_runs ADD COLUMN ${ddl}`)
+    }
+    add('dispatch_status', `dispatch_status TEXT NOT NULL DEFAULT 'pending'`)
+    add('execution_status', `execution_status TEXT NOT NULL DEFAULT 'pending'`)
+    add('acceptance_status', `acceptance_status TEXT NOT NULL DEFAULT 'not_required'`)
+    add('contract_version', 'contract_version INTEGER')
+    add('contract_snapshot_json', 'contract_snapshot_json TEXT')
   }
 
   /** 启动时清理进程意外中断遗留的 running 运行记录。 */
@@ -327,7 +357,11 @@ export class SchedulerStore {
     return rows.map(rowToSchedule)
   }
 
-  startRun(schedule: ScheduleRecord, now = new Date()): ScheduleRunRecord {
+  startRun(
+    schedule: ScheduleRecord,
+    now = new Date(),
+    contractMeta?: { version: number; snapshotJson: string },
+  ): ScheduleRunRecord {
     const id = makeId('run')
     const iso = now.toISOString()
     // 先推进 next_run_at，避免长任务执行期间重复触发；一次性任务执行即停用。
@@ -343,9 +377,13 @@ export class SchedulerStore {
       : null
 
     this.db.prepare(`
-      INSERT INTO schedule_runs (id, schedule_id, started_at, finished_at, status, summary, ticket_id, error, duration_ms)
-      VALUES (?, ?, ?, NULL, 'running', '', NULL, NULL, NULL)
-    `).run(id, schedule.id, iso)
+      INSERT INTO schedule_runs (
+        id, schedule_id, started_at, finished_at, status,
+        dispatch_status, execution_status, acceptance_status,
+        contract_version, contract_snapshot_json,
+        summary, ticket_id, error, duration_ms
+      ) VALUES (?, ?, ?, NULL, 'running', 'pending', 'running', 'not_required', ?, ?, '', NULL, NULL, NULL)
+    `).run(id, schedule.id, iso, contractMeta?.version ?? null, contractMeta?.snapshotJson ?? null)
     this.db.prepare(`
       UPDATE schedules
       SET enabled = ?, next_run_at = ?, last_run_at = ?, last_status = 'running', updated_at = ?
@@ -357,7 +395,17 @@ export class SchedulerStore {
   finishRun(
     runId: string,
     scheduleId: string,
-    outcome: { status: 'ok' | 'skipped' | 'changed' | 'error'; summary: string; ticketId?: string; error?: string },
+    outcome: {
+      status: 'ok' | 'skipped' | 'changed' | 'error'
+      dispatchStatus?: ScheduleRunRecord['dispatchStatus']
+      executionStatus?: ScheduleRunRecord['executionStatus']
+      acceptanceStatus?: ScheduleRunRecord['acceptanceStatus']
+      contractVersion?: number | null
+      contractSnapshotJson?: string | null
+      summary: string
+      ticketId?: string
+      error?: string
+    },
     startedMs: number,
     now = new Date(),
   ): ScheduleRunRecord | undefined {
@@ -365,11 +413,34 @@ export class SchedulerStore {
     const durationMs = Math.max(0, now.getTime() - startedMs)
     const summary = outcome.summary.slice(0, 600)
     const errText = outcome.error ? outcome.error.slice(0, 1000) : null
+
+    const dispatchStatus: ScheduleRunRecord['dispatchStatus'] = outcome.dispatchStatus
+      ?? (outcome.status === 'skipped' ? 'skipped' : outcome.status === 'error' ? 'failed' : 'dispatched')
+    const executionStatus: ScheduleRunRecord['executionStatus'] = outcome.executionStatus
+      ?? (outcome.status === 'skipped' ? 'skipped' : outcome.status === 'error' ? 'failed' : (outcome.ticketId ? 'running' : 'succeeded'))
+    const acceptanceStatus: ScheduleRunRecord['acceptanceStatus'] = outcome.acceptanceStatus ?? 'not_required'
+
     this.db.prepare(`
       UPDATE schedule_runs
-      SET finished_at = ?, status = ?, summary = ?, ticket_id = ?, error = ?, duration_ms = ?
+      SET finished_at = ?, status = ?, dispatch_status = ?, execution_status = ?, acceptance_status = ?,
+          contract_version = COALESCE(?, contract_version),
+          contract_snapshot_json = COALESCE(?, contract_snapshot_json),
+          summary = ?, ticket_id = ?, error = ?, duration_ms = ?
       WHERE id = ?
-    `).run(iso, outcome.status, summary, outcome.ticketId ?? null, errText, durationMs, runId)
+    `).run(
+      iso,
+      outcome.status,
+      dispatchStatus,
+      executionStatus,
+      acceptanceStatus,
+      outcome.contractVersion ?? null,
+      outcome.contractSnapshotJson ?? null,
+      summary,
+      outcome.ticketId ?? null,
+      errText,
+      durationMs,
+      runId,
+    )
     this.db.prepare(`
       UPDATE schedules
       SET last_status = ?, last_summary = ?,
@@ -391,6 +462,36 @@ export class SchedulerStore {
       )
     `).run(scheduleId, scheduleId)
     return this.getRun(runId)
+  }
+
+  /** 根据已派发工单 ID 回填“已执行 / 已验收”状态（三态独立更新）。 */
+  updateTicketOutcome(
+    ticketId: string,
+    executionStatus: ScheduleRunRecord['executionStatus'],
+    acceptanceStatus: ScheduleRunRecord['acceptanceStatus'],
+  ): ScheduleRunRecord | undefined {
+    const row = this.db.prepare(
+      'SELECT * FROM schedule_runs WHERE ticket_id = ? ORDER BY started_at DESC LIMIT 1',
+    ).get(ticketId) as RunRow | undefined
+    if (!row) return undefined
+    this.db.prepare(`
+      UPDATE schedule_runs
+      SET execution_status = ?, acceptance_status = ?
+      WHERE id = ?
+    `).run(executionStatus, acceptanceStatus, row.id)
+    return this.getRun(row.id)
+  }
+
+  /** 读取单次运行固化的历史任务约定快照（旧报告口径不受后续约定修订影响）。 */
+  getRunContractSnapshot(runId: string): Record<string, unknown> | undefined {
+    const row = this.db.prepare('SELECT contract_snapshot_json FROM schedule_runs WHERE id = ?').get(runId) as { contract_snapshot_json: string | null } | undefined
+    if (!row?.contract_snapshot_json) return undefined
+    try {
+      const parsed = JSON.parse(row.contract_snapshot_json)
+      return typeof parsed === 'object' && parsed !== null ? parsed as Record<string, unknown> : undefined
+    } catch {
+      return undefined
+    }
   }
 
   getRun(runId: string): ScheduleRunRecord | undefined {
