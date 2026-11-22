@@ -297,16 +297,26 @@ describe('V2 最终端到端业务验收（网页改动 + 周期周报）', () =
     expect(versions).toContain(2)
 
     // =========================================================================
-    // 架构约束真实 HTTP 实测：热停用插件后路由立即 404，重新启用恢复 200
+    // 架构约束真实 HTTP 实测：
+    // 1) 单机模式默认停用 remote-nodes（404），按需启用后 200，再停用恢复 404；
+    // 2) 热停用 evolution 插件后路由立即 404，重新启用恢复 200。
     // =========================================================================
+    expect((await api('/remote/nodes')).status).toBe(404)
+    const remoteOn = await api('/plugins/remote-nodes', { method: 'PUT', body: JSON.stringify({ enabled: true }) })
+    expect(remoteOn.status).toBe(200)
     expect((await api('/remote/nodes')).status).toBe(200)
-    const offRes = await api('/plugins/remote-nodes', { method: 'PUT', body: JSON.stringify({ enabled: false }) })
-    expect(offRes.status).toBe(200)
-    expect(offRes.body.item.enabled).toBe(false)
+    const remoteOff = await api('/plugins/remote-nodes', { method: 'PUT', body: JSON.stringify({ enabled: false }) })
+    expect(remoteOff.status).toBe(200)
     expect((await api('/remote/nodes')).status).toBe(404)
 
-    const onRes = await api('/plugins/remote-nodes', { method: 'PUT', body: JSON.stringify({ enabled: true }) })
+    expect((await api('/evolution/benchmarks')).status).toBe(200)
+    const offRes = await api('/plugins/evolution', { method: 'PUT', body: JSON.stringify({ enabled: false }) })
+    expect(offRes.status).toBe(200)
+    expect(offRes.body.item.enabled).toBe(false)
+    expect((await api('/evolution/benchmarks')).status).toBe(404)
+
+    const onRes = await api('/plugins/evolution', { method: 'PUT', body: JSON.stringify({ enabled: true }) })
     expect(onRes.status).toBe(200)
-    expect((await api('/remote/nodes')).status).toBe(200)
+    expect((await api('/evolution/benchmarks')).status).toBe(200)
   }, 45_000)
 })

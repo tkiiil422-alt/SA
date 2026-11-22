@@ -235,6 +235,13 @@ export interface TicketDetailView extends TicketSummaryView {
   project?: TicketProjectView
 }
 
+/** 工单级执行器选择（留空默认走 Pi；可选 `script` / `claude-code` / `opencode`）。 */
+export interface TicketRunnerInput {
+  runnerId: string
+  scriptId?: string
+  scriptParams?: Record<string, unknown>
+}
+
 /** What `POST /tickets` reports back, mirroring `sa ask`. */
 export interface CreateTicketResult {
   ticketId?: string
@@ -579,7 +586,7 @@ export interface AdminHost {
    * `projectMode: 'direct'` mounts the project library's original tree instead (edits are saved to the library); only
    * one open ticket may edit the same project directly.
    */
-  createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree'): Promise<CreateTicketResult>
+  createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree', runner?: TicketRunnerInput): Promise<CreateTicketResult>
 
   /** Every stored secret, metadata only, sorted by name. */
   listSecrets(): SecretListItemView[]

@@ -22,6 +22,7 @@ export interface SkillCreateInput {
   tags?: string[]
   content: string
   enabled?: boolean
+  preferredRunnerId?: string | null
 }
 
 export interface SkillUpdateInput {
@@ -33,6 +34,7 @@ export interface SkillUpdateInput {
   tags?: string[]
   content?: string
   enabled?: boolean
+  preferredRunnerId?: string | null
 }
 
 interface SkillRow {
@@ -45,6 +47,7 @@ interface SkillRow {
   tags_json: string
   content: string
   enabled: number
+  preferred_runner_id: string | null
   active_version: number
   previous_version: number | null
   use_count: number
@@ -114,6 +117,7 @@ function rowToSkill(row: SkillRow): SkillRecord {
     tags: parseJsonStrings(row.tags_json),
     content: row.content,
     enabled: row.enabled === 1,
+    preferredRunnerId: row.preferred_runner_id ?? null,
     activeVersion: row.active_version ?? 1,
     previousVersion: row.previous_version ?? null,
     useCount: row.use_count,
@@ -151,6 +155,7 @@ function formatSkillMarkdown(skill: SkillRecord): string {
     `description: ${quote(skill.description)}`,
     `scope: ${quote(skill.scope)}`,
     `enabled: ${skill.enabled}`,
+    ...(skill.preferredRunnerId ? [`preferredRunnerId: ${quote(skill.preferredRunnerId)}`] : []),
     `triggers: ${JSON.stringify(skill.triggers)}`,
     `tags: ${JSON.stringify(skill.tags)}`,
     `updatedAt: ${quote(skill.updatedAt)}`,
@@ -177,6 +182,7 @@ export class SkillStore {
         tags_json TEXT NOT NULL DEFAULT '[]',
         content TEXT NOT NULL,
         enabled INTEGER NOT NULL DEFAULT 1,
+        preferred_runner_id TEXT,
         active_version INTEGER NOT NULL DEFAULT 1,
         previous_version INTEGER,
         use_count INTEGER NOT NULL DEFAULT 0,
@@ -221,6 +227,7 @@ export class SkillStore {
     )
     if (!cols.has('active_version')) this.db.exec('ALTER TABLE skills ADD COLUMN active_version INTEGER NOT NULL DEFAULT 1')
     if (!cols.has('previous_version')) this.db.exec('ALTER TABLE skills ADD COLUMN previous_version INTEGER')
+    if (!cols.has('preferred_runner_id')) this.db.exec('ALTER TABLE skills ADD COLUMN preferred_runner_id TEXT')
   }
 
   private syncFile(skill: SkillRecord, previousSlug?: string): void {
@@ -255,6 +262,7 @@ export class SkillStore {
     const triggers = cleanList(input.triggers)
     const tags = cleanList(input.tags)
     const enabled = input.enabled === false ? 0 : 1
+    const preferredRunnerId = input.preferredRunnerId?.trim() || null
     const iso = now.toISOString()
 
     const existing = this.getBySlug(slug)
@@ -268,9 +276,9 @@ export class SkillStore {
       this.db.prepare(`
         UPDATE skills
         SET name = ?, description = ?, scope = ?, triggers_json = ?, tags_json = ?,
-            content = ?, enabled = ?, active_version = ?, previous_version = ?, updated_at = ?
+            content = ?, enabled = ?, preferred_runner_id = ?, active_version = ?, previous_version = ?, updated_at = ?
         WHERE id = ?
-      `).run(name, description, scope, JSON.stringify(triggers), JSON.stringify(tags), content, enabled, nextVer, existing.activeVersion, iso, existing.id)
+      `).run(name, description, scope, JSON.stringify(triggers), JSON.stringify(tags), content, enabled, preferredRunnerId, nextVer, existing.activeVersion, iso, existing.id)
       const updated = this.get(existing.id)!
       this.syncFile(updated)
       return updated
@@ -280,9 +288,9 @@ export class SkillStore {
     this.db.prepare(`
       INSERT INTO skills (
         id, slug, name, description, scope, triggers_json, tags_json,
-        content, enabled, active_version, previous_version, use_count, last_used_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, 0, NULL, ?, ?)
-    `).run(id, slug, name, description, scope, JSON.stringify(triggers), JSON.stringify(tags), content, enabled, iso, iso)
+        content, enabled, preferred_runner_id, active_version, previous_version, use_count, last_used_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, 0, NULL, ?, ?)
+    `).run(id, slug, name, description, scope, JSON.stringify(triggers), JSON.stringify(tags), content, enabled, preferredRunnerId, iso, iso)
     this.db.prepare(`
       INSERT OR REPLACE INTO skill_versions (skill_id, version, status, content, triggers_json, source, reason, eval_report_json, created_at)
       VALUES (?, 1, 'active', ?, ?, 'manual', '初始版本', NULL, ?)
@@ -315,14 +323,17 @@ export class SkillStore {
     const triggers = patch.triggers !== undefined ? cleanList(patch.triggers) : cur.triggers
     const tags = patch.tags !== undefined ? cleanList(patch.tags) : cur.tags
     const enabled = patch.enabled !== undefined ? (patch.enabled ? 1 : 0) : (cur.enabled ? 1 : 0)
+    const preferredRunnerId = patch.preferredRunnerId !== undefined
+      ? (patch.preferredRunnerId?.trim() || null)
+      : (cur.preferredRunnerId ?? null)
     const iso = now.toISOString()
 
     this.db.prepare(`
       UPDATE skills
       SET slug = ?, name = ?, description = ?, scope = ?, triggers_json = ?, tags_json = ?,
-          content = ?, enabled = ?, updated_at = ?
+          content = ?, enabled = ?, preferred_runner_id = ?, updated_at = ?
       WHERE id = ?
-    `).run(slug, name, description, scope, JSON.stringify(triggers), JSON.stringify(tags), content, enabled, iso, id)
+    `).run(slug, name, description, scope, JSON.stringify(triggers), JSON.stringify(tags), content, enabled, preferredRunnerId, iso, id)
     const updated = this.get(id)!
     this.syncFile(updated, cur.slug)
     return updated

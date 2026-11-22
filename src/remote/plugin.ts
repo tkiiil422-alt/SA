@@ -55,10 +55,11 @@ const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
 export function createRemoteNodesPlugin(remote: RemoteNodeService): SubsystemPlugin {
   return {
     id: 'remote-nodes',
-    name: '远程执行节点与分布式作业',
-    description: '复用 SSH、模型网关与账本，支持按能力路由、租约领取、心跳保活、断线重连、产物回传与去重结算',
+    name: '远程执行节点（可选，默认停用）',
+    description: '单台主机模式默认关闭；按需开启后支持多机租约领取、心跳保活、产物回传与去重结算',
     version: '2.2.0',
     routesPrefix: '/remote',
+    enabled: () => false,
 
     start: () => remote.start(),
     stop: () => remote.stop(),

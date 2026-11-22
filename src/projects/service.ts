@@ -18,7 +18,7 @@ import { materializeProject, writeAgentsFile } from './materialize.ts'
 import { buildProfile, type ProjectProfile } from './profile.ts'
 import { ProjectStore, type ProjectMode, type ProjectRecord, type ProjectStatus } from './store.ts'
 import { TicketReviewStore } from './review-store.ts'
-import { commitWorktreeChanges, inspectTicketDiff, mergeWorktreeBranch, prepareWorktree } from './worktree.ts'
+import { commitWorktreeChanges, inspectTicketDiff, mergeWorktreeBranch, prepareWorktree, pushWorktreeBranch } from './worktree.ts'
 import type { TicketDiffResponse, TicketReviewComment, TicketReviewState } from '../shared/api-types.ts'
 
 export type { ProjectMode } from './store.ts'
@@ -92,6 +92,8 @@ export interface TicketProjectView {
 export interface PreparedWorkspace {
   /** Set in `direct` mode: the library tree the container mounts at `/workspace/project`. */
   directTree?: string
+  /** Set in `worktree` mode: the main repo's `.git` dir mounted at the same host path so `git` works inside Podman. */
+  worktreeGitDir?: string
   /** A best-effort step (the pre-task snapshot) failed; the ticket still runs. */
   warning?: string
 }
@@ -763,15 +765,18 @@ export class ProjectService {
 
     if (mode === 'worktree') {
       const existingWt = this.copies.get(ticketId)
+      const gitDir = join(tree, '.git')
       if (existingWt !== undefined) {
         await existingWt
-        return {}
+        return existsSync(gitDir) ? { worktreeGitDir: gitDir } : {}
       }
       let warning: string | undefined
+      let usedWorktree = false
       const wtTask = (async (): Promise<void> => {
         this.preparing.add(ticketId)
         try {
           const wt = await prepareWorktree(tree, workspace, ticketId)
+          usedWorktree = wt.usedWorktree
           if (!wt.usedWorktree) {
             warning = wt.warning
             this.store.bindTicket(ticketId, record.id, this.now().toISOString(), 'copy')
@@ -784,7 +789,10 @@ export class ProjectService {
       })()
       this.copies.set(ticketId, wtTask)
       await wtTask
-      return warning ? { warning } : {}
+      return {
+        ...(usedWorktree && existsSync(gitDir) ? { worktreeGitDir: gitDir } : {}),
+        ...(warning ? { warning } : {}),
+      }
     }
 
     // The same ticket can be launched again after an idle retirement; the project copy happens only once.
@@ -1055,6 +1063,19 @@ export class ProjectService {
     if (!entry) return { ok: false, message: '这张任务没有绑定项目库。' }
     if (entry.mode !== 'worktree') return { ok: false, message: '只有 worktree 隔离分支模式的任务有独立分支可提交。' }
     return commitWorktreeChanges({ workspace: join(this.workspaceRoot, ticketId), ticketId, ...(message ? { message } : {}) })
+  }
+
+  /** 将工单 worktree 分支推送到远端仓库（创建 GitHub PR 前自动调用）。 */
+  async pushTicketBranch(ticketId: string, opts: { remote?: string; token?: string } = {}): Promise<{ ok: true; branch: string; remote: string } | { ok: false; message: string }> {
+    const entry = this.store.ticketEntry(ticketId)
+    if (!entry) return { ok: false, message: '这张任务没有绑定项目库。' }
+    if (entry.mode !== 'worktree') return { ok: false, message: '只有 worktree 隔离分支模式的任务支持分支推送。' }
+    return pushWorktreeBranch({
+      workspace: join(this.workspaceRoot, ticketId),
+      ticketId,
+      ...(opts.remote ? { remote: opts.remote } : {}),
+      ...(opts.token ? { token: opts.token } : {}),
+    })
   }
 
   /** 将 `worktree` 模式工单的隔离分支安全合并回项目库原件（合并前自动快照；若审查后代码发生变化默认拦截要求复审）。 */

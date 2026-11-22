@@ -74,6 +74,8 @@ export interface SkillRecord {
   tags: string[]
   content: string
   enabled: boolean
+  /** 可选：命中该技能时默认优先使用的执行器 ID（如 `pi` / `script` / `claude-code` / `opencode`）。 */
+  preferredRunnerId?: string | null
   activeVersion: number
   previousVersion: number | null
   useCount: number

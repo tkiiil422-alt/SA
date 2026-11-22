@@ -65,6 +65,9 @@ const CreateTicketSchema = z.object({
   projectMode: z.enum(['copy', 'direct', 'worktree']).optional(),
   collab: z.boolean().optional(),
   goal: GoalInputSchema.optional(),
+  runnerId: z.string().trim().max(40).optional(),
+  scriptId: z.string().trim().max(80).optional(),
+  scriptParams: z.record(z.string(), z.unknown()).optional(),
 }).strict()
 
 const ReviewPostSchema = z.object({
@@ -206,6 +209,13 @@ export async function handleTicketsAndAuditRoutes(deps: AdminRouteDeps, { req, r
         throw error
       }
     }
+    const runner = parsed.data.runnerId
+      ? {
+          runnerId: parsed.data.runnerId,
+          ...(parsed.data.scriptId ? { scriptId: parsed.data.scriptId } : {}),
+          ...(parsed.data.scriptParams ? { scriptParams: parsed.data.scriptParams } : {}),
+        }
+      : undefined
     const result = await host.createTicket(
       parsed.data.text,
       parsed.data.model || undefined,
@@ -214,6 +224,7 @@ export async function handleTicketsAndAuditRoutes(deps: AdminRouteDeps, { req, r
       parsed.data.collab,
       goal,
       parsed.data.projectMode,
+      ...(runner ? [runner] : []),
     )
     sendJson(res, 200, { ok: true, ...result })
     return true

@@ -293,6 +293,44 @@ export async function commitWorktreeChanges(opts: {
 }
 
 /**
+ * 将工单 worktree 分支推送到远端 Git 仓库（用于创建 GitHub PR）：
+ * - 若传入 `token` 且远端是 HTTPS 地址，通过临时 `http.extraheader` 注入 Basic 认证，绝不写入 `.git/config`；
+ * - 错误信息自动脱敏，绝不泄露明文 token。
+ */
+export async function pushWorktreeBranch(opts: {
+  workspace: string
+  ticketId: string
+  remote?: string
+  token?: string
+}): Promise<{ ok: true; branch: string; remote: string } | { ok: false; message: string }> {
+  const workDir = join(opts.workspace, 'project')
+  if (!existsSync(workDir)) return { ok: false, message: '找不到工单的工作区目录。' }
+  if (!(await isUsableGitRepo(workDir))) return { ok: false, message: '工单工作区不是有效的 Git 仓库。' }
+
+  const remote = (opts.remote ?? 'origin').trim() || 'origin'
+  const branch = worktreeBranchName(opts.ticketId)
+  const remoteUrlRes = await runGit(['remote', 'get-url', remote], workDir)
+  if (remoteUrlRes.code !== 0 || !remoteUrlRes.stdout.trim()) {
+    return { ok: false, message: `项目未配置 Git 远程仓库 ${remote}，无法推送分支 ${branch}。` }
+  }
+  const remoteUrl = remoteUrlRes.stdout.trim()
+  const args: string[] = []
+  if (opts.token && /^https?:\/\//i.test(remoteUrl)) {
+    const basic = Buffer.from(`x-access-token:${opts.token}`, 'utf8').toString('base64')
+    args.push('-c', `http.extraheader=AUTHORIZATION: basic ${basic}`)
+  }
+  args.push('push', '-u', remote, `HEAD:refs/heads/${branch}`)
+
+  const res = await runGit(args, workDir)
+  if (res.code !== 0) {
+    let err = (res.stderr || res.stdout || '未知推送错误').trim()
+    if (opts.token) err = err.split(opts.token).join('***')
+    return { ok: false, message: `推送分支 ${branch} 至 ${remote} 失败：${err.slice(0, 240)}` }
+  }
+  return { ok: true, branch, remote }
+}
+
+/**
  * 将 `worktree` 分支改动安全合并回项目库主树：
  * 1. 先给项目库主树拍一份回滚快照（若提供了 `history`）；
  * 2. 若工单工作树存在未提交改动，自动提交到工单分支 `sa/<ticketId>`；

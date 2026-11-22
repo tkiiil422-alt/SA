@@ -53,6 +53,7 @@ import { allowedSender, assessmentOutcome, settingsPolicy } from './policy.ts'
 import { SqliteRepositories } from './store/sqlite.ts'
 import { Effects } from './effects/effects.ts'
 import { PiExecutor } from './executor/pi-executor.ts'
+import { MultiRunnerExecutor, type TicketRunnerSelection } from './executor/runner-executor.ts'
 import { ActivityLog } from './executor/activity.ts'
 import { FanqieService } from './fanqie/service.ts'
 import { PiVersionService } from './executor/pi-versions.ts'
@@ -633,6 +634,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
 
     let engine!: Engine
     let executor!: PiExecutor
+    let multiRunner!: MultiRunnerExecutor
     let novelExecutor!: NovelExecutor
     // Preview links and their host ports live beside the tickets; `isRunning` reads the executor once it exists.
     const previews = new PreviewStore({
@@ -642,9 +644,9 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     })
     // The Engine needs an Executor at construction; the real PiExecutor is built after the gateway and MCP ports exist.
     // Nothing calls these methods before `effects.start()`, which is the last startup step.
-    // A ticket bound to a book goes to the novel executor; every other ticket goes to Pi exactly as before.
+    // A ticket bound to a book goes to the novel executor; non-Pi runner selections go to MultiRunnerExecutor; others go to Pi.
     const executorFor = (ticket: { id: string; origin: { triggerId: string } }): Executor =>
-      novelTicket(ticket) ? novelExecutor : executor
+      novelTicket(ticket) ? novelExecutor : multiRunner?.handles(ticket) ? multiRunner : executor
     const executorPort: Executor = {
       start: (ticket, assignment) => executorFor(ticket).start(ticket, assignment),
       deliver: (ticket, assignment) => executorFor(ticket).deliver(ticket, assignment),
@@ -796,6 +798,14 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         token = vault.reveal('GITHUB_TOKEN')
       } catch {
         return { ok: false, message: '无法读取 GitHub 令牌，请重新填写。' }
+      }
+      // worktree 隔离分支模式：若项目已配置 Git 远程仓库，创建 PR 前先自动推送分支至远端
+      const projBinding = projects.ticketProject(ticketId, ticket.origin.triggerId)
+      if (projBinding?.mode === 'worktree') {
+        const pushed = await projects.pushTicketBranch(ticketId, { token })
+        if (!pushed.ok && !pushed.message.includes('未配置 Git 远程仓库')) {
+          return { ok: false, message: pushed.message }
+        }
       }
       const client = new GithubClient({ apiBase: cfg.apiBase, token, repos: cfg.repos })
       const result = await client.createPullRequest({
@@ -1524,6 +1534,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
             PI_CODING_AGENT_DIR: directory,
             ...(previewOptions.enabled ? { SA_PREVIEW_PORTS: previewPorts.join(',') } : {}),
             ...(preparedProject.directTree ? { SA_PROJECT_DIR: preparedProject.directTree, SA_PROJECTS_ROOT: projectsRoot } : {}),
+            ...(preparedProject.worktreeGitDir ? { SA_WORKTREE_GIT_DIR: preparedProject.worktreeGitDir, SA_PROJECTS_ROOT: projectsRoot } : {}),
           },
         }
       },
@@ -1538,6 +1549,22 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       keepAlive: ticketId => goals.isChecking(ticketId),
     })
     cleanup.push(() => executor.close())
+
+    multiRunner = new MultiRunnerExecutor({
+      db: repo.db,
+      engine: () => engine,
+      runners,
+      ledger,
+      events,
+      activity,
+      goals: () => goals,
+      afterCommit: fn => repo.afterCommit(fn),
+      workspaceRoot,
+      prepareProject: (ticketId, triggerIds) => projects.prepareWorkspace(ticketId, triggerIds),
+      getTrigger: id => repo.triggers.get(id),
+      onError: error => console.error(`superagentd: multi-runner failed: ${error instanceof Error ? error.message : String(error)}`),
+    })
+    cleanup.push(() => multiRunner.close())
 
     // The novel engine: resolved models, ledger rows under the arc ticket, and its own budget on top of the global one.
     const resolveNovel = (role: NovelRole, bookId: string): { provider: string; model: string; target: ModelTarget } | undefined => {
@@ -1744,7 +1771,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     cleanup.push(() => wechat.stop())
 
     const sleep = (ms: number): Promise<void> => new Promise(resolveSleep => setTimeout(resolveSleep, ms))
-    const ask = async (text: string, opts: { model?: string; secrets?: string[]; projectId?: string; projectMode?: ProjectMode; collab?: boolean; goal?: GoalSpec; novel?: { bookId: string; arc: number } } = {}): Promise<AskResult> => {
+    const ask = async (text: string, opts: { model?: string; secrets?: string[]; projectId?: string; projectMode?: ProjectMode; collab?: boolean; goal?: GoalSpec; novel?: { bookId: string; arc: number }; runner?: TicketRunnerSelection } = {}): Promise<AskResult> => {
       let personRef: ModelRef | undefined
       if (opts.model !== undefined) {
         const parsedRef = parseRef(opts.model)
@@ -1764,6 +1791,19 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       if (opts.goal !== undefined) goals.setPending(trigger.id, opts.goal)
       // A book is bound the same way, so the first launch already routes to the novel executor.
       if (opts.novel !== undefined) novelStore.bindPending(trigger.id, opts.novel.bookId, opts.novel.arc, new Date().toISOString())
+      // 单机多执行器路由：优先采用工单显式选择的 runnerId；未指定时如命中带 preferredRunnerId 的启用技能则自动分流。
+      let resolvedRunner = opts.runner
+      let matchedSkillForRunner: ReturnType<typeof skills.match>[number] | undefined
+      if (!opts.novel && (!resolvedRunner || !resolvedRunner.runnerId)) {
+        const topSkill = skills.match(text, 'worker', 1, false)[0]
+        if (topSkill?.preferredRunnerId && topSkill.preferredRunnerId !== 'pi' && runners.get(topSkill.preferredRunnerId)) {
+          resolvedRunner = { runnerId: topSkill.preferredRunnerId }
+          matchedSkillForRunner = topSkill
+        }
+      }
+      if (!opts.novel && resolvedRunner && resolvedRunner.runnerId && resolvedRunner.runnerId !== 'pi') {
+        multiRunner.setSelection(trigger.id, resolvedRunner)
+      }
       const receive = engine.receive(trigger)
       if (receive === 'stored') {
         engine.evaluateDue()
@@ -1801,6 +1841,9 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         }
       }
       if (result.ticketId !== undefined) {
+        if (matchedSkillForRunner) {
+          try { skills.recordTicketUse(result.ticketId, matchedSkillForRunner) } catch { /* best effort */ }
+        }
         try {
           contracts.ensureDefault('ticket', result.ticketId, text, {
             ...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
@@ -2008,13 +2051,14 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         if (cfg.enabled && cfg.mode === 'ws') await feishuWs.restart()
         else feishuWs.stop()
       },
-      ask: (text, model, secrets, projectId, collab, goal, projectMode) => ask(text, {
+      ask: (text, model, secrets, projectId, collab, goal, projectMode, runner) => ask(text, {
         ...(goal === undefined ? {} : { goal }),
         ...(model === undefined ? {} : { model }),
         ...(secrets === undefined ? {} : { secrets }),
         ...(projectId === undefined ? {} : { projectId }),
         ...(projectMode === undefined ? {} : { projectMode }),
         ...(collab === undefined ? {} : { collab }),
+        ...(runner === undefined ? {} : { runner }),
       }),
       reply: replyOnTicket,
       goalReplied: ticketId => { goals.personReplied(ticketId) },

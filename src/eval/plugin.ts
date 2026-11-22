@@ -8,17 +8,28 @@
  */
 import { z } from 'zod'
 import type { SubsystemPlugin } from '../plugins/types.ts'
+import type { MemoryStore } from '../memory/store.ts'
 import type { SkillStore } from '../skills/store.ts'
 import type { SkillEvolutionService } from '../skills/evolution.ts'
+import type { SkillAutoObserver } from '../skills/auto-observer.ts'
 import type { PluginEvolutionService } from '../plugins/evolution.ts'
 import { coreBenchmarkCases, type BenchmarkStore } from './benchmarks.ts'
 import { issuesOf } from '../admin/http.ts'
 
 export interface EvolutionPluginDeps {
+  memories?: MemoryStore
   skills: SkillStore
   skillEvolution: SkillEvolutionService
+  autoObserver?: SkillAutoObserver
   pluginEvolution: PluginEvolutionService
   benchmarks: BenchmarkStore
+  getTicketSummary?: (ticketId: string) => {
+    title: string
+    outcome?: string
+    acceptanceStatus?: 'met' | 'unmet' | 'not_checked'
+    summary?: string
+  } | undefined
+  afterCommit?: (fn: () => void) => void
 }
 
 const CandidateSchema = z.object({
@@ -41,7 +52,7 @@ const GapSchema = z.object({
 const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '')
 
 export function createEvolutionPlugin(deps: EvolutionPluginDeps): SubsystemPlugin {
-  const { skills, skillEvolution, pluginEvolution, benchmarks } = deps
+  const { memories, skills, skillEvolution, autoObserver, pluginEvolution, benchmarks, getTicketSummary, afterCommit } = deps
 
   return {
     id: 'evolution',
@@ -54,7 +65,7 @@ export function createEvolutionPlugin(deps: EvolutionPluginDeps): SubsystemPlugi
       const { req, res, method, route, sendJson, parseJsonBody, invalid, decodeSegment } = ctx
       if (!route.startsWith('/evolution')) return false
 
-      const skVer = /^\/evolution\/skills\/([^/]+)\/(versions|candidate|rollback)$/.exec(route)
+      const skVer = /^\/evolution\/skills\/([^/]+)\/(versions|candidate|rollback|auto-correct)$/.exec(route)
       if (skVer !== null) {
         const idOrSlug = decodeSegment(skVer[1] ?? '')
         const action = skVer[2]
@@ -82,6 +93,19 @@ export function createEvolutionPlugin(deps: EvolutionPluginDeps): SubsystemPlugi
           }
           return true
         }
+        if (action === 'auto-correct' && method === 'POST') {
+          if (!autoObserver) { sendJson(res, 503, { error: 'unavailable', message: '技能自动观察器未装配。' }); return true }
+          const body = (await parseJsonBody(req).catch(() => ({}))) as Record<string, unknown>
+          const rule = str(body?.correctionRule)
+          if (!rule) { sendJson(res, 400, { error: 'invalid', message: '请填写纠正规则 correctionRule。' }); return true }
+          const evaluated = await autoObserver.onUserCorrection({
+            skillIdOrSlug: skill.id,
+            correctionRule: rule,
+            reason: str(body?.reason) || '用户主动纠正触发 A/B 评测升级',
+          })
+          sendJson(res, 200, { ok: true, result: evaluated })
+          return true
+        }
       }
 
       if (route === '/evolution/proposals' && method === 'GET') {
@@ -96,16 +120,19 @@ export function createEvolutionPlugin(deps: EvolutionPluginDeps): SubsystemPlugi
         sendJson(res, 200, { ok: true, ...out })
         return true
       }
-      const propApprove = /^\/evolution\/proposals\/([^/]+)\/approve$/.exec(route)
-      if (propApprove !== null && method === 'POST') {
-        const id = decodeSegment(propApprove[1] ?? '')
+      const propAction = /^\/evolution\/proposals\/([^/]+)\/(approve|reject)$/.exec(route)
+      if (propAction !== null && method === 'POST') {
+        const id = decodeSegment(propAction[1] ?? '')
+        const op = propAction[2]
         if (!id) { sendJson(res, 400, { error: 'invalid_path', message: '提案编号不合法。' }); return true }
         const body = (await parseJsonBody(req).catch(() => ({}))) as Record<string, unknown>
         try {
-          const proposal = await pluginEvolution.approveProposal(id, str(body?.actorId) || 'web:admin', str(body?.projectId) || undefined)
+          const proposal = op === 'approve'
+            ? await pluginEvolution.approveProposal(id, str(body?.actorId) || 'web:admin', str(body?.projectId) || undefined)
+            : pluginEvolution.rejectProposal(id)
           sendJson(res, 200, { ok: true, proposal })
         } catch (error) {
-          sendJson(res, 400, { error: 'approve_failed', message: error instanceof Error ? error.message : String(error) })
+          sendJson(res, 400, { error: `${op}_failed`, message: error instanceof Error ? error.message : String(error) })
         }
         return true
       }
@@ -117,8 +144,46 @@ export function createEvolutionPlugin(deps: EvolutionPluginDeps): SubsystemPlugi
         })
         return true
       }
+      if (route === '/evolution/benchmarks/run' && method === 'POST') {
+        const body = (await parseJsonBody(req).catch(() => ({}))) as Record<string, unknown>
+        const label = str(body?.label) || `基准快照 ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`
+        const run = await benchmarks.runAndRecord({
+          suiteName: 'core-v2',
+          label,
+          runner: async item => {
+            const matchedSkills = skills.match(item.input, 'worker', 3, false)
+            const matchedMems = memories ? memories.recall({ query: item.input, limit: 5, recordUse: false }) : []
+            const ctxParts = [
+              item.input,
+              ...matchedSkills.map(s => `[技能:${s.name}@v${s.activeVersion}] ${s.content}`),
+              ...matchedMems.map(m => `[记忆:${m.title}] ${m.content}`),
+            ]
+            return { output: ctxParts.join('\n'), usd: 0, firstPass: true }
+          },
+        })
+        sendJson(res, 200, { ok: true, run })
+        return true
+      }
 
       return false
+    },
+
+    onDomainEvent: event => {
+      if (event.type !== 'ticket.ended' || !autoObserver || !getTicketSummary) return
+      const run = (): void => {
+        try {
+          const info = getTicketSummary(event.data.ticketId)
+          if (!info) return
+          autoObserver.onTicketEnded({
+            ticketId: event.data.ticketId,
+            outcome: info.outcome ?? event.data.outcome ?? 'closed',
+            acceptanceStatus: info.acceptanceStatus ?? 'not_checked',
+            summary: info.summary ?? '',
+          })
+        } catch { /* best effort */ }
+      }
+      if (afterCommit) afterCommit(run)
+      else run()
     },
 
     directorQueries: {

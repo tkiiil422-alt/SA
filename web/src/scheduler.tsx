@@ -59,6 +59,7 @@ export function SchedulerPage() {
   const list = usePoll<ScheduleListResponse>('api/schedules', 10000)
   const [editing, setEditing] = useState<Partial<ScheduleRecord> | null>(null)
   const [runsOf, setRunsOf] = useState<{ schedule: ScheduleRecord; runs: ScheduleRunRecord[] } | null>(null)
+  const [contractOf, setContractOf] = useState<ScheduleRecord | null>(null)
   const { busy, run } = useAction()
 
   const toggle = (s: ScheduleRecord) =>
@@ -118,6 +119,7 @@ export function SchedulerPage() {
             <div className="actions">
               <button disabled={busy} onClick={() => runNow(s)}>立即运行</button>
               <button disabled={busy} onClick={() => openRuns(s)}>运行记录</button>
+              <button disabled={busy} onClick={() => setContractOf(s)}>任务约定</button>
               <button disabled={busy} onClick={() => toggle(s)}>{s.enabled ? '暂停' : '启用'}</button>
               <button disabled={busy} onClick={() => setEditing(s)}>编辑</button>
               <button className="danger" disabled={busy} onClick={() => remove(s)}>删除</button>
@@ -134,6 +136,7 @@ export function SchedulerPage() {
       </div>}
 
     {editing && <ScheduleEditor initial={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); list.reload() }} />}
+    {contractOf && <ScheduleContractSheet schedule={contractOf} onClose={() => setContractOf(null)} />}
     {runsOf && <Sheet title={`运行历史 · ${runsOf.schedule.name}`} onClose={() => setRunsOf(null)}>
       {runsOf.runs.length === 0
         ? <Empty>还没有运行记录。</Empty>
@@ -301,6 +304,104 @@ function ScheduleEditor({ initial, onClose, onSaved }: { initial: Partial<Schedu
     <div className="actions">
       <button onClick={onClose}>取消</button>
       <button className="primary" disabled={busy} onClick={save}>{busy ? '保存中…' : '保存'}</button>
+    </div>
+  </Sheet>
+}
+
+function ScheduleContractSheet({ schedule, onClose }: { schedule: ScheduleRecord; onClose: () => void }) {
+  const [data, setData] = useState<{ item: any; versions: any[] } | null>(null)
+  const [missing, setMissing] = useState(false)
+  const [scope, setScope] = useState<'project' | 'preference' | 'once'>('project')
+  const [reason, setReason] = useState('')
+  const [addCrit, setAddCrit] = useState('')
+  const [goalOverride, setGoalOverride] = useState('')
+  const { busy, run } = useAction()
+
+  const load = () => {
+    get<any>(`api/contracts/schedule/${encodeURIComponent(schedule.id)}`)
+      .then(res => { setData(res); setMissing(false) })
+      .catch(() => { setData(null); setMissing(true) })
+  }
+  useEffect(() => { load() }, [schedule.id]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const submitAmend = () => {
+    if (!reason.trim()) { toast('请填写修订原因或最新口径要求', true); return }
+    const addCriteria = addCrit.split(/\n+/).map(s => s.trim()).filter(Boolean)
+    run(async () => {
+      if (missing) {
+        await put(`api/contracts/schedule/${encodeURIComponent(schedule.id)}`, {
+          goal: goalOverride.trim() || String((schedule.actionConfig as any)?.prompt || schedule.name),
+          criteria: addCriteria,
+          amendmentScope: scope,
+          amendmentReason: reason.trim(),
+        })
+      } else {
+        await post(`api/contracts/schedule/${encodeURIComponent(schedule.id)}/amend`, {
+          scope,
+          reason: reason.trim(),
+          ...(goalOverride.trim() ? { goal: goalOverride.trim() } : {}),
+          ...(addCriteria.length ? { addCriteria } : {}),
+        })
+      }
+      setReason('')
+      setAddCrit('')
+      setGoalOverride('')
+      load()
+    }, '任务约定已升级并保留历史版本口径')
+  }
+
+  const cur = data?.item
+  return <Sheet title={`任务约定 · ${schedule.name}`} onClose={onClose}>
+    {cur ? <>
+      <div className="card" style={{ marginBottom: 12 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+          <b>当前生效版本：v{cur.version}</b>
+          <span className="pill">{cur.amendmentScope === 'preference' ? '长期偏好' : cur.amendmentScope === 'project' ? '后续周期生效' : '单次约定'}</span>
+        </div>
+        <p style={{ margin: '8px 0 6px' }}><b>目标：</b>{cur.goal}</p>
+        {cur.criteria?.length ? <div style={{ marginTop: 6 }}>
+          <b>逐项验收条件：</b>
+          <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+            {cur.criteria.map((c: any) => <li key={c.id}>{c.text} {c.required ? <span className="meta">(必选)</span> : <span className="meta">(可选)</span>}</li>)}
+          </ul>
+        </div> : null}
+        {cur.amendmentReason ? <p className="meta" style={{ margin: '8px 0 0' }}>最近修订说明：{cur.amendmentReason}</p> : null}
+      </div>
+
+      {data?.versions && data.versions.length > 1 && <details style={{ marginBottom: 12 }}>
+        <summary>历史口径版本（共 {data.versions.length} 版，历史周报保留当时依据）</summary>
+        <div className="list" style={{ marginTop: 8 }}>
+          {data.versions.map((v: any) => <div key={v.version} className="card" style={{ marginBottom: 6 }}>
+            <b>v{v.version}</b> <span className="meta">· {v.amendmentScope} · {fmtLocal(v.createdAt)}</span>
+            <p style={{ margin: '4px 0 0' }}>{v.goal}</p>
+            {v.amendmentReason && <p className="meta" style={{ margin: '2px 0 0' }}>原因：{v.amendmentReason}</p>}
+          </div>)}
+        </div>
+      </details>}
+    </> : missing ? <p className="meta">该定时计划尚未建立显式约定，首次运行或提交下方表单时会自动生成 v1 版本。</p> : <p className="meta">加载中…</p>}
+
+    <div className="card">
+      <b>修订后续口径（旧记录保留当时口径，下周期自动生效）</b>
+      <label className="field" style={{ marginTop: 8 }}><span>生效范围</span>
+        <select value={scope} onChange={e => setScope(e.target.value as 'project' | 'preference' | 'once')}>
+          <option value="project">后续周期自动沿用（推荐）</option>
+          <option value="preference">写入我的长期偏好（跨任务生效）</option>
+          <option value="once">仅本次临时调整</option>
+        </select>
+      </label>
+      <label className="field"><span>修订说明（必填）</span>
+        <input value={reason} onChange={e => setReason(e.target.value)} placeholder="例如：以后按付款日期统计，金额严格保留两位小数" />
+      </label>
+      <label className="field"><span>追加验收条件（每行一条，可选）</span>
+        <textarea rows={3} value={addCrit} onChange={e => setAddCrit(e.target.value)} placeholder="统计口径必须按付款日期 paid_at&#10;金额字段严格保留两位小数" />
+      </label>
+      <label className="field"><span>更新目标描述（留空沿用原目标）</span>
+        <input value={goalOverride} onChange={e => setGoalOverride(e.target.value)} placeholder="可选：更新总体目标描述" />
+      </label>
+      <div className="actions" style={{ marginTop: 10 }}>
+        <button onClick={onClose}>关闭</button>
+        <button className="primary" disabled={busy} onClick={submitAmend}>{busy ? '保存中…' : '保存新版本口径'}</button>
+      </div>
     </div>
   </Sheet>
 }

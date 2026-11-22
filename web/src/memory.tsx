@@ -5,7 +5,7 @@ import { useState } from 'react'
 import { del, get, post, put } from './api'
 import { ago, usePoll } from './hooks'
 import { Empty, Markdown, Sheet, Tabs, confirmAction, toast, useAction } from './ui'
-import type { MemoryKind, MemoryRecord, MemoryScope, PluginDescriptor, SkillRecord, SkillScope } from '../../src/shared/api-types.ts'
+import type { BenchmarkMetrics, MemoryKind, MemoryRecord, MemoryScope, PluginDescriptor, PluginProposalRecord, SkillRecord, SkillScope } from '../../src/shared/api-types.ts'
 
 const SCOPE_LABEL: Record<MemoryScope, string> = { user: '全局', project: '项目', ticket: '工单' }
 const KIND_LABEL: Record<MemoryKind, string> = {
@@ -39,6 +39,9 @@ export function MemoryPage() {
   const mems = usePoll<MemoryListApi>(memQuery, 15000)
   const skills = usePoll<{ items: SkillRecord[]; total: number }>(`api/skills?limit=100${q.trim() ? `&q=${encodeURIComponent(q.trim())}` : ''}`, 15000)
   const plugins = usePoll<{ items: PluginDescriptor[] }>('api/plugins', 30000)
+  const benches = usePoll<{ cases: { id: string; title: string; input: string }[]; runs: { id: string; suiteName: string; label: string; metrics: BenchmarkMetrics; createdAt: string }[] }>('api/evolution/benchmarks', 30000)
+  const proposals = usePoll<{ items: PluginProposalRecord[]; total: number }>('api/evolution/proposals', 30000)
+  const runners = usePoll<{ runners: { id: string; name: string; kind: string; zeroToken?: boolean; description?: string }[]; scripts: { id: string; description: string }[] }>('api/runners', 60000)
 
   const doRecall = () => {
     if (!recallQ.trim()) { setRecalled(null); return }
@@ -75,20 +78,54 @@ export function MemoryPage() {
       window.dispatchEvent(new Event('sa-plugins-changed'))
     }, pl.enabled ? `已停用插件「${pl.name}」` : `已启用插件「${pl.name}」`, plugins.reload)
 
+  const runCoreBenchmarks = () =>
+    run(
+      () => post('api/evolution/benchmarks/run', {}),
+      '核心基准评测已运行并记录',
+      benches.reload,
+    )
+
+  const approveProposal = async (p: PluginProposalRecord) => {
+    const riskNote = [
+      p.externalWritePermissions.length ? `外部写权限：${p.externalWritePermissions.join('、')}` : '',
+      p.irreversibleMigration ? '包含不可逆数据迁移' : '',
+    ].filter(Boolean).join('；')
+    if (!(await confirmAction(
+      `确认批准插件提案「${p.pluginName}」并启动独立分支研发？${riskNote ? `\n风险提示：${riskNote}` : ''}`,
+      { title: '批准插件演进提案', okLabel: '批准并派发' },
+    ))) return
+    run(
+      () => post(`api/evolution/proposals/${encodeURIComponent(p.id)}/approve`, { actorId: 'web:admin' }),
+      '已批准并启动独立分支研发',
+      proposals.reload,
+    )
+  }
+
+  const rejectProposal = async (p: PluginProposalRecord) => {
+    if (!(await confirmAction(`确认拒绝插件提案「${p.pluginName}」吗？`, { title: '拒绝提案', danger: true, okLabel: '拒绝' }))) return
+    run(
+      () => post(`api/evolution/proposals/${encodeURIComponent(p.id)}/reject`, {}),
+      '已拒绝提案',
+      proposals.reload,
+    )
+  }
+
   const stats = mems.d?.stats
 
   return <div className="page">
     <header className="phead">
       <div>
-        <h1>记忆与技能</h1>
-        <p className="phead__sub">三层长期记忆（自动召回 + 完工复盘）与可复用 SOP 技能库</p>
+        <h1>记忆与进化</h1>
+        <p className="phead__sub">三层长期记忆、可回退 SOP 技能库、基准评测指标、插件提案与本机多执行器</p>
       </div>
       <div className="actions">
         {tab === 'memories'
           ? <button className="primary" onClick={() => setEditMem({ scope: 'user', kind: 'preference', title: '', content: '', tags: [], pinned: false })}>新建记忆</button>
           : tab === 'skills'
             ? <button className="primary" onClick={() => setEditSkill({ name: '', slug: '', description: '', scope: 'both', triggers: [], tags: [], content: '', enabled: true })}>新建技能</button>
-            : null}
+            : tab === 'evolution'
+              ? <button className="primary" disabled={busy} onClick={runCoreBenchmarks}>{busy ? '评测中…' : '运行核心基准评测'}</button>
+              : null}
       </div>
     </header>
 
@@ -98,6 +135,8 @@ export function MemoryPage() {
       items={[
         ['memories', `长期记忆 (${stats?.total ?? mems.d?.total ?? 0})`],
         ['skills', `技能库 (${skills.d?.total ?? 0})`],
+        ['evolution', `进化与评测 (${benches.d?.runs?.length ?? 0})`],
+        ['runners', `本机执行器 (${runners.d?.runners?.length ?? 0})`],
         ['plugins', `子系统插件 (${plugins.d?.items?.length ?? 0})`],
       ]}
     />
@@ -204,8 +243,95 @@ export function MemoryPage() {
             </div>
             {sk.description && <p style={{ margin: '6px 0' }}>{sk.description}</p>}
             <p className="meta" style={{ margin: 0 }}>
-              触发词：{sk.triggers.length ? sk.triggers.join('、') : '未设置'} · 使用 {sk.useCount} 次 · 更新于 {ago(sk.updatedAt)}
+              触发词：{sk.triggers.length ? sk.triggers.join('、') : '未设置'}
+              {sk.preferredRunnerId ? ` · 优先执行器：${sk.preferredRunnerId}` : ''}
+              {' · '}使用 {sk.useCount} 次 · 更新于 {ago(sk.updatedAt)}
             </p>
+          </article>)}
+        </div>}
+    </>}
+
+    {tab === 'evolution' && <>
+      <div className="card" style={{ marginBottom: 12 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <div>
+            <b>核心典型任务评测基准</b>
+            <p className="meta" style={{ margin: '4px 0 0' }}>持续对比首次验收通过率、人工介入次数、每通过任务成本与验收后返工率</p>
+          </div>
+          <button className="primary" disabled={busy} onClick={runCoreBenchmarks}>{busy ? '评测中…' : '立即跑一轮基准'}</button>
+        </div>
+        {benches.d?.cases?.length ? <ul className="meta" style={{ margin: '8px 0 0', paddingLeft: 18 }}>
+          {benches.d.cases.map(c => <li key={c.id}><b>{c.title}</b>（{c.id}）</li>)}
+        </ul> : null}
+      </div>
+
+      {!benches.d?.runs?.length
+        ? <Empty>还没有评测记录。点击「立即跑一轮基准」建立当前基线，每次技能或策略更新后可横向对比。</Empty>
+        : <div className="list" style={{ marginBottom: 18 }}>
+          {benches.d.runs.map(r => <article key={r.id} className="card" style={{ marginBottom: 10 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+              <b>{r.label} <span className="meta">({r.suiteName})</span></b>
+              <span className="meta">{ago(r.createdAt)}</span>
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 8 }}>
+              <span className="pill">通过：{r.metrics.passedTasks}/{r.metrics.totalTasks}</span>
+              <span className="pill">首过率：{Math.round(r.metrics.firstPassAcceptanceRate * 100)}%</span>
+              <span className="pill">人工介入：{r.metrics.humanInterventions} 次</span>
+              <span className="pill">单通过成本：{r.metrics.costPerPassingTaskUsd !== null ? `$${r.metrics.costPerPassingTaskUsd.toFixed(4)}` : '—'}</span>
+              <span className="pill">验收后返工：{Math.round(r.metrics.postAcceptanceReworkRate * 100)}%</span>
+            </div>
+          </article>)}
+        </div>}
+
+      <h2 style={{ marginTop: 14 }}>插件自动演进提案</h2>
+      {!proposals.d?.items?.length
+        ? <Empty>暂无待处理的插件演进提案。当现有技能反复无法完成某类需求时，系统会自动登记缺口并在此发起研发与审批提案。</Empty>
+        : <div className="list">
+          {proposals.d.items.map(p => <article key={p.id} className="card" style={{ marginBottom: 10 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'flex-start', flexWrap: 'wrap' }}>
+              <div>
+                <span className="pill" style={{ marginRight: 6 }}>{p.status === 'pending_approval' ? '待主人审批' : p.status === 'dispatched' ? '已派发研发' : p.status === 'rejected' ? '已拒绝' : p.status}</span>
+                {p.requiresUserApproval && <span className="pill" style={{ marginRight: 6 }}>高风险审批门禁</span>}
+                <b>{p.pluginName}</b> <code className="meta">{p.gapKey}</code>
+              </div>
+              {p.status === 'pending_approval' && <div className="actions">
+                <button className="primary" disabled={busy} onClick={() => approveProposal(p)}>批准并启动研发</button>
+                <button className="danger" disabled={busy} onClick={() => rejectProposal(p)}>拒绝</button>
+              </div>}
+            </div>
+            <p style={{ margin: '6px 0' }}>{p.summary}</p>
+            <p className="meta" style={{ margin: 0 }}>
+              缺口累计 {p.occurrences} 次
+              {p.externalWritePermissions.length ? ` · 新增外部写权限：${p.externalWritePermissions.join('、')}` : ''}
+              {p.irreversibleMigration ? ' · 含不可逆迁移' : ''}
+              {p.approvedBy ? ` · 审批人：${p.approvedBy}` : ''}
+              {p.missionId ? <> · <a href="#/director">关联 DAG {p.missionId}</a></> : null}
+            </p>
+          </article>)}
+        </div>}
+    </>}
+
+    {tab === 'runners' && <>
+      <h2>已注册本机执行器</h2>
+      <div className="list" style={{ marginBottom: 16 }}>
+        {(runners.d?.runners || []).map(rn => <article key={rn.id} className="card" style={{ marginBottom: 10 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+            <div><b>{rn.name}</b> <code className="meta">{rn.id}</code></div>
+            <div className="actions">
+              <span className="pill">{rn.kind}</span>
+              {rn.zeroToken && <span className="pill">0 Token</span>}
+            </div>
+          </div>
+          {rn.description && <p className="meta" style={{ margin: '6px 0 0' }}>{rn.description}</p>}
+        </article>)}
+      </div>
+      <h2>已登记的 0 Token 确定性脚本</h2>
+      {!runners.d?.scripts?.length
+        ? <Empty>暂无已登记的确定性脚本。</Empty>
+        : <div className="list">
+          {runners.d.scripts.map(sc => <article key={sc.id} className="card" style={{ marginBottom: 8 }}>
+            <b><code className="mono">{sc.id}</code></b>
+            <p className="meta" style={{ margin: '4px 0 0' }}>{sc.description}</p>
           </article>)}
         </div>}
     </>}
@@ -307,6 +433,7 @@ function SkillEditor({ initial, onClose, onSaved }: { initial: Partial<SkillReco
   const [slug, setSlug] = useState(initial.slug || '')
   const [description, setDescription] = useState(initial.description || '')
   const [scope, setScope] = useState<SkillScope>(initial.scope || 'both')
+  const [preferredRunnerId, setPreferredRunnerId] = useState(initial.preferredRunnerId || '')
   const [triggersText, setTriggersText] = useState((initial.triggers || []).join(', '))
   const [content, setContent] = useState(initial.content || '')
   const [enabled, setEnabled] = useState(initial.enabled !== false)
@@ -323,6 +450,7 @@ function SkillEditor({ initial, onClose, onSaved }: { initial: Partial<SkillReco
       triggers,
       content: content.trim(),
       enabled,
+      preferredRunnerId: preferredRunnerId.trim() || null,
     }
     run(
       () => initial.id ? put(`api/skills/${encodeURIComponent(initial.id)}`, body) : post('api/skills', body),
@@ -343,6 +471,14 @@ function SkillEditor({ initial, onClose, onSaved }: { initial: Partial<SkillReco
         </select>
       </label>
     </div>
+    <label className="field"><span>命中时优先执行器（可选）</span>
+      <select value={preferredRunnerId} onChange={e => setPreferredRunnerId(e.target.value)}>
+        <option value="">跟随默认（Pi 沙箱代理）</option>
+        <option value="script">script（0 Token 确定性脚本）</option>
+        <option value="claude-code">claude-code（Claude Code CLI）</option>
+        <option value="opencode">opencode（OpenCode CLI）</option>
+      </select>
+    </label>
     <label className="field"><span>一句话简介</span><input value={description} onChange={e => setDescription(e.target.value)} placeholder="什么时候使用这个 SOP" /></label>
     <label className="field"><span>触发关键词（逗号分隔）</span><input value={triggersText} onChange={e => setTriggersText(e.target.value)} placeholder="部署, 上线, systemd" /></label>
     <label className="field"><span>SOP 步骤内容（支持 Markdown）</span><textarea rows={8} value={content} onChange={e => setContent(e.target.value)} placeholder="1. 先跑 pnpm check&#10;2. 检查 ..." /></label>

@@ -130,7 +130,17 @@ if [[ -n "${SA_PROJECT_DIR:-}" ]]; then
   [[ "$PROJECT_DIR" =~ ^"$PROJECTS_ROOT"/p_[A-Za-z0-9]{1,32}/tree$ ]] || { echo "pi-container.sh: refusing project dir $PROJECT_DIR" >&2; exit 2; }
   [[ -d "$PROJECT_DIR" && ! -L "$SA_PROJECT_DIR" ]] || { echo "pi-container.sh: project dir is not a directory" >&2; exit 2; }
   mkdir -p "$WORKSPACE/project"
-  PROJECT_ARGS=(--volume "$PROJECT_DIR:/workspace/project:rw")
+  PROJECT_ARGS+=(--volume "$PROJECT_DIR:/workspace/project:rw")
+fi
+
+# "worktree 隔离分支"模式：`<workspace>/project/.git` 指向主仓 `p_<id>/tree/.git/worktrees/...`，
+# 按同路径挂载主仓 `.git` 目录，使容器内 git status/diff/commit 正常工作，同时严格限定只允许白名单形状路径。
+if [[ -n "${SA_WORKTREE_GIT_DIR:-}" ]]; then
+  PROJECTS_ROOT="$(realpath -e "${SA_PROJECTS_ROOT:-$HOME/superagent-projects}")"
+  WT_GIT_DIR="$(realpath -e "$SA_WORKTREE_GIT_DIR")" || { echo "pi-container.sh: worktree git dir missing" >&2; exit 2; }
+  [[ "$WT_GIT_DIR" =~ ^"$PROJECTS_ROOT"/p_[A-Za-z0-9]{1,32}/tree/\.git$ ]] || { echo "pi-container.sh: refusing worktree git dir $WT_GIT_DIR" >&2; exit 2; }
+  [[ -d "$WT_GIT_DIR" && ! -L "$SA_WORKTREE_GIT_DIR" ]] || { echo "pi-container.sh: worktree git dir is not a directory" >&2; exit 2; }
+  PROJECT_ARGS+=(--volume "$WT_GIT_DIR:$WT_GIT_DIR:rw")
 fi
 
 exec podman run \

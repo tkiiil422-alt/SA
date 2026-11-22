@@ -32,6 +32,7 @@ import { RemoteStore } from '../remote/store.ts'
 import { RemoteNodeService } from '../remote/service.ts'
 import { createRemoteNodesPlugin } from '../remote/plugin.ts'
 import { SkillEvolutionService } from '../skills/evolution.ts'
+import { SkillAutoObserver } from '../skills/auto-observer.ts'
 import { PluginEvolutionService } from '../plugins/evolution.ts'
 import { BenchmarkStore } from '../eval/benchmarks.ts'
 import { createEvolutionPlugin } from '../eval/plugin.ts'
@@ -80,6 +81,7 @@ export interface CorePluginsBundle {
   readonly missions: MissionService
   readonly remoteNodes: RemoteNodeService
   readonly skillEvolution: SkillEvolutionService
+  readonly skillAutoObserver: SkillAutoObserver
   readonly pluginEvolution: PluginEvolutionService
   readonly benchmarks: BenchmarkStore
 }
@@ -146,6 +148,11 @@ export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle
     ...(opts.getGatewayUrl ? { gatewayUrl: opts.getGatewayUrl } : {}),
   })
   const skillEvolution = new SkillEvolutionService(skills)
+  const skillAutoObserver = new SkillAutoObserver({
+    skills,
+    evolution: skillEvolution,
+    events: opts.events,
+  })
   const pluginEvolution = new PluginEvolutionService({
     db: opts.db,
     missions,
@@ -226,11 +233,15 @@ export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle
 
   opts.plugins.register(createRemoteNodesPlugin(remoteNodes))
   opts.plugins.register(createEvolutionPlugin({
+    memories,
     skills,
     skillEvolution,
+    autoObserver: skillAutoObserver,
     pluginEvolution,
     benchmarks,
+    getTicketSummary: opts.getTicketSummary,
+    afterCommit: opts.afterCommit,
   }))
 
-  return { memories, skills, contracts, scheduler, runners, scriptRunner, missions, remoteNodes, skillEvolution, pluginEvolution, benchmarks }
+  return { memories, skills, contracts, scheduler, runners, scriptRunner, missions, remoteNodes, skillEvolution, skillAutoObserver, pluginEvolution, benchmarks }
 }

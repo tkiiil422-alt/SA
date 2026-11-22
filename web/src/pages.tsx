@@ -19,7 +19,13 @@ export function NewTask() {
   const [text, setText] = useState(() => localStorage.getItem('sa-next-draft') || '')
   const [model, setModel] = useState('')
   const [projectId, setProjectId] = useState(() => query().get('project') || '')
-  const [editOriginal, setEditOriginal] = useState(() => query().get('mode') === 'direct')
+  const [projectMode, setProjectMode] = useState<'worktree' | 'copy' | 'direct'>(() => {
+    const m = query().get('mode')
+    return m === 'direct' ? 'direct' : m === 'copy' ? 'copy' : 'worktree'
+  })
+  const [runnerId, setRunnerId] = useState('pi')
+  const [scriptId, setScriptId] = useState('')
+  const [scriptParamsText, setScriptParamsText] = useState('')
   const [secrets, setSecrets] = useState<Set<string>>(new Set())
   const [council, setCouncil] = useState(false)
   const [helpers, setHelpers] = useState(true)
@@ -27,12 +33,18 @@ export function NewTask() {
   const goalBody = goalPayload(goal)
   const models = usePoll<any>('api/models', 60000)
   const projects = usePoll<any>('api/projects', 60000)
+  const runners = usePoll<any>('api/runners', 60000)
   const allSecrets = usePoll<any>('api/secrets', 60000)
   const cset = usePoll<any>('api/settings/council', 600000)
   const collabSet = usePoll<any>('api/settings/collab', 600000)
   const { busy, run } = useAction()
   useEffect(() => { localStorage.setItem('sa-next-draft', text) }, [text])
   useEffect(() => { if (cset.d?.defaultOn) setCouncil(true) }, [cset.d])
+  useEffect(() => {
+    if (runnerId === 'script' && !scriptId && runners.d?.scripts?.length) {
+      setScriptId(runners.d.scripts[0].id)
+    }
+  }, [runnerId, scriptId, runners.d])
   const send = () => run(async () => {
     if (council) {
       const r = await post('api/councils', { mode: 'brief', text, autoStart: true, ...(projectId ? { projectId } : {}) })
@@ -40,17 +52,43 @@ export function NewTask() {
       location.hash = r?.id ? `#/councils/${encodeURIComponent(r.id)}` : '#/councils'
       return
     }
-    const r = await post('api/tickets', { text, ...(model ? { model } : {}), ...(projectId ? { projectId, ...(editOriginal ? { projectMode: 'direct' } : {}) } : {}), ...(secrets.size ? { secrets: [...secrets] } : {}), ...(collabSet.d?.enabled && !helpers ? { collab: false } : {}), ...(goalBody ? { goal: goalBody } : {}) })
+    let parsedScriptParams: Record<string, unknown> | undefined
+    if (runnerId === 'script' && scriptParamsText.trim()) {
+      try {
+        const obj = JSON.parse(scriptParamsText)
+        if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) {
+          toast('脚本参数必须是 JSON 对象，例如 {"mode":"paid"}', true)
+          return
+        }
+        parsedScriptParams = obj as Record<string, unknown>
+      } catch {
+        toast('脚本参数 JSON 格式有误，请检查括号与引号', true)
+        return
+      }
+    }
+    const r = await post('api/tickets', {
+      text,
+      ...(model ? { model } : {}),
+      ...(projectId ? { projectId, projectMode } : {}),
+      ...(runnerId && runnerId !== 'pi' ? { runnerId } : {}),
+      ...(runnerId === 'script' && scriptId ? { scriptId } : {}),
+      ...(runnerId === 'script' && parsedScriptParams ? { scriptParams: parsedScriptParams } : {}),
+      ...(secrets.size ? { secrets: [...secrets] } : {}),
+      ...(collabSet.d?.enabled && !helpers ? { collab: false } : {}),
+      ...(goalBody ? { goal: goalBody } : {}),
+    })
     localStorage.removeItem('sa-next-draft')
     const id = r?.ticketId ?? r?.id
     location.hash = id ? `#/tickets/${encodeURIComponent(id)}` : '#/tickets'
   }, council ? '会商已开始' : '已发出')
   const ready = (projects.d?.items || []).filter((p: any) => p.status === 'ready')
+  const runnerList: any[] = runners.d?.runners || [{ id: 'pi', name: 'Pi 沙箱代理（默认）' }]
+  const scriptList: any[] = runners.d?.scripts || []
   return <><h1>发任务</h1>
     <textarea className="big" rows={7} value={text} onChange={e => setText(e.target.value)} placeholder="想让它做什么？写清楚要什么结果。" autoFocus />
     <div className="grid2">
       <label className="field">执行模型
-        <select value={model} onChange={e => setModel(e.target.value)} disabled={council}>
+        <select value={model} onChange={e => setModel(e.target.value)} disabled={council || runnerId === 'script'}>
           <option value="">{models.d?.autoSelect === false ? `默认（${models.d?.default || ''}）` : '让它挑'}</option>
           {(models.d?.items || []).map((m: any) => <option key={m.ref} value={m.ref}>{m.label || m.ref}{m.providerName ? `（${m.providerName}）` : ''}</option>)}
         </select></label>
@@ -60,11 +98,32 @@ export function NewTask() {
           {ready.map((p: any) => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select></label>
     </div>
-    {projectId && !council && <label className="check"><input type="checkbox" checked={editOriginal} onChange={e => setEditOriginal(e.target.checked)} /> 直接修改项目原件（改动直接保存到项目库；开始前自动快照，可在项目页回滚。不勾选则在副本上改）</label>}
+    {!council && <div className="grid2">
+      <label className="field">执行器（本机）
+        <select value={runnerId} onChange={e => setRunnerId(e.target.value)}>
+          {runnerList.map((rn: any) => <option key={rn.id} value={rn.id}>{rn.name}{rn.zeroToken ? '（0 Token）' : ''}</option>)}
+        </select></label>
+      {projectId
+        ? <label className="field">项目工作模式
+          <select value={projectMode} onChange={e => setProjectMode(e.target.value as 'worktree' | 'copy' | 'direct')}>
+            <option value="worktree">Git 隔离分支（推荐：支持并行审查、返工与安全合并）</option>
+            <option value="copy">独立副本（不改动项目原件）</option>
+            <option value="direct">直接修改项目原件（自动快照，可回滚）</option>
+          </select></label>
+        : <div />}
+    </div>}
+    {!council && runnerId === 'script' && <div className="card" style={{ marginBottom: 12 }}>
+      <label className="field">已登记的确定性脚本（0 Token，仅允许白名单脚本 ID）
+        <select value={scriptId} onChange={e => setScriptId(e.target.value)}>
+          {scriptList.map((sc: any) => <option key={sc.id} value={sc.id}>{sc.id} — {sc.description}</option>)}
+        </select></label>
+      <label className="field">结构化 JSON 参数（可选）
+        <textarea rows={3} className="mono" value={scriptParamsText} onChange={e => setScriptParamsText(e.target.value)} placeholder='例如：{"inputFile":"project/sales.csv","dateField":"paid_at","decimals":2} 或 {"subDir":"."}' /></label>
+    </div>}
     {!!allSecrets.d?.items?.length && !council && <details className="field"><summary>可用密钥（{secrets.size}）</summary>
       {allSecrets.d.items.map((s: any) => <label key={s.name} className="check"><input type="checkbox" checked={secrets.has(s.name)} onChange={() => setSecrets(p => { const n = new Set(p); n.has(s.name) ? n.delete(s.name) : n.add(s.name); return n })} /><span className="mono">{s.name}</span><span className="meta">{s.description}</span></label>)}
     </details>}
-    {collabSet.d?.enabled && !council && <label className="check"><input type="checkbox" checked={helpers} onChange={e => setHelpers(e.target.checked)} /> 允许它在执行中叫别的模型帮忙（侦察、审查、顾问等，见「设置 → 协作」）</label>}
+    {collabSet.d?.enabled && !council && runnerId === 'pi' && <label className="check"><input type="checkbox" checked={helpers} onChange={e => setHelpers(e.target.checked)} /> 允许它在执行中叫别的模型帮忙（侦察、审查、顾问等，见「设置 → 协作」）</label>}
     {!council && <details className="field goalbox"><summary>设定目标：没达成就不停{goalBody ? '（已填写）' : ''}</summary>
       <GoalFields g={goal} set={patch => setGoal(x => ({ ...x, ...patch }))} /></details>}
     {cset.d?.enabled && <label className="check"><input type="checkbox" checked={council} onChange={e => setCouncil(e.target.checked)} /> 先让几个 AI 角色会商，出任务书后自动开工</label>}
@@ -106,7 +165,7 @@ export function Projects() {
       <span className="meta">{PSTATUS[p.status] || p.status} · {p.files ?? 0} 个文件 · {bytes(p.bytes)} · {ago(p.createdAt)}</span>
       {p.error && <span className="warn">{p.error}</span>}
       <span className="actions">
-        {p.status === 'ready' && <a className="btn" href={`#/new?project=${encodeURIComponent(p.id)}`}>用它发任务</a>}
+        {p.status === 'ready' && <a className="btn" href={`#/new?project=${encodeURIComponent(p.id)}&mode=worktree`}>隔离分支发任务</a>}
         {p.status === 'ready' && <a className="btn" href={`#/new?project=${encodeURIComponent(p.id)}&mode=direct`}>直接改原件</a>}
         <button className="ghost danger" disabled={busy} onClick={() => { if (confirm(`删除项目「${p.name}」？`)) run(() => del(`api/projects/${encodeURIComponent(p.id)}`), '已删除', reload) }}>删除</button>
       </span>

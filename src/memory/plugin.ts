@@ -65,6 +65,7 @@ const SkillCreateSchema = z.object({
   tags: z.array(z.string().trim().min(1).max(40)).max(20).default([]),
   content: z.string().trim().min(1, '请填写技能步骤内容').max(20_000),
   enabled: z.boolean().default(true),
+  preferredRunnerId: z.string().trim().max(40).nullable().optional(),
 }).strict()
 
 const SkillUpdateSchema = SkillCreateSchema.partial().strict()
@@ -245,6 +246,7 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
           tags: parsed.data.tags,
           content: redact(parsed.data.content),
           enabled: parsed.data.enabled,
+          ...(parsed.data.preferredRunnerId !== undefined ? { preferredRunnerId: parsed.data.preferredRunnerId } : {}),
         })
         try { events.add({ kind: 'skill.saved', level: 'info', text: `保存技能「${item.name}」(${item.slug})`, data: { id: item.id, slug: item.slug } }) } catch { /* ignore */ }
         sendJson(res, 200, { ok: true, item })
@@ -273,6 +275,7 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
             ...(parsed.data.tags !== undefined ? { tags: parsed.data.tags } : {}),
             ...(parsed.data.content !== undefined ? { content: redact(parsed.data.content) } : {}),
             ...(parsed.data.enabled !== undefined ? { enabled: parsed.data.enabled } : {}),
+            ...(parsed.data.preferredRunnerId !== undefined ? { preferredRunnerId: parsed.data.preferredRunnerId } : {}),
           })
           if (!item) { sendJson(res, 404, { error: 'not_found', message: '找不到这个技能。' }); return true }
           sendJson(res, 200, { ok: true, item })
@@ -401,6 +404,7 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
           tags: strArr(args.tags),
           content: redact(content),
           enabled: typeof args.enabled === 'boolean' ? args.enabled : true,
+          ...(args.preferredRunnerId !== undefined ? { preferredRunnerId: str(args.preferredRunnerId) || null } : {}),
         })
         return { ok: true, item }
       },
