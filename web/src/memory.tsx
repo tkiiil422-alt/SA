@@ -41,7 +41,7 @@ export function MemoryPage() {
   const plugins = usePoll<{ items: PluginDescriptor[] }>('api/plugins', 30000)
   const benches = usePoll<{ cases: { id: string; title: string; input: string }[]; runs: { id: string; suiteName: string; label: string; metrics: BenchmarkMetrics; createdAt: string }[] }>('api/evolution/benchmarks', 30000)
   const proposals = usePoll<{ items: PluginProposalRecord[]; total: number }>('api/evolution/proposals', 30000)
-  const runners = usePoll<{ runners: { id: string; name: string; kind: string; zeroToken?: boolean; description?: string }[]; scripts: { id: string; description: string }[] }>('api/runners', 60000)
+  const runners = usePoll<{ items: { id: string; name: string; kind: string; available: boolean; detail?: string }[]; scripts: { id: string; name?: string; description: string }[] }>('api/runners', 60000)
 
   const doRecall = () => {
     if (!recallQ.trim()) { setRecalled(null); return }
@@ -136,7 +136,7 @@ export function MemoryPage() {
         ['memories', `长期记忆 (${stats?.total ?? mems.d?.total ?? 0})`],
         ['skills', `技能库 (${skills.d?.total ?? 0})`],
         ['evolution', `进化与评测 (${benches.d?.runs?.length ?? 0})`],
-        ['runners', `本机执行器 (${runners.d?.runners?.length ?? 0})`],
+        ['runners', `本机执行器 (${runners.d?.items?.length ?? 0})`],
         ['plugins', `子系统插件 (${plugins.d?.items?.length ?? 0})`],
       ]}
     />
@@ -314,15 +314,16 @@ export function MemoryPage() {
     {tab === 'runners' && <>
       <h2>已注册本机执行器</h2>
       <div className="list" style={{ marginBottom: 16 }}>
-        {(runners.d?.runners || []).map(rn => <article key={rn.id} className="card" style={{ marginBottom: 10 }}>
+        {(runners.d?.items || []).map(rn => <article key={rn.id} className="card" style={{ marginBottom: 10, opacity: rn.available ? 1 : 0.65 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
             <div><b>{rn.name}</b> <code className="meta">{rn.id}</code></div>
             <div className="actions">
               <span className="pill">{rn.kind}</span>
-              {rn.zeroToken && <span className="pill">0 Token</span>}
+              {rn.kind === 'script' && <span className="pill">0 Token</span>}
+              <span className="pill">{rn.available ? '可用' : '未检测到 CLI'}</span>
             </div>
           </div>
-          {rn.description && <p className="meta" style={{ margin: '6px 0 0' }}>{rn.description}</p>}
+          {rn.detail && <p className="meta" style={{ margin: '6px 0 0' }}>{rn.detail}</p>}
         </article>)}
       </div>
       <h2>已登记的 0 Token 确定性脚本</h2>
@@ -330,7 +331,7 @@ export function MemoryPage() {
         ? <Empty>暂无已登记的确定性脚本。</Empty>
         : <div className="list">
           {runners.d.scripts.map(sc => <article key={sc.id} className="card" style={{ marginBottom: 8 }}>
-            <b><code className="mono">{sc.id}</code></b>
+            <b><code className="mono">{sc.id}</code>{sc.name ? ` · ${sc.name}` : ''}</b>
             <p className="meta" style={{ margin: '4px 0 0' }}>{sc.description}</p>
           </article>)}
         </div>}

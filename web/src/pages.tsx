@@ -82,7 +82,7 @@ export function NewTask() {
     location.hash = id ? `#/tickets/${encodeURIComponent(id)}` : '#/tickets'
   }, council ? '会商已开始' : '已发出')
   const ready = (projects.d?.items || []).filter((p: any) => p.status === 'ready')
-  const runnerList: any[] = runners.d?.runners || [{ id: 'pi', name: 'Pi 沙箱代理（默认）' }]
+  const runnerList: any[] = runners.d?.items || [{ id: 'pi', name: 'Pi 默认容器执行器', kind: 'agent', available: true }]
   const scriptList: any[] = runners.d?.scripts || []
   return <><h1>发任务</h1>
     <textarea className="big" rows={7} value={text} onChange={e => setText(e.target.value)} placeholder="想让它做什么？写清楚要什么结果。" autoFocus />
@@ -101,7 +101,7 @@ export function NewTask() {
     {!council && <div className="grid2">
       <label className="field">执行器（本机）
         <select value={runnerId} onChange={e => setRunnerId(e.target.value)}>
-          {runnerList.map((rn: any) => <option key={rn.id} value={rn.id}>{rn.name}{rn.zeroToken ? '（0 Token）' : ''}</option>)}
+          {runnerList.map((rn: any) => <option key={rn.id} value={rn.id} disabled={rn.available === false}>{rn.name}{rn.kind === 'script' ? '（0 Token）' : ''}{rn.available === false ? '（未安装）' : ''}</option>)}
         </select></label>
       {projectId
         ? <label className="field">项目工作模式
