@@ -1,23 +1,9 @@
 import { createContext, useContext, useEffect, useState } from 'react'
 import { API, get } from './api'
+import type { LiveBoardSnapshot, LiveRunningStep } from '../../src/shared/api-types.ts'
 
-export interface RunningStep {
-  id: string; summary: string; kind: string; at: string; tool?: string; status?: string; since?: string
-  model?: string
-  agents?: { role: string; name?: string; model?: string; state: string }[]
-}
-export interface Board {
-  now: string
-  paused: boolean
-  slots: { used: number; max: number; reservedForPerson?: number }
-  tickets: { open: number; running: number; needsPerson: number; endedToday: number }
-  usage: { todayUsd: number; todayCalls?: number; dailyBudgetUsd?: number }
-  upstream?: { ok: boolean; model?: string; provider?: string }
-  runningSteps: RunningStep[]
-  open: any[]
-  ended: any[]
-  alerts: { level: string; text: string; link?: string }[]
-}
+export type RunningStep = LiveRunningStep
+export type Board = LiveBoardSnapshot
 export interface Live { board?: Board; live: boolean; err: string; skew: number }
 
 /**

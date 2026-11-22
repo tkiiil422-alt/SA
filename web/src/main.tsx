@@ -152,7 +152,7 @@ function Today() {
           <div className="sechead"><h2>最近结束</h2><a className="sechead__note" href="#/tickets">全部任务</a></div>
           {b.ended.length ? <ul className="endlist">{b.ended.map(t => <li key={t.id}>
             <a href={link(t.id)}><Mark tone={toneOf(t)} /><span className="t">{t.title}</span>
-              <span className="w" data-tone={toneOf(t)}>{STATUS_WORD[t.outcome] || '已结束'}</span><span className="a">{ago(t.updatedAt)}</span></a>
+              <span className="w" data-tone={toneOf(t)}>{STATUS_WORD[t.outcome ?? ''] || '已结束'}</span><span className="a">{ago(t.updatedAt)}</span></a>
           </li>)}</ul> : <Empty>今天还没有结束的任务。</Empty>}
         </section>
       </div>

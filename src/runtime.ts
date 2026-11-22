@@ -1926,9 +1926,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     })
     syncWechat()
     const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity, novels, fanqie, piVersions, goals, devEnv, pentest, director })
-    const webRoot = join(dirname(fileURLToPath(import.meta.url)), 'admin', 'web')
-    // The new console is the default; SA_WEB=legacy puts the old one back at the root. The old one stays at /legacy/.
-    const legacyDefault = process.env.SA_WEB === 'legacy'
+    const consoleRoot = join(dirname(fileURLToPath(import.meta.url)), 'admin', 'web-next')
     // Public preview links sit outside `/api` too: the token is the credential, and the worker app has no session.
     const previewProxy = createPreviewProxy({
       store: previews,
@@ -1939,29 +1937,26 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     const adminServer = createAdminServer({
       api: adminApi,
       staticHandler: (() => {
-        const legacy = createStaticHandler(webRoot)
-        const next = createStaticHandler(join(dirname(fileURLToPath(import.meta.url)), 'admin', 'web-next'))
-        const mounted = (handler: typeof legacy, prefix: string, req: IncomingMessage, res: ServerResponse): boolean => {
+        const consoleHandler = createStaticHandler(consoleRoot)
+        const mounted = (prefix: string, req: IncomingMessage, res: ServerResponse): boolean => {
           const original = req.url
           req.url = (req.url ?? '/').slice(prefix.length) || '/'
-          try { return handler(req, res) } finally { req.url = original }
+          try { return consoleHandler(req, res) } finally { req.url = original }
         }
         return (req: IncomingMessage, res: ServerResponse): boolean => {
           const path = (req.url ?? '/').split('?')[0] ?? '/'
-          if (path === '/legacy') { res.writeHead(302, { location: 'legacy/' }); res.end(); return true }
-          if (path.startsWith('/legacy/')) return mounted(legacy, '/legacy', req, res)
-          // /next/ was the preview address of the new console; it is the default now.
-          if (path === '/next') { res.writeHead(302, { location: './' }); res.end(); return true }
-          if (path === '/next/') { res.writeHead(302, { location: '../' }); res.end(); return true }
-          if (path.startsWith('/next/')) return mounted(next, '/next', req, res)
-          return (legacyDefault ? legacy : next)(req, res)
+          // 统一使用新版 React 控制台；旧 /legacy 与 /next 入口做 302 跳转兼容历史书签。
+          if (path === '/legacy' || path === '/next') { res.writeHead(302, { location: './' }); res.end(); return true }
+          if (path === '/legacy/' || path === '/next/') { res.writeHead(302, { location: '../' }); res.end(); return true }
+          if (path.startsWith('/next/')) return mounted('/next', req, res)
+          return consoleHandler(req, res)
         }
       })(),
       // The Feishu and WeChat event callbacks sit outside `/api`: no login, each verifies its own signature/token.
       callbacks: async (req, res) => {
-        // A console mounted under /legacy/ or /next/ calls `api/...` relative to itself: route it to the one API.
-        const mount = /^\/(legacy|next)(\/api(?:\/|$|\?))/.exec(req.url ?? '')
-        if (mount) req.url = (req.url ?? '').slice(mount[1]!.length + 1)
+        // 兼容挂载在 /next/ 下的相对 API 路径。
+        const mount = /^\/next(\/api(?:\/|$|\?))/.exec(req.url ?? '')
+        if (mount) req.url = (req.url ?? '').slice(5)
         if (await previewProxy(req, res)) return true
         const url = new URL(req.url ?? '/', 'http://admin.invalid')
         if (url.pathname === '/feishu/events') {

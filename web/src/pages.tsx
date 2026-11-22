@@ -558,7 +558,6 @@ export function More({ onLogout }: { onLogout: () => void }) {
       {items.map(([k, n, h]) => <a className="menu__item" key={k} href={`#/${k}`}><Icon name={k} size={20} /><span><b>{n}</b><span className="meta">{h}</span></span><Icon name="chev" size={16} /></a>)}
     </section>)}
     <section className="menu"><h2>其他</h2>
-      <a className="menu__item" href="legacy/"><Icon name="server" size={20} /><span><b>旧版后台</b><span className="meta">需要时可以回去用</span></span><Icon name="chev" size={16} /></a>
       <button className="menu__item danger" onClick={onLogout}><Icon name="logout" size={20} /><span><b>退出登录</b></span></button>
     </section></>
 }
