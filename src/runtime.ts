@@ -1790,7 +1790,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         pendingSecrets.delete(trigger.id)
       }
       if (opts.projectId !== undefined) {
-        if (result.ticketId !== undefined) projects.bindTicket(result.ticketId, opts.projectId)
+        if (result.ticketId !== undefined) projects.bindTicket(result.ticketId, opts.projectId, opts.projectMode)
         else projects.clearPendingTrigger(trigger.id)
       }
       if (opts.novel !== undefined) {

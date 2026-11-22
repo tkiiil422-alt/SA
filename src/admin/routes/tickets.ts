@@ -508,16 +508,20 @@ export async function handleTicketsAndAuditRoutes(deps: AdminRouteDeps, { req, r
       : ticketStatusLabel(ticket)
     const council = councils?.forTicket(id)
     const contract = contracts?.get('ticket', id)
-    const deliverables = host.deliverables(id).map(d => ({ path: d.path, size: d.size, kind: d.kind }))
-    const receipt = goals?.buildReceipt(id, {
-      deliverables,
-      contractVersion: contract?.version ?? null,
-      ...(contract?.criteria ? { contractCriteria: contract.criteria } : {}),
-      needsPerson: Boolean(ticket.attention?.question),
-      ...(ticket.attention?.question ? { question: ticket.attention.question } : {}),
-      ended: ticket.status === 'ended',
-      ...(ticket.outcome ? { outcome: ticket.outcome } : {}),
-    })
+    let receipt
+    if (goals) {
+      let deliverables: { path: string; size?: number; kind?: string }[] = []
+      try { deliverables = host.deliverables(id).map(d => ({ path: d.path, size: d.size, kind: d.kind })) } catch { /* mock host */ }
+      receipt = goals.buildReceipt(id, {
+        deliverables,
+        contractVersion: contract?.version ?? null,
+        ...(contract?.criteria ? { contractCriteria: contract.criteria } : {}),
+        needsPerson: Boolean(ticket.attention?.question),
+        ...(ticket.attention?.question ? { question: ticket.attention.question } : {}),
+        ended: ticket.status === 'ended',
+        ...(ticket.outcome ? { outcome: ticket.outcome } : {}),
+      })
+    }
     sendJson(res, 200, {
       ...ticket,
       ...(council === undefined ? {} : { council }),
