@@ -37,7 +37,11 @@ import { readProjectProfile } from './council/profile.ts'
 import { createAdminApi } from './admin/api.ts'
 import { createRuntimeAdminHost } from './admin/runtime-host.ts'
 import { createConsoleServer, registerBuiltinDescriptors } from './runtime/console-server.ts'
+import { wireCorePlugins } from './runtime/plugin-wiring.ts'
 import { PluginRegistry } from './plugins/registry.ts'
+import type { MemoryStore } from './memory/store.ts'
+import type { SkillStore } from './skills/store.ts'
+import type { SchedulerService } from './scheduler/service.ts'
 import type { DomainEvent, Executor } from './core/index.ts'
 import type { Trigger } from './core/model.ts'
 import { allowedSender, assessmentOutcome, settingsPolicy } from './policy.ts'
@@ -132,6 +136,9 @@ export interface Runtime {
   readonly adminUrl: string
   readonly director: DirectorService
   readonly plugins: PluginRegistry
+  readonly memories: MemoryStore
+  readonly skills: SkillStore
+  readonly scheduler: SchedulerService
   ask(text: string, opts?: { model?: string }): Promise<AskResult>
   /** The intake both Feishu transports use, exposed so tests exercise the same continuation path. */
   feishuIntake(trigger: Trigger): void
@@ -736,8 +743,38 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       },
       onError: error => console.error(`superagentd: assessment failed: ${error instanceof Error ? error.message : String(error)}`),
     })
+    let adminHostRef: ReturnType<typeof createRuntimeAdminHost> | undefined
     const plugins = new PluginRegistry()
     registerBuiltinDescriptors(plugins, optionsStore)
+    const { memories, skills, scheduler } = wireCorePlugins({
+      db: repo.db,
+      stateDir,
+      plugins,
+      events,
+      redact: text => vault.redactSecrets(text),
+      isPaused: () => Boolean(settings.paused),
+      getAdminHost: () => adminHostRef,
+      getDirector: () => director,
+      getTicketSummary: ticketId => {
+        const t = repo.tickets.get(ticketId)
+        if (!t?.ended) return undefined
+        const summary = latestReport(t)?.summary ?? t.ended.reason ?? ''
+        const proj = projects.ticketProject(ticketId)
+        return {
+          title: t.title,
+          outcome: t.ended.outcome,
+          summary,
+          ...(proj ? { projectId: proj.id } : {}),
+        }
+      },
+      afterCommit: fn => repo.afterCommit(fn),
+      notifyAlert: async input => {
+        const opts = optionsStore.get()
+        if (opts.wechat.enabled) {
+          try { await wechat.sendNew({ title: input.title, text: input.text }) } catch { /* best effort */ }
+        }
+      },
+    })
     const policy = () => settingsPolicy(settings, composite)
     // Track budget-blocked notifications per ticket; reset on ticket end, budget settings change, or new day.
     const budgetNotified = new Set<string>()
@@ -1872,6 +1909,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         choices.set(ticket.origin.triggerId, { ...parsed, source: 'person', reason: '在任务里换了模型' })
       },
     })
+    adminHostRef = adminHost
     {
       const initialAllowed = [...optionsStore.get().wechat.allowedUsers]
       const boundUser = wechat.status().ilink?.userId
@@ -2018,6 +2056,9 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       adminUrl,
       director,
       plugins,
+      memories,
+      skills,
+      scheduler,
       ask,
       feishuIntake,
       ticket,
