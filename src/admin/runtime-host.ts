@@ -109,7 +109,7 @@ export interface RuntimeAdminDeps {
   /** The Source scope used when a policy change revalidates open mandates. */
   source: SourceScope
   /** Accept a sentence as a ticket, exactly like `sa ask`; `model` is an optional "provider/model" person choice. */
-  ask(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct'): Promise<CreateTicketResult>
+  ask(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree'): Promise<CreateTicketResult>
   /** Answer on the ticket's original thread as a person. */
   reply(ticketId: string, text: string): void
   /** Feishu connection test; absent when the runtime has no Feishu source. */
@@ -766,7 +766,7 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
       return deps.previews?.list(id) ?? []
     },
 
-    async createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct'): Promise<CreateTicketResult> {
+    async createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree'): Promise<CreateTicketResult> {
       // Validate before accepting: a bad name or an unready project must not leave a ticket behind.
       if (secrets !== undefined) {
         const missing = [...new Set(secrets)].filter(name => !deps.vault.has(name))

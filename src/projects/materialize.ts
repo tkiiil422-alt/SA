@@ -28,7 +28,7 @@ export interface MaterializeOptions {
 }
 
 /** Write `<workspace>/AGENTS.md` unless the workspace already has one (a person may have edited it). */
-export function writeAgentsFile(workspace: string, withProject: boolean, mode: 'copy' | 'direct' = 'copy'): void {
+export function writeAgentsFile(workspace: string, withProject: boolean, mode: 'copy' | 'direct' | 'worktree' = 'copy'): void {
   mkdirSync(workspace, { recursive: true, mode: 0o700 })
   const path = join(workspace, 'AGENTS.md')
   if (existsSync(path)) return

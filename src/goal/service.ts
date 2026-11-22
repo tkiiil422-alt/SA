@@ -120,6 +120,11 @@ export interface GoalDeps {
   event?(ticketId: string, level: 'info' | 'warn', text: string): void
   /** Tells a running worker something (a goal set or cancelled while it works). */
   notify?(ticketId: string, text: string): void
+  /**
+   * 模型阶梯升级钩子：当目标验收连续失败达到阈值（默认第 2 轮）时，
+   * 允许运行时自动切换至更强推理模型接管破局；返回 `{ from, to }` 表示升级成功。
+   */
+  escalateModel?(ticketId: string, round: number, reason: string): Promise<{ from: string; to: string } | undefined> | { from: string; to: string } | undefined
   now?: () => Date
 }
 
@@ -194,6 +199,8 @@ interface GoalState {
   checks: GoalCheck[]
   /** The question this goal asked when it last stopped; a reply answers it, though core keeps it open until a report. */
   asked?: string
+  /** 若因连续失败触发过模型自动阶梯升级，记录已升级到的模型 ref，避免反复重复切换。 */
+  escalatedTo?: string
 }
 interface Stored { triggerId: string; spec: GoalSpec; state: GoalState; ticket?: GoalTicket }
 
@@ -420,6 +427,21 @@ export class GoalService {
       return { action: 'replace', report: pause, reply: `目标检查没通过，并且${why}。任务已停下等人决定，不要再改动，等人回复。` }
     }
     this.push(state, check)
+    let escalationNote = ''
+    // 目标连续 2 轮检查未通过时，自动尝试升级至更强推理模型破局（每张工单至多自动升级一次）
+    if (state.rounds >= 2 && !state.escalatedTo && this.deps.escalateModel) {
+      try {
+        const escalated = await this.deps.escalateModel(ticketId, state.rounds, check.summary)
+        if (escalated && escalated.to !== escalated.from) {
+          state.escalatedTo = escalated.to
+          escalationNote = `\n\n[系统自动升级] 连续 ${state.rounds} 轮验收未通过，已自动将本工单升级切换至更强模型 ${escalated.to}（原模型 ${escalated.from}）接管破局。`
+          this.deps.step?.(ticketId, `模型自动升级：${escalated.from} → ${escalated.to}`, check.summary, 'done')
+          this.deps.event?.(ticketId, 'info', `目标连续 ${state.rounds} 轮未达成，自动升级模型：${escalated.from} → ${escalated.to}`)
+        }
+      } catch {
+        // 升级为尽力优化，失败不影响正常反馈流程
+      }
+    }
     this.write(current)
     this.deps.step?.(ticketId, `目标检查：没通过（第 ${state.rounds}/${state.roundCap} 轮）。${check.summary}`, this.detail(check), 'error')
     // Clearing the question this goal asked when it stopped: the person answered it by resuming the goal.
@@ -427,7 +449,7 @@ export class GoalService {
     return {
       action: 'replace',
       report: { state: 'progress', summary: clip(`目标检查没通过（第 ${state.rounds}/${state.roundCap} 轮）：${check.summary}`, 600), ...(stale ? { question: null } : {}) },
-      reply: this.feedback(spec, state, check),
+      reply: `${this.feedback(spec, state, check)}${escalationNote}`,
     }
   }
 

@@ -17,10 +17,11 @@ export interface MemoryPluginDeps {
   memories: MemoryStore
   skills: SkillStore
   redact: (text: string) => string
-  /** 根据 ticketId 查工单摘要信息（用于 `ticket.ended` 自动复盘沉淀）。 */
+  /** 根据 ticketId 查工单摘要、真实终态与目标验收状态（用于 `ticket.ended` 自动复盘沉淀）。 */
   getTicketSummary?: (ticketId: string) => {
     title: string
     outcome?: string
+    acceptanceStatus?: 'met' | 'unmet' | 'not_checked'
     summary?: string
     projectId?: string
   } | undefined
@@ -144,6 +145,40 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
         })
         try { events.add({ kind: 'memory.saved', level: 'info', text: `保存记忆「${item.title}」`, data: { id: item.id, scope: item.scope } }) } catch { /* ignore */ }
         sendJson(res, 200, { ok: true, item })
+        return true
+      }
+
+      const correctMatch = /^\/memories\/([^/]+)\/correct$/.exec(route)
+      if (correctMatch !== null && method === 'POST') {
+        const oldId = decodeSegment(correctMatch[1] ?? '')
+        if (!oldId) { sendJson(res, 400, { error: 'invalid_path', message: '记忆编号不合法。' }); return true }
+        const body = await parseJsonBody(req)
+        const parsed = z.object({
+          title: z.string().trim().min(1).max(160).optional(),
+          content: z.string().trim().min(1, '请填写纠正后的内容').max(8000),
+          scope: ScopeSchema.optional(),
+          kind: KindSchema.optional(),
+          projectId: z.string().trim().max(64).nullable().optional(),
+          tags: z.array(z.string().trim().min(1).max(40)).max(20).optional(),
+          pinned: z.boolean().optional(),
+          userFeedback: z.string().trim().max(1000).optional(),
+        }).strict().safeParse(body)
+        if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
+        try {
+          const item = memories.correct(oldId, {
+            ...(parsed.data.title ? { title: redact(parsed.data.title) } : {}),
+            content: redact(parsed.data.content),
+            ...(parsed.data.scope ? { scope: parsed.data.scope } : {}),
+            ...(parsed.data.kind ? { kind: parsed.data.kind } : {}),
+            ...(parsed.data.projectId !== undefined ? { projectId: parsed.data.projectId } : {}),
+            ...(parsed.data.tags ? { tags: parsed.data.tags } : {}),
+            ...(parsed.data.pinned !== undefined ? { pinned: parsed.data.pinned } : {}),
+            ...(parsed.data.userFeedback ? { userFeedback: redact(parsed.data.userFeedback) } : {}),
+          })
+          sendJson(res, 200, { ok: true, item })
+        } catch (error) {
+          sendJson(res, 404, { error: 'not_found', message: error instanceof Error ? error.message : String(error) })
+        }
         return true
       }
 
@@ -331,6 +366,22 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
         })
         if (!updated) throw new Error(`找不到记忆 ${id}`)
         return { ok: true, item: updated }
+      },
+      memory_correct: args => {
+        const oldId = str(args.oldId) || str(args.id)
+        const content = str(args.content)
+        if (!oldId || !content) throw new Error('memory_correct 需要提供 oldId 和纠正后的 content')
+        const item = memories.correct(oldId, {
+          ...(str(args.title) ? { title: redact(str(args.title)) } : {}),
+          content: redact(content),
+          ...(args.scope !== undefined ? { scope: parseScope(args.scope, 'user') } : {}),
+          ...(args.kind !== undefined ? { kind: parseKind(args.kind, 'preference') } : {}),
+          ...(args.tags !== undefined ? { tags: strArr(args.tags) } : {}),
+          ...(typeof args.pinned === 'boolean' ? { pinned: args.pinned } : {}),
+          ...(str(args.reason) ? { userFeedback: redact(str(args.reason)) } : {}),
+          source: 'director_correction',
+        })
+        return { ok: true, item }
       },
       memory_delete: args => {
         const id = str(args.id)
@@ -523,10 +574,29 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
       const runRetro = (): void => {
         const info = getTicketSummary(event.data.ticketId)
         if (!info) return
-        if (info.outcome === 'stopped' || info.outcome === 'abandoned') return
+        const outcome = info.outcome ?? 'closed'
+        // 人工主动停止的工单不产生复盘噪音
+        if (outcome === 'stopped') return
         const summary = redact((info.summary ?? '').trim())
         if (summary.length < 12) return
-        const outcomeLabel = info.outcome === 'failed' ? '失败教训' : '完工复盘'
+
+        // 严格按真实工单终态分类，绝不把 closed / dropped / failed 误标为 completed
+        const labelMap: Record<string, string> = {
+          completed: '完工复盘',
+          merged: '已合并复盘',
+          closed: '已关闭记录',
+          dropped: '已放弃教训',
+          failed: '失败教训',
+        }
+        const outcomeLabel = labelMap[outcome] ?? `结束记录(${outcome})`
+        const acceptanceStatus = info.acceptanceStatus ?? 'not_checked'
+        const isSuccess = outcome === 'completed' || outcome === 'merged'
+        const tags = [
+          `outcome:${outcome}`,
+          `acceptance:${acceptanceStatus}`,
+          ...(isSuccess ? ['completed'] : [outcome]),
+          'auto-retro',
+        ]
         memories.save({
           scope: info.projectId ? 'project' : 'ticket',
           kind: 'retro',
@@ -534,9 +604,12 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
           ticketId: event.data.ticketId,
           title: `${outcomeLabel}：${redact(info.title).slice(0, 120)}`,
           content: summary.slice(0, 1800),
-          tags: [info.outcome === 'failed' ? 'failed' : 'completed', 'auto-retro'],
-          confidence: info.outcome === 'failed' ? 0.8 : 0.75,
+          tags,
+          confidence: acceptanceStatus === 'met' ? 0.85 : isSuccess ? 0.72 : 0.65,
           source: 'auto_retro',
+          ticketOutcome: outcome,
+          acceptanceStatus,
+          evidence: [`ticket:${event.data.ticketId}`, `outcome:${outcome}`, `acceptance:${acceptanceStatus}`],
         })
       }
       if (afterCommit) afterCommit(runRetro)

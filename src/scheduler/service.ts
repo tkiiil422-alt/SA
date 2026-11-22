@@ -25,7 +25,7 @@ export interface SchedulerServiceDeps {
     text: string
     model?: string
     projectId?: string
-    projectMode?: 'copy' | 'direct'
+    projectMode?: 'copy' | 'direct' | 'worktree'
     collab?: boolean
     goal?: GoalSpec
   }) => Promise<{ ticketId?: string; triggerId: string }>
@@ -158,7 +158,7 @@ export class SchedulerService {
           text: `[定时任务：${schedule.name}]\n${prompt}`,
           ...(str(cfg.model) ? { model: str(cfg.model) } : {}),
           ...(str(cfg.projectId) ? { projectId: str(cfg.projectId) } : {}),
-          ...(cfg.projectMode === 'copy' || cfg.projectMode === 'direct' ? { projectMode: cfg.projectMode } : {}),
+          ...(cfg.projectMode === 'copy' || cfg.projectMode === 'direct' || cfg.projectMode === 'worktree' ? { projectMode: cfg.projectMode } : {}),
           ...(typeof cfg.collab === 'boolean' ? { collab: cfg.collab } : {}),
         })
         const summary = res.ticketId ? `已自动派发工单 ${res.ticketId}` : `已提交触发器 ${res.triggerId}`

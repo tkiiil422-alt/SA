@@ -7,7 +7,7 @@
  */
 
 /** The text written to `<workspace>/AGENTS.md`; `withProject` adds the project-specific rules. */
-export function agentsFileText(withProject: boolean, mode: 'copy' | 'direct' = 'copy'): string {
+export function agentsFileText(withProject: boolean, mode: 'copy' | 'direct' | 'worktree' = 'copy'): string {
   const lines: string[] = [
     '# 工作区约定',
     '',
@@ -21,6 +21,12 @@ export function agentsFileText(withProject: boolean, mode: 'copy' | 'direct' = '
       '  - 保留 `.git` 与提交历史，不要重写历史、不要删除 `.git`；不要在这里放临时文件、日志或测试产物（这些放 `/workspace/output/` 或 `/tmp`）。',
       '  - 平台在任务开始前已自动拍了快照，结束时会统计改动，需要时可以整体回滚；但仍然要谨慎操作。',
       '  - 交付总结里列出你修改/新增/删除的文件清单。',
+    )
+  } else if (withProject && mode === 'worktree') {
+    lines.push(
+      '- `/workspace/project/`：**独立隔离的 Git Worktree 分支**。你可以放心地在当前分支进行代码开发与测试，不会与其他并行工单互相干扰。',
+      '  - 保持改动最小、清晰、可审查；不要切换或强制重写主分支历史，不要删除 `.git`。',
+      '  - 任务结束后，主人可以在控制台直接查看彩色 Diff、提交行级审查意见，或一键合并回项目主分支。',
     )
   } else if (withProject) {
     lines.push(

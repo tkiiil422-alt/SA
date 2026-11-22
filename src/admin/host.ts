@@ -202,7 +202,7 @@ export interface TicketProjectView {
   name: string
   preparing: boolean
   /** `direct`: the ticket edits the project library's original files instead of a private copy. */
-  mode?: 'copy' | 'direct'
+  mode?: 'copy' | 'direct' | 'worktree'
 }
 
 /** One file under the ticket's workspace that the reader can show. */
@@ -579,7 +579,7 @@ export interface AdminHost {
    * `projectMode: 'direct'` mounts the project library's original tree instead (edits are saved to the library); only
    * one open ticket may edit the same project directly.
    */
-  createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct'): Promise<CreateTicketResult>
+  createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree'): Promise<CreateTicketResult>
 
   /** Every stored secret, metadata only, sorted by name. */
   listSecrets(): SecretListItemView[]

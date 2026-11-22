@@ -8,8 +8,10 @@
 import type { DatabaseSync, StatementSync } from 'node:sqlite'
 
 export type ProjectStatus = 'uploading' | 'extracting' | 'ready' | 'failed'
-/** How a ticket gets its project: `copy` = a private copy in the workspace; `direct` = the library tree itself is mounted. */
-export type ProjectMode = 'copy' | 'direct'
+/** 项目工作区挂载模式：`copy` 独立副本、`direct` 直接改原件、`worktree` Git 并发隔离分支。 */
+export type ProjectMode = 'copy' | 'direct' | 'worktree'
+
+const parseMode = (raw?: string): ProjectMode => (raw === 'direct' ? 'direct' : raw === 'worktree' ? 'worktree' : 'copy')
 
 export interface ProjectRecord {
   id: string
@@ -211,7 +213,7 @@ export class ProjectStore {
   pendingEntry(triggerIds: readonly string[]): { projectId: string; mode: ProjectMode } | undefined {
     for (const triggerId of triggerIds) {
       const row = this.selectPending.get(triggerId) as { project_id?: string; mode?: string } | undefined
-      if (row?.project_id !== undefined) return { projectId: row.project_id, mode: row.mode === 'direct' ? 'direct' : 'copy' }
+      if (row?.project_id !== undefined) return { projectId: row.project_id, mode: parseMode(row.mode) }
     }
     return undefined
   }
@@ -231,7 +233,7 @@ export class ProjectStore {
   ticketEntry(ticketId: string): { projectId: string; mode: ProjectMode } | undefined {
     const row = this.selectTicket.get(ticketId) as { project_id?: string; mode?: string } | undefined
     if (row?.project_id === undefined) return undefined
-    return { projectId: row.project_id, mode: row.mode === 'direct' ? 'direct' : 'copy' }
+    return { projectId: row.project_id, mode: parseMode(row.mode) }
   }
 
   /** Tickets that were launched with the library tree of this project mounted directly. */

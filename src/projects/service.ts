@@ -17,6 +17,8 @@ import { ProjectHistory, type ChangeSummary, type DeleteSnapshotResult, type Sna
 import { materializeProject, writeAgentsFile } from './materialize.ts'
 import { buildProfile, type ProjectProfile } from './profile.ts'
 import { ProjectStore, type ProjectMode, type ProjectRecord, type ProjectStatus } from './store.ts'
+import { inspectTicketDiff, mergeWorktreeBranch, prepareWorktree } from './worktree.ts'
+import type { TicketDiffResponse } from '../shared/api-types.ts'
 
 export type { ProjectMode } from './store.ts'
 export type { ChangeSummary, DeleteSnapshotResult, Snapshot } from './history.ts'
@@ -756,6 +758,31 @@ export class ProjectService {
       return { directTree: tree, ...(warning ? { warning } : {}) }
     }
 
+    if (mode === 'worktree') {
+      const existingWt = this.copies.get(ticketId)
+      if (existingWt !== undefined) {
+        await existingWt
+        return {}
+      }
+      let warning: string | undefined
+      const wtTask = (async (): Promise<void> => {
+        this.preparing.add(ticketId)
+        try {
+          const wt = await prepareWorktree(tree, workspace, ticketId)
+          if (!wt.usedWorktree) {
+            warning = wt.warning
+            await materializeProject(tree, workspace)
+          }
+        } finally {
+          this.preparing.delete(ticketId)
+          this.copies.delete(ticketId)
+        }
+      })()
+      this.copies.set(ticketId, wtTask)
+      await wtTask
+      return warning ? { warning } : {}
+    }
+
     // The same ticket can be launched again after an idle retirement; the project copy happens only once.
     const existing = this.copies.get(ticketId)
     if (existing !== undefined) {
@@ -951,6 +978,42 @@ export class ProjectService {
   /** Exposed for the smoke script: where extracted trees live. */
   projectDir(id: string): string {
     return join(this.root, id)
+  }
+
+  /** 读取工单工作区的实时 Git Diff（支持 worktree / copy / direct）。 */
+  async ticketDiff(ticketId: string): Promise<TicketDiffResponse> {
+    const entry = this.store.ticketEntry(ticketId)
+    const record = entry ? this.store.get(entry.projectId) : undefined
+    const projectDir = record ? this.treeRoot(record.id) : undefined
+    return inspectTicketDiff({
+      workspace: join(this.workspaceRoot, ticketId),
+      ticketId,
+      ...(projectDir ? { projectDir } : {}),
+      ...(entry?.mode ? { mode: entry.mode } : {}),
+      ...(record ? { projectId: record.id, projectName: record.name } : {}),
+    })
+  }
+
+  /** 将 `worktree` 模式工单的隔离分支安全合并回项目库原件（合并前自动快照）。 */
+  async mergeTicketWorktree(
+    ticketId: string,
+    isOpen: (id: string) => boolean,
+  ): Promise<{ ok: true; branch: string; mergedCommit: string; snapshot?: string } | { ok: false; message: string; conflicts?: string[] }> {
+    const entry = this.store.ticketEntry(ticketId)
+    if (!entry) throw new AdminError('not_found', '这张任务没有绑定项目库。', 404)
+    if (entry.mode !== 'worktree') throw new AdminError('invalid', '只有 worktree 隔离分支模式的任务支持一键合并。', 400)
+    const treeDir = this.treeRoot(entry.projectId)
+    if (!treeDir) throw new AdminError('not_found', '找不到对应的项目原件目录。', 404)
+    const busy = this.directTickets(entry.projectId).filter(isOpen)
+    if (busy.length > 0) {
+      throw new AdminError('conflict', `任务 ${busy.join('、')} 正在直接修改该项目原件，请待其结束后再合并。`, 409)
+    }
+    return mergeWorktreeBranch({
+      treeDir,
+      workspace: join(this.workspaceRoot, ticketId),
+      ticketId,
+      history: this.history(entry.projectId),
+    })
   }
 }
 

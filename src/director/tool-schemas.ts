@@ -93,7 +93,7 @@ export function buildDirectorToolDefinitions(plugins?: PluginRegistry): readonly
         properties: {
           prompt: { type: 'string', description: '整理后的清晰任务说明书与验收要求' },
           projectId: { type: 'string', description: '可选：项目库 ID（先经 projects_list 确认存在且就绪）' },
-          projectMode: { type: 'string', enum: ['copy', 'direct'], description: '可选：copy（默认）在项目副本上改，结果不回写项目库；direct 直接修改项目库原件（主人要求「直接改项目/改原件/改完保留」时使用，开始前自动快照可回滚，同一项目同时只能有一个 direct 任务）' },
+          projectMode: { type: 'string', enum: ['copy', 'direct', 'worktree'], description: '可选：copy（默认）副本模式；worktree 推荐用于同一仓库并行开发（秒级隔离分支，改完可审 Diff 并一键合并）；direct 直接改项目原件（同一项目同时只能有一个 direct 任务）' },
           model: { type: 'string', description: '可选：指定执行模型 ref（如 provider/model）' },
           collab: { type: 'boolean', description: '可选：是否开启工单内多模型协作，默认 true' },
           secrets: { type: 'array', items: { type: 'string' }, description: '可选：需授予该工单的已有密钥名称（触发二次确认）' },
