@@ -64,6 +64,17 @@ export function MemoryPage() {
     run(() => del(`api/skills/${encodeURIComponent(sk.id)}`), '已删除技能', skills.reload)
   }
 
+  const rollbackSkill = async (sk: SkillRecord) => {
+    if (!(await confirmAction(`确定将技能「${sk.name}」从 v${sk.activeVersion} 回退至 v${sk.previousVersion} 吗？`, { title: '回退技能版本', okLabel: '回退' }))) return
+    run(() => post(`api/evolution/skills/${encodeURIComponent(sk.id)}/rollback`, { reason: '控制台手动回退' }), '已回退至上一稳定版', skills.reload)
+  }
+
+  const togglePlugin = (pl: PluginDescriptor) =>
+    run(async () => {
+      await put(`api/plugins/${encodeURIComponent(pl.id)}`, { enabled: !pl.enabled })
+      window.dispatchEvent(new Event('sa-plugins-changed'))
+    }, pl.enabled ? `已停用插件「${pl.name}」` : `已启用插件「${pl.name}」`, plugins.reload)
+
   const stats = mems.d?.stats
 
   return <div className="page">
@@ -180,10 +191,12 @@ export function MemoryPage() {
               <div>
                 <span className="pill" style={{ marginRight: 6 }}>{SKILL_SCOPE_LABEL[sk.scope]}</span>
                 <span className="pill" style={{ marginRight: 6 }}>{sk.enabled ? '启用' : '停用'}</span>
+                <span className="pill" style={{ marginRight: 6 }}>v{sk.activeVersion ?? 1}</span>
                 <b>{sk.name}</b> <code className="meta">{sk.slug}</code>
               </div>
               <div className="actions">
                 <button onClick={() => setViewSkill(sk)}>查看全文</button>
+                {sk.previousVersion ? <button disabled={busy} onClick={() => rollbackSkill(sk)}>回退 v{sk.previousVersion}</button> : null}
                 <button disabled={busy} onClick={() => toggleSkill(sk)}>{sk.enabled ? '停用' : '启用'}</button>
                 <button disabled={busy} onClick={() => setEditSkill(sk)}>编辑</button>
                 <button className="danger" disabled={busy} onClick={() => removeSkill(sk)}>删除</button>
@@ -199,10 +212,13 @@ export function MemoryPage() {
 
     {tab === 'plugins' && <>
       <div className="list">
-        {(plugins.d?.items || []).map(pl => <article key={pl.id} className="card" style={{ marginBottom: 10 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        {(plugins.d?.items || []).map(pl => <article key={pl.id} className="card" style={{ marginBottom: 10, opacity: pl.enabled ? 1 : 0.65 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
             <div><b>{pl.name}</b> <code className="meta">{pl.id} v{pl.version}</code></div>
-            <span className="pill">{pl.enabled ? '已启用' : '未启用'}</span>
+            <div className="actions">
+              <span className="pill">{pl.enabled ? '已启用' : '已停用'}</span>
+              {pl.routesPrefix && <button disabled={busy} onClick={() => togglePlugin(pl)}>{pl.enabled ? '停用插件' : '启用插件'}</button>}
+            </div>
           </div>
           <p style={{ margin: '6px 0' }}>{pl.description}</p>
           <p className="meta" style={{ margin: 0 }}>

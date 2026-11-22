@@ -1,22 +1,25 @@
 import { createRoot } from 'react-dom/client'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
 import { API, get, post, put, del } from './api'
 import { usePoll, ago, money } from './hooks'
 import { useSteps, type Step } from './useSteps'
 import { LiveContext, useLive, useLiveSource, useTick, clock, secondsSince, type RunningStep } from './useLive'
 import { ToastHost, toast, useAction, Sheet, Empty, Tabs, bytes, DialogHost, ErrorBoundary, Markdown, confirmAction, promptAction, safeDecode, useTheme } from './ui'
 import * as P from './pages'
-import { Fanqie } from './fanqie'
-import { PiVersions } from './pi'
-import { DevEnv } from './devenv'
-import { Pentest } from './pentest'
-import { Defense } from './defense'
-import { Director } from './director'
-import { MemoryPage } from './memory'
-import { SchedulerPage } from './scheduler'
 import { Icon, Logo } from './icons'
 import { GoalCard, GoalSheet } from './goal'
+import { ContractCard, DeliveryReceiptCard, TicketDiffReviewPanel } from './ticket-review'
+import type { PluginDescriptor } from '../../src/shared/api-types.ts'
 import './style.css'
+
+const Fanqie = lazy(() => import('./fanqie').then(m => ({ default: m.Fanqie })))
+const PiVersions = lazy(() => import('./pi').then(m => ({ default: m.PiVersions })))
+const DevEnv = lazy(() => import('./devenv').then(m => ({ default: m.DevEnv })))
+const Pentest = lazy(() => import('./pentest').then(m => ({ default: m.Pentest })))
+const Defense = lazy(() => import('./defense').then(m => ({ default: m.Defense })))
+const Director = lazy(() => import('./director').then(m => ({ default: m.Director })))
+const MemoryPage = lazy(() => import('./memory').then(m => ({ default: m.MemoryPage })))
+const SchedulerPage = lazy(() => import('./scheduler').then(m => ({ default: m.SchedulerPage })))
 
 const useHash = () => {
   const [h, set] = useState(location.hash || '#/today')
@@ -442,9 +445,11 @@ function Detail({ id }: { id: string }) {
     {d?.attention?.question && <div className="ask"><b>等你回答</b><p>{d.attention.question}</p></div>}
     {d?.delivery && <p className="warn">结果没送达：{d.delivery.error}</p>}
     {d?.goal && <GoalCard id={id} goal={d.goal} ended={ended} onChange={reload} />}
-    <Tabs value={cur} onChange={setTab} items={[['steps', '过程'], ['result', '结果'], ['files', '文件'], ['council', '会商'], ['info', '信息']]} />
+    <Tabs value={cur} onChange={setTab} items={[['steps', '过程'], ['result', '结果与回执'], ['review', '代码审查'], ['files', '文件'], ['council', '会商'], ['info', '信息']]} />
     {cur === 'steps' && <StepList id={id} mainModel={d?.model?.label} active={!!d && d.status !== 'ended' && !d.attention} goalChecking={!!d?.goal?.checking} prompt={d?.prompt} inputs={d?.inputs} />}
     {cur === 'result' && <>
+      {d?.receipt && <DeliveryReceiptCard ticketId={id} receipt={d.receipt} />}
+      {d?.contract && <ContractCard ticketId={id} contract={d.contract} onUpdated={reload} />}
       {last ? <div className="card">
         <div className="headrow"><h2>最新报告 <small>{last.state} · {ago(last.at)}</small></h2>
           <button type="button" className="ghost small" onClick={() => setRawReport(v => !v)}>{rawReport ? '排版视图' : '原文'}</button></div>
@@ -454,6 +459,7 @@ function Detail({ id }: { id: string }) {
       {!!d?.previews?.length && <><h2>预览</h2>{d.previews.map((p: any) => <div className="row" key={p.port}><a href={p.url} target="_blank" rel="noopener">{p.title || `端口 ${p.port}`}</a><span className="meta">{p.active ? '在线' : '已停止（显示留存文件）'} · <button className="ghost small" onClick={() => navigator.clipboard?.writeText(p.url).then(() => toast('已复制'), () => toast('复制失败', true))}>复制链接</button></span></div>)}</>}
       {!!d?.links?.length && <><h2>链接</h2>{d.links.filter((l: any) => /^https?:\/\//.test(l.url)).map((l: any) => <a className="row" key={l.url} href={l.url} target="_blank" rel="noopener">{l.title || l.url}</a>)}</>}
     </>}
+    {cur === 'review' && <TicketDiffReviewPanel ticketId={id} onChanged={reload} />}
     {cur === 'files' && <Files id={id} />}
     {cur === 'council' && <CouncilPanel ticketId={id} current={d?.council} />}
     {cur === 'info' && d && <div className="card"><dl className="kvs">
@@ -517,7 +523,7 @@ function Login({ onDone }: { onDone: () => void }) {
   </form></main>
 }
 
-const PAGES: Record<string, () => JSX.Element> = {
+const PAGES: Record<string, React.ComponentType> = {
   new: P.NewTask, director: Director, projects: P.Projects, usage: P.Usage, events: P.Events, decisions: P.Decisions, system: P.System, pi: PiVersions, devenv: DevEnv,
   connections: P.Connections, secrets: P.Secrets, novels: P.Novels, settings: P.Settings, councils: P.Councils, fanqie: Fanqie, defense: Defense, pentest: Pentest,
   memory: MemoryPage, schedules: SchedulerPage,
@@ -587,9 +593,27 @@ function App() {
   return <Shell h={h} m={m} k={key} logout={logout} top={top} />
 }
 
+const NAV_PLUGIN_GUARD: Record<string, string> = {
+  schedules: 'scheduler',
+  memory: 'memory-skills',
+}
+
 function Shell({ h, m, k: key, logout, top }: { h: string; m: RegExpExecArray | null; k: string; logout: () => void; top: React.RefObject<HTMLElement> }) {
   const live = useLiveSource(true)
   const theme = useTheme()
+  const pluginsPoll = usePoll<{ items: PluginDescriptor[] }>('api/plugins', 30000)
+  useEffect(() => {
+    const onChanged = () => pluginsPoll.reload()
+    window.addEventListener('sa-plugins-changed', onChanged)
+    return () => window.removeEventListener('sa-plugins-changed', onChanged)
+  }, [pluginsPoll.reload])
+  const disabledPlugins = useMemo(() => {
+    const set = new Set<string>()
+    for (const p of pluginsPoll.d?.items ?? []) {
+      if (!p.enabled) set.add(p.id)
+    }
+    return set
+  }, [pluginsPoll.d])
   const [cmdOpen, setCmdOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(() => {
     try { return localStorage.getItem('sa-side-collapsed') === '1' } catch { return false }
@@ -629,7 +653,11 @@ function Shell({ h, m, k: key, logout, top }: { h: string; m: RegExpExecArray | 
           <button type="button" className="mbar__btn" aria-label={theme.dark ? '切到浅色' : '切到深色'} onClick={theme.cycle}><Icon name={theme.dark ? 'sun' : 'moon'} size={18} /></button>
         </div>
       </header>
-      <main ref={top} key={m ? 'd' + m[1] : h}>{m ? <Detail id={safeDecode(m[1]!)} /> : key === 'tickets' ? <Tickets /> : key === 'more' ? <P.More onLogout={logout} /> : Page ? <Page /> : <Today />}</main>
+      <main ref={top} key={m ? 'd' + m[1] : h}>
+        <Suspense fallback={<p className="meta">加载页面模块…</p>}>
+          {m ? <Detail id={safeDecode(m[1]!)} /> : key === 'tickets' ? <Tickets /> : key === 'more' ? <P.More onLogout={logout} /> : Page ? <Page /> : <Today />}
+        </Suspense>
+      </main>
       <nav className="tabs" aria-label="主导航">
         {TABS.map(([k, n]) => <a key={k} href={`#/${k}`} aria-current={k === 'more' ? inMore : cur(k)}><span className="tabs__ic"><Icon name={k} size={22} />{badge(k)}</span>{n}</a>)}
       </nav>
@@ -640,8 +668,12 @@ function Shell({ h, m, k: key, logout, top }: { h: string; m: RegExpExecArray | 
         </div>
         <a className="newtask" href="#/new" title="发任务"><Icon name="new" size={18} stroke={2.2} /><span>发任务</span></a>
         <button type="button" className="cmdbtn" onClick={() => setCmdOpen(true)} title="快速跳转 (Ctrl+K)"><Icon name="search" size={15} /><span>快速跳转</span><kbd>Ctrl K</kbd></button>
-        {SIDE_GROUPS.map(([g, items]) => <div className="navgroup" key={g}><span className="navgroup__h">{g}</span>
-          {items.map(([k, n]) => <a key={k} href={`#/${k}`} aria-current={cur(k)} title={n}><Icon name={k} /><span>{n}</span>{badge(k)}</a>)}</div>)}
+        {SIDE_GROUPS.map(([g, items]) => {
+          const visible = items.filter(([k]) => !NAV_PLUGIN_GUARD[k] || !disabledPlugins.has(NAV_PLUGIN_GUARD[k]!))
+          if (visible.length === 0) return null
+          return <div className="navgroup" key={g}><span className="navgroup__h">{g}</span>
+            {visible.map(([k, n]) => <a key={k} href={`#/${k}`} aria-current={cur(k)} title={n}><Icon name={k} /><span>{n}</span>{badge(k)}</a>)}</div>
+        })}
         <div className="side__foot">
           <span className="side__live" data-on={live.live}><i /><span>{liveWord}</span></span>
           <div className="side__footbtns">

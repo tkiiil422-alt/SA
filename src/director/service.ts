@@ -18,6 +18,7 @@ import { buildDirectorSystemPrompt } from './prompt.ts'
 import { redactPendingAction, redactToolCallArgs } from './settings-patch.ts'
 import { DirectorStore, type DirectorChannel, type DirectorFollowup, type DirectorMessage, type DirectorSession, type FollowupTriggerKind, type PendingAction, type SessionListItem } from './store.ts'
 import { DirectorToolExecutor, type DirectorToolsDeps } from './tools.ts'
+import type { DirectorProgressEvent } from '../shared/api-types.ts'
 
 export interface DirectorServiceDeps extends Omit<DirectorToolsDeps, 'store' | 'onAudit'> {
   store: DirectorStore
@@ -43,6 +44,8 @@ export interface DirectorChatInput {
   deliverToWechat?: boolean
   /** 内部使用：由任务/会商完成事件自动唤醒总控推进后续步骤。 */
   autoTrigger?: { eventKind: FollowupTriggerKind; targetId: string; followupIds?: string[] }
+  /** 实时流式思考与工具调用进度回调（供 SSE `/api/director/chat/stream` 消费）。 */
+  onProgress?: (ev: DirectorProgressEvent) => void
 }
 
 export interface DirectorToolAudit {
@@ -523,6 +526,14 @@ export class DirectorService {
       }
 
       const allowTools = step < maxSteps
+      if (step === 0) {
+        input.onProgress?.({ type: 'start', sessionId: session.id, model: resolved.ref })
+      }
+      input.onProgress?.({
+        type: 'thinking',
+        step: step + 1,
+        message: step === 0 ? '正在结合项目背景与长期偏好理解需求…' : `第 ${step + 1} 轮综合工具结果继续研判…`,
+      })
       const result = await this.doCallTool(resolved.target, {
         model: resolved.model,
         system: systemPrompt,
@@ -581,18 +592,37 @@ export class DirectorService {
       for (let i = 0; i < assistantCalls.length; i += 1) {
         const tc = assistantCalls[i]!
         const safeArgs = sanitizedCalls[i]!.arguments
+        const actName = typeof safeArgs.action === 'string' ? safeArgs.action : undefined
+        input.onProgress?.({
+          type: 'tool_start',
+          step: step + 1,
+          name: tc.name,
+          ...(actName ? { action: actName } : {}),
+          summary: `执行 ${tc.name}${actName ? `(${actName})` : ''}`,
+        })
         const t0 = Date.now()
         const runRes = await this.tools.run(tc.name, tc.arguments, {
           session: this.store.getSession(session.id) ?? session,
           confirmHighRisk: cfg.confirmHighRisk,
         })
         const ms = Date.now() - t0
+        const sum = safeSummary(runRes.output, 160)
+        input.onProgress?.({
+          type: 'tool_done',
+          step: step + 1,
+          name: tc.name,
+          ...(actName ? { action: actName } : {}),
+          ok: runRes.ok,
+          ms,
+          summary: sum,
+          ...(runRes.pendingActionId ? { pendingActionId: runRes.pendingActionId } : {}),
+        })
         toolsUsed.push({
           name: tc.name,
           args: safeArgs,
           ok: runRes.ok,
           ms,
-          summary: safeSummary(runRes.output, 160),
+          summary: sum,
           ...(runRes.pendingActionId ? { pendingActionId: runRes.pendingActionId } : {}),
         })
         this.store.addMessage({

@@ -3,7 +3,7 @@
  */
 import { z } from 'zod'
 import { AdminError } from '../host.ts'
-import { decodeSegment, invalid, issuesOf, parseJsonBody, sendJson } from '../http.ts'
+import { SECURITY_HEADERS, decodeSegment, invalid, issuesOf, parseJsonBody, sendJson } from '../http.ts'
 import type { DirectorService } from '../../director/service.ts'
 import type { AdminRouteDeps, AdminRouteRequest } from './types.ts'
 
@@ -68,6 +68,34 @@ export async function handleDirectorRoutes(deps: AdminRouteDeps, { req, res, url
     if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
     const resChat = await svc.chat(parsed.data)
     sendJson(res, 200, { ok: true, ...resChat })
+    return true
+  }
+  if (route === '/director/chat/stream' && method === 'POST') {
+    const svc = requireDirector(deps)
+    const parsed = DirectorChatSchema.safeParse(await parseJsonBody(req))
+    if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
+    res.writeHead(200, {
+      ...SECURITY_HEADERS,
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-store, no-transform',
+      'x-accel-buffering': 'no',
+      connection: 'keep-alive',
+    })
+    const writeEvent = (ev: unknown): void => {
+      if (res.writableEnded || res.destroyed) return
+      res.write(`event: progress\ndata: ${JSON.stringify(ev)}\n\n`)
+    }
+    try {
+      const resChat = await svc.chat({
+        ...parsed.data,
+        onProgress: ev => writeEvent(ev),
+      })
+      writeEvent({ type: 'done', result: { ok: true, ...resChat } })
+    } catch (error) {
+      writeEvent({ type: 'error', message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      if (!res.writableEnded) res.end()
+    }
     return true
   }
   if (route === '/director/actions' && method === 'GET') {

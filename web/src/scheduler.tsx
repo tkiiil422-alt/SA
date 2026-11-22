@@ -28,6 +28,26 @@ const STATUS_LABEL: Record<ScheduleRecord['lastStatus'], string> = {
   error: '失败',
 }
 
+const DISPATCH_LABEL: Record<ScheduleRunRecord['dispatchStatus'], string> = {
+  pending: '待派发',
+  dispatched: '已派发',
+  skipped: '已跳过',
+  failed: '派发失败',
+}
+const EXEC_LABEL: Record<ScheduleRunRecord['executionStatus'], string> = {
+  pending: '待执行',
+  running: '执行中',
+  succeeded: '已执行(成功)',
+  failed: '执行失败',
+  skipped: '已跳过',
+}
+const ACCEPT_LABEL: Record<ScheduleRunRecord['acceptanceStatus'], string> = {
+  not_required: '无需验收',
+  pending: '待验收',
+  passed: '已验收通过',
+  failed: '验收未通过',
+}
+
 function fmtLocal(iso: string | null): string {
   if (!iso) return '—'
   const d = new Date(iso)
@@ -119,11 +139,19 @@ export function SchedulerPage() {
         ? <Empty>还没有运行记录。</Empty>
         : <div className="list">
           {runsOf.runs.map(r => <div key={r.id} className="card" style={{ marginBottom: 8 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-              <b>{STATUS_LABEL[r.status]}</b>
+            <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
+              <div>
+                <b>{STATUS_LABEL[r.status]}</b>
+                {r.contractVersion ? <span className="pill" style={{ marginLeft: 6 }}>约定 v{r.contractVersion}</span> : null}
+              </div>
               <span className="meta">{fmtLocal(r.startedAt)}{r.durationMs !== null ? ` · ${r.durationMs}ms` : ''}</span>
             </div>
-            {r.summary && <p style={{ margin: '4px 0 0' }}>{r.summary}</p>}
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 6 }}>
+              <span className="pill">派发：{DISPATCH_LABEL[r.dispatchStatus] || r.dispatchStatus}</span>
+              <span className="pill">执行：{EXEC_LABEL[r.executionStatus] || r.executionStatus}</span>
+              <span className="pill">验收：{ACCEPT_LABEL[r.acceptanceStatus] || r.acceptanceStatus}</span>
+            </div>
+            {r.summary && <p style={{ margin: '6px 0 0' }}>{r.summary}</p>}
             {r.error && <p className="formerr" style={{ margin: '4px 0 0' }}>{r.error}</p>}
             {r.ticketId && <p style={{ margin: '4px 0 0' }}><a href={`#/tickets/${encodeURIComponent(r.ticketId)}`}>查看关联工单 {r.ticketId} →</a></p>}
           </div>)}
