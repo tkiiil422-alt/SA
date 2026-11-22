@@ -45,6 +45,8 @@ import type { SkillStore } from './skills/store.ts'
 import type { ContractStore } from './contracts/store.ts'
 import type { SchedulerService } from './scheduler/service.ts'
 import type { RunnerRegistry } from './executor/runner.ts'
+import type { MissionService } from './missions/service.ts'
+import type { RemoteNodeService } from './remote/service.ts'
 import type { DomainEvent, Executor } from './core/index.ts'
 import type { Trigger } from './core/model.ts'
 import { allowedSender, assessmentOutcome, settingsPolicy } from './policy.ts'
@@ -56,7 +58,7 @@ import { FanqieService } from './fanqie/service.ts'
 import { PiVersionService } from './executor/pi-versions.ts'
 import { DevEnvService } from './executor/dev-env.ts'
 import { CollabChoices, collabFile, splitAgentToken } from './executor/collab.ts'
-import { GoalService, type GoalSpec, type JudgeInput, type JudgeResult } from './goal/service.ts'
+import { GoalService, resolveGoal, type GoalSpec, type JudgeInput, type JudgeResult } from './goal/service.ts'
 import { WebSearchService, formatHits } from './web/search.ts'
 import { keySecretName, writeSshFiles } from './ssh/connections.ts'
 import { JUDGE_SYSTEM, judgeUser, parseVerdict } from './goal/judge.ts'
@@ -145,6 +147,8 @@ export interface Runtime {
   readonly scheduler: SchedulerService
   readonly goals: GoalService
   readonly runners: RunnerRegistry
+  readonly missions: MissionService
+  readonly remoteNodes: RemoteNodeService
   ask(text: string, opts?: { model?: string }): Promise<AskResult>
   /** The intake both Feishu transports use, exposed so tests exercise the same continuation path. */
   feishuIntake(trigger: Trigger): void
@@ -751,6 +755,33 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     })
     let adminHostRef: ReturnType<typeof createRuntimeAdminHost> | undefined
     let goalsRef: GoalService | undefined
+    let councilsRef: CouncilService | undefined
+    let gatewayUrlRef = ''
+    const ticketCommitSha = (ticketId: string): string | undefined => {
+      const wsProj = join(workspaceRoot, ticketId, 'project')
+      if (!existsSync(join(wsProj, '.git'))) return undefined
+      try {
+        const sha = execFileSync('git', ['-C', wsProj, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 3000, windowsHide: true }).trim()
+        return sha || undefined
+      } catch {
+        return undefined
+      }
+    }
+    const ticketHandoff = (ticketId: string) => {
+      const t = repo.tickets.get(ticketId)
+      if (!t) return undefined
+      const summary = latestReport(t)?.summary ?? t.ended?.reason ?? ''
+      const deliverables = adminHostRef?.deliverables(ticketId).map(d => d.path) ?? []
+      const commitSha = ticketCommitSha(ticketId)
+      return {
+        ticketId: t.id,
+        ended: t.ended !== undefined,
+        ...(t.ended ? { outcome: t.ended.outcome } : {}),
+        summary,
+        ...(deliverables.length > 0 ? { artifacts: deliverables } : {}),
+        ...(commitSha ? { commitSha } : {}),
+      }
+    }
     const createTicketPr = async (
       ticketId: string,
       input: { repo: string; head: string; base?: string; title: string; body: string },
@@ -796,23 +827,43 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     }
     const plugins = new PluginRegistry()
     registerBuiltinDescriptors(plugins, optionsStore)
-    const { memories, skills, contracts, scheduler, runners } = wireCorePlugins({
+    const { memories, skills, contracts, scheduler, runners, missions, remoteNodes } = wireCorePlugins({
       db: repo.db,
       stateDir,
       workspaceRoot,
       plugins,
+      ledger,
       events,
       redact: text => vault.redactSecrets(text),
       isPaused: () => Boolean(settings.paused),
       getAdminHost: () => adminHostRef,
       getDirector: () => director,
       getProjects: () => projects,
+      getCouncils: () => councilsRef,
       getGoals: () => goalsRef,
       getGoalDefaults: () => optionsStore.get().goal,
+      resolveGoalInput: raw => {
+        try {
+          if (typeof raw.text !== 'string' || !raw.text.trim()) return undefined
+          return resolveGoal(raw as unknown as Parameters<typeof resolveGoal>[0], optionsStore.get().goal)
+        } catch {
+          return undefined
+        }
+      },
+      getGatewayUrl: () => gatewayUrlRef,
       notifyTicket: (ticketId, text) => {
         try { engine.note(ticketId, text) } catch { /* ignore */ }
       },
       createTicketPr,
+      reconcileTicketByExecutionId: executionId => {
+        const marker = `[SA-EXEC-ID:${executionId}]`
+        for (const t of repo.tickets.list()) {
+          const orig = repo.triggers.get(t.origin.triggerId)
+          if (orig?.text.includes(marker)) return ticketHandoff(t.id)
+        }
+        return undefined
+      },
+      getTicketHandoff: ticketId => ticketHandoff(ticketId),
       getTicketSummary: ticketId => {
         const t = repo.tickets.get(ticketId)
         if (!t?.ended) return undefined
@@ -823,12 +874,16 @@ export async function createRuntime(config: Config): Promise<Runtime> {
           goalView?.status === 'met' ? 'met'
             : goalView ? 'unmet'
               : 'not_checked'
+        const deliverables = adminHostRef?.deliverables(ticketId).map(d => d.path) ?? []
+        const commitSha = ticketCommitSha(ticketId)
         return {
           title: t.title,
           outcome: t.ended.outcome,
           acceptanceStatus,
           summary,
           ...(proj ? { projectId: proj.id } : {}),
+          ...(deliverables.length > 0 ? { artifacts: deliverables } : {}),
+          ...(commitSha ? { commitSha } : {}),
         }
       },
       afterCommit: fn => repo.afterCommit(fn),
@@ -1089,6 +1144,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     cleanup.push(() => gateway.close())
     const gatewayPort = (await gateway.listen()).port
     const gatewayUrl = `http://127.0.0.1:${gatewayPort}`
+    gatewayUrlRef = gatewayUrl
 
     // Ticket goals: a goal must be reached before the ticket ends (see src/goal/service.ts). Acceptance commands run in the
     // worker's own container when workers run in containers, else in the ticket's workspace on this machine.
@@ -1911,6 +1967,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       onError: error => console.error(`superagentd: council failed: ${error instanceof Error ? error.message : String(error)}`),
     })
     cleanup.push(() => councils.close())
+    councilsRef = councils
 
     // Security & Defense workbench: engagements, structured findings, built-in safe scans, and AI playbooks.
     const pentest = new PentestService({
@@ -2137,6 +2194,8 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       scheduler,
       goals,
       runners,
+      missions,
+      remoteNodes,
       ask,
       feishuIntake,
       ticket,

@@ -1,9 +1,11 @@
 /**
- * DAG 任务计划与多步骤编排存储（SQLite `missions` + `mission_nodes`）。
+ * DAG 任务计划与多步骤编排存储（SQLite `missions` + `mission_nodes` + `mission_approvals`）。
  *
  * 支持：
  * - 任意有向无环图（DAG）节点依赖定义与严格环检测（DFS 三色染色）
- * - 节点级状态流转、上下游上下文传递、重试计数与审批卡点记录
+ * - 计划版本号（`planVersion`）、稳定执行 ID（`executionId`）供中断恢复防重复派单
+ * - 节点产出交接（实际文件路径 `artifacts` 与 Git 提交 `commitSha`）
+ * - 绑定真实操作人、节点与计划版本的幂等人工审批审计表（同一批准提交两次不重复触发）
  */
 import { randomBytes } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
@@ -40,6 +42,7 @@ interface MissionRow {
   title: string
   goal: string
   status: string
+  plan_version: number
   auto_start: number
   summary: string
   created_at: string
@@ -56,8 +59,14 @@ interface NodeRow {
   depends_on_json: string
   config_json: string
   status: string
+  execution_id: string | null
   ticket_id: string | null
   council_id: string | null
+  artifacts_json: string
+  commit_sha: string | null
+  approved_by: string | null
+  approved_plan_version: number | null
+  approval_idempotency_key: string | null
   output_summary: string
   error: string | null
   retries: number
@@ -70,7 +79,8 @@ function makeId(prefix: string): string {
   return `${prefix}_${randomBytes(5).toString('hex')}`
 }
 
-function parseJsonArray(raw: string): string[] {
+function parseJsonArray(raw: string | null | undefined): string[] {
+  if (!raw) return []
   try {
     const v = JSON.parse(raw)
     return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
@@ -99,8 +109,14 @@ function rowToNode(row: NodeRow): MissionNodeRecord {
     dependsOn: parseJsonArray(row.depends_on_json),
     config: parseJsonObj(row.config_json),
     status: row.status as MissionNodeStatus,
+    executionId: row.execution_id ?? null,
     ticketId: row.ticket_id,
     councilId: row.council_id,
+    artifacts: parseJsonArray(row.artifacts_json),
+    commitSha: row.commit_sha ?? null,
+    approvedBy: row.approved_by ?? null,
+    approvedPlanVersion: row.approved_plan_version ?? null,
+    approvalIdempotencyKey: row.approval_idempotency_key ?? null,
     outputSummary: row.output_summary,
     error: row.error,
     retries: row.retries,
@@ -135,7 +151,6 @@ export function validateMissionDag(nodes: readonly MissionNodeInput[]): void {
     }
   }
 
-  // 三色 DFS 环检测：0=未访问，1=访问中，2=已完成
   const color = new Map<string, 0 | 1 | 2>()
   const dfs = (k: string, path: string[]): void => {
     color.set(k, 1)
@@ -162,6 +177,7 @@ export class MissionStore {
         title TEXT NOT NULL,
         goal TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'draft',
+        plan_version INTEGER NOT NULL DEFAULT 1,
         auto_start INTEGER NOT NULL DEFAULT 1,
         summary TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
@@ -180,8 +196,14 @@ export class MissionStore {
         depends_on_json TEXT NOT NULL DEFAULT '[]',
         config_json TEXT NOT NULL DEFAULT '{}',
         status TEXT NOT NULL DEFAULT 'pending',
+        execution_id TEXT,
         ticket_id TEXT,
         council_id TEXT,
+        artifacts_json TEXT NOT NULL DEFAULT '[]',
+        commit_sha TEXT,
+        approved_by TEXT,
+        approved_plan_version INTEGER,
+        approval_idempotency_key TEXT,
         output_summary TEXT NOT NULL DEFAULT '',
         error TEXT,
         retries INTEGER NOT NULL DEFAULT 0,
@@ -193,7 +215,42 @@ export class MissionStore {
       CREATE INDEX IF NOT EXISTS idx_mission_nodes_mission ON mission_nodes(mission_id, order_index ASC);
       CREATE INDEX IF NOT EXISTS idx_mission_nodes_ticket ON mission_nodes(ticket_id);
       CREATE INDEX IF NOT EXISTS idx_mission_nodes_council ON mission_nodes(council_id);
+      CREATE INDEX IF NOT EXISTS idx_mission_nodes_exec ON mission_nodes(execution_id);
+
+      CREATE TABLE IF NOT EXISTS mission_approvals (
+        mission_id TEXT NOT NULL,
+        node_key TEXT NOT NULL,
+        plan_version INTEGER NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        approved_at TEXT NOT NULL,
+        PRIMARY KEY (mission_id, node_key, plan_version, idempotency_key)
+      );
     `)
+    this.ensureMigrations()
+  }
+
+  private ensureMigrations(): void {
+    const mCols = new Set(
+      (this.db.prepare('PRAGMA table_info(missions)').all() as unknown as { name: string }[]).map(c => c.name),
+    )
+    if (!mCols.has('plan_version')) {
+      this.db.exec('ALTER TABLE missions ADD COLUMN plan_version INTEGER NOT NULL DEFAULT 1')
+    }
+
+    const nCols = new Set(
+      (this.db.prepare('PRAGMA table_info(mission_nodes)').all() as unknown as { name: string }[]).map(c => c.name),
+    )
+    const addN = (name: string, ddl: string): void => {
+      if (!nCols.has(name)) this.db.exec(`ALTER TABLE mission_nodes ADD COLUMN ${ddl}`)
+    }
+    addN('execution_id', 'execution_id TEXT')
+    addN('artifacts_json', `artifacts_json TEXT NOT NULL DEFAULT '[]'`)
+    addN('commit_sha', 'commit_sha TEXT')
+    addN('approved_by', 'approved_by TEXT')
+    addN('approved_plan_version', 'approved_plan_version INTEGER')
+    addN('approval_idempotency_key', 'approval_idempotency_key TEXT')
   }
 
   private hydrate(row: MissionRow): MissionRecord {
@@ -206,6 +263,7 @@ export class MissionStore {
       title: row.title,
       goal: row.goal,
       status: row.status as MissionStatus,
+      planVersion: row.plan_version ?? 1,
       autoStart: row.auto_start === 1,
       summary: row.summary,
       createdAt: row.created_at,
@@ -227,15 +285,17 @@ export class MissionStore {
     const status: MissionStatus = autoStart ? 'running' : 'draft'
 
     this.db.prepare(`
-      INSERT INTO missions (id, session_id, title, goal, status, auto_start, summary, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, '', ?, ?)
+      INSERT INTO missions (id, session_id, title, goal, status, plan_version, auto_start, summary, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 1, ?, '', ?, ?)
     `).run(id, input.sessionId?.trim() || null, title, goal, status, autoStart ? 1 : 0, iso, iso)
 
     const insNode = this.db.prepare(`
       INSERT INTO mission_nodes (
         id, mission_id, node_key, title, kind, prompt, depends_on_json, config_json,
-        status, ticket_id, council_id, output_summary, error, retries, started_at, finished_at, order_index
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, '', NULL, 0, NULL, NULL, ?)
+        status, execution_id, ticket_id, council_id, artifacts_json, commit_sha,
+        approved_by, approved_plan_version, approval_idempotency_key,
+        output_summary, error, retries, started_at, finished_at, order_index
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, '[]', NULL, NULL, NULL, NULL, '', NULL, 0, NULL, NULL, ?)
     `)
 
     input.nodes.forEach((n, index) => {
@@ -276,6 +336,16 @@ export class MissionStore {
     return { items: rows.map(r => this.hydrate(r)), total: Number(totalRow.c) }
   }
 
+  /** 修订计划目标或版本时递增 `plan_version`，使旧版本未提交的审批自动失效。 */
+  bumpPlanVersion(id: string, nextGoal?: string, now = new Date()): MissionRecord | undefined {
+    const cur = this.get(id)
+    if (!cur) return undefined
+    this.db.prepare(`
+      UPDATE missions SET plan_version = plan_version + 1, goal = ?, updated_at = ? WHERE id = ?
+    `).run(nextGoal?.trim() || cur.goal, now.toISOString(), id)
+    return this.get(id)
+  }
+
   setMissionStatus(id: string, status: MissionStatus, summary?: string, now = new Date()): MissionRecord | undefined {
     const iso = now.toISOString()
     if (summary !== undefined) {
@@ -291,8 +361,14 @@ export class MissionStore {
     nodeKey: string,
     patch: {
       status?: MissionNodeStatus
+      executionId?: string | null
       ticketId?: string | null
       councilId?: string | null
+      artifacts?: string[]
+      commitSha?: string | null
+      approvedBy?: string | null
+      approvedPlanVersion?: number | null
+      approvalIdempotencyKey?: string | null
       outputSummary?: string
       error?: string | null
       incrementRetries?: boolean
@@ -305,8 +381,14 @@ export class MissionStore {
     if (!row) return undefined
     const cur = rowToNode(row)
     const status = patch.status ?? cur.status
+    const executionId = patch.executionId !== undefined ? patch.executionId : cur.executionId
     const ticketId = patch.ticketId !== undefined ? patch.ticketId : cur.ticketId
     const councilId = patch.councilId !== undefined ? patch.councilId : cur.councilId
+    const artifacts = patch.artifacts !== undefined ? patch.artifacts : cur.artifacts
+    const commitSha = patch.commitSha !== undefined ? patch.commitSha : cur.commitSha
+    const approvedBy = patch.approvedBy !== undefined ? patch.approvedBy : cur.approvedBy
+    const approvedPlanVersion = patch.approvedPlanVersion !== undefined ? patch.approvedPlanVersion : cur.approvedPlanVersion
+    const approvalIdempotencyKey = patch.approvalIdempotencyKey !== undefined ? patch.approvalIdempotencyKey : cur.approvalIdempotencyKey
     const outputSummary = patch.outputSummary !== undefined ? patch.outputSummary.slice(0, 4000) : cur.outputSummary
     const error = patch.error !== undefined ? (patch.error ? patch.error.slice(0, 1000) : null) : cur.error
     const retries = cur.retries + (patch.incrementRetries ? 1 : 0)
@@ -315,18 +397,86 @@ export class MissionStore {
 
     this.db.prepare(`
       UPDATE mission_nodes
-      SET status = ?, ticket_id = ?, council_id = ?, output_summary = ?, error = ?,
-          retries = ?, started_at = ?, finished_at = ?
+      SET status = ?, execution_id = ?, ticket_id = ?, council_id = ?, artifacts_json = ?, commit_sha = ?,
+          approved_by = ?, approved_plan_version = ?, approval_idempotency_key = ?,
+          output_summary = ?, error = ?, retries = ?, started_at = ?, finished_at = ?
       WHERE id = ?
-    `).run(status, ticketId, councilId, outputSummary, error, retries, startedAt, finishedAt, cur.id)
+    `).run(
+      status,
+      executionId,
+      ticketId,
+      councilId,
+      JSON.stringify(artifacts),
+      commitSha,
+      approvedBy,
+      approvedPlanVersion,
+      approvalIdempotencyKey,
+      outputSummary,
+      error,
+      retries,
+      startedAt,
+      finishedAt,
+      cur.id,
+    )
     this.db.prepare('UPDATE missions SET updated_at = ? WHERE id = ?').run(now.toISOString(), missionId)
 
     const updated = this.db.prepare('SELECT * FROM mission_nodes WHERE id = ?').get(cur.id) as NodeRow | undefined
     return updated ? rowToNode(updated) : undefined
   }
 
+  /** 原子记录幂等审批；若同一 `(missionId, nodeKey, planVersion, idempotencyKey)` 已存在，返回 `{ inserted: false }`。 */
+  recordApprovalIdempotent(input: {
+    missionId: string
+    nodeKey: string
+    planVersion: number
+    idempotencyKey: string
+    actorId: string
+    note: string
+    approvedAt: string
+  }): { inserted: boolean } {
+    const res = this.db.prepare(`
+      INSERT OR IGNORE INTO mission_approvals (
+        mission_id, node_key, plan_version, idempotency_key, actor_id, note, approved_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.missionId,
+      input.nodeKey,
+      input.planVersion,
+      input.idempotencyKey,
+      input.actorId,
+      input.note.slice(0, 600),
+      input.approvedAt,
+    )
+    return { inserted: Number(res.changes) > 0 }
+  }
+
+  listDispatchingOrRunningNodes(): { mission: MissionRecord; node: MissionNodeRecord }[] {
+    const rows = this.db.prepare(`
+      SELECT n.* FROM mission_nodes n
+      INNER JOIN missions m ON m.id = n.mission_id
+      WHERE m.status = 'running' AND n.status IN ('dispatching', 'running')
+      ORDER BY m.updated_at ASC, n.order_index ASC
+    `).all() as unknown as NodeRow[]
+    const out: { mission: MissionRecord; node: MissionNodeRecord }[] = []
+    for (const r of rows) {
+      const m = this.get(r.mission_id)
+      const n = m?.nodes.find(x => x.id === r.id)
+      if (m && n) out.push({ mission: m, node: n })
+    }
+    return out
+  }
+
   findNodeByTicket(ticketId: string): { mission: MissionRecord; node: MissionNodeRecord } | undefined {
     const row = this.db.prepare('SELECT * FROM mission_nodes WHERE ticket_id = ? LIMIT 1').get(ticketId) as NodeRow | undefined
+    if (!row) return undefined
+    const mission = this.get(row.mission_id)
+    if (!mission) return undefined
+    const node = mission.nodes.find(n => n.id === row.id)
+    return node ? { mission, node } : undefined
+  }
+
+  findNodeByExecutionId(executionId: string): { mission: MissionRecord; node: MissionNodeRecord } | undefined {
+    const row = this.db.prepare('SELECT * FROM mission_nodes WHERE execution_id = ? LIMIT 1').get(executionId) as NodeRow | undefined
     if (!row) return undefined
     const mission = this.get(row.mission_id)
     if (!mission) return undefined
@@ -347,6 +497,7 @@ export class MissionStore {
     const res = this.db.prepare('DELETE FROM missions WHERE id = ?').run(id)
     if (Number(res.changes) > 0) {
       this.db.prepare('DELETE FROM mission_nodes WHERE mission_id = ?').run(id)
+      this.db.prepare('DELETE FROM mission_approvals WHERE mission_id = ?').run(id)
       return true
     }
     return false

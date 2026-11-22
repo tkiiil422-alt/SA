@@ -9,8 +9,10 @@ import type { DatabaseSync } from 'node:sqlite'
 import type { AdminHost } from '../admin/host.ts'
 import type { DirectorService } from '../director/service.ts'
 import type { EventLog } from '../ledger/events.ts'
-import type { GoalService } from '../goal/service.ts'
+import type { Ledger } from '../ledger/ledger.ts'
+import type { GoalService, GoalSpec } from '../goal/service.ts'
 import type { ProjectService } from '../projects/service.ts'
+import type { CouncilService } from '../council/service.ts'
 import type { PluginRegistry } from '../plugins/registry.ts'
 import { MemoryStore } from '../memory/store.ts'
 import { SkillStore } from '../skills/store.ts'
@@ -23,28 +25,42 @@ import { createSchedulerPlugin } from '../scheduler/plugin.ts'
 import { PiRunnerDescriptor, RegisteredScriptRunner, RunnerRegistry } from '../executor/runner.ts'
 import { ClaudeCodeRunner, OpenCodeRunner } from '../executor/adapters.ts'
 import { createEngineeringFactoryPlugin } from '../verify/factory-plugin.ts'
+import { MissionStore } from '../missions/store.ts'
+import { MissionService, type TicketHandoffInfo } from '../missions/service.ts'
+import { createMissionsPlugin } from '../missions/plugin.ts'
+import { RemoteStore } from '../remote/store.ts'
+import { RemoteNodeService } from '../remote/service.ts'
+import { createRemoteNodesPlugin } from '../remote/plugin.ts'
 
 export interface WireCorePluginsOptions {
   db: DatabaseSync
   stateDir: string
   workspaceRoot: string
   plugins: PluginRegistry
+  ledger: Ledger
   events: EventLog
   redact: (text: string) => string
   isPaused: () => boolean
   getAdminHost: () => AdminHost | undefined
   getDirector: () => DirectorService | undefined
   getProjects?: () => ProjectService | undefined
+  getCouncils?: () => CouncilService | undefined
   getGoals?: () => Pick<GoalService, 'view' | 'set' | 'recordEvidence'> | undefined
   getGoalDefaults?: () => { maxRounds: number; maxUsd: number; maxHours: number }
+  resolveGoalInput?: (raw: Record<string, unknown>) => GoalSpec | undefined
+  getGatewayUrl?: () => string
   notifyTicket?: (ticketId: string, text: string) => void
   createTicketPr?: (ticketId: string, input: { repo: string; head: string; base?: string; title: string; body: string }) => Promise<{ ok: true; url: string; number: number } | { ok: false; message: string }>
+  reconcileTicketByExecutionId?: (executionId: string) => TicketHandoffInfo | undefined
+  getTicketHandoff?: (ticketId: string) => TicketHandoffInfo | undefined
   getTicketSummary: (ticketId: string) => {
     title: string
     outcome?: string
     acceptanceStatus?: 'met' | 'unmet' | 'not_checked'
     summary?: string
     projectId?: string
+    artifacts?: string[]
+    commitSha?: string
   } | undefined
   afterCommit: (fn: () => void) => void
   notifyAlert?: (input: { title: string; text: string }) => Promise<void>
@@ -57,6 +73,8 @@ export interface CorePluginsBundle {
   readonly scheduler: SchedulerService
   readonly runners: RunnerRegistry
   readonly scriptRunner: RegisteredScriptRunner
+  readonly missions: MissionService
+  readonly remoteNodes: RemoteNodeService
 }
 
 export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle {
@@ -70,6 +88,56 @@ export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle
     .register(scriptRunner)
     .register(new ClaudeCodeRunner())
     .register(new OpenCodeRunner())
+  const missionStore = new MissionStore(opts.db)
+  const missions = new MissionService({
+    store: missionStore,
+    events: opts.events,
+    dispatchTicket: async input => {
+      const host = opts.getAdminHost()
+      if (!host) throw new Error('控制台宿主尚未就绪')
+      return host.createTicket(input.text, input.model, undefined, input.projectId, input.collab, input.goal, input.projectMode)
+    },
+    ...(opts.reconcileTicketByExecutionId ? { reconcileTicketByExecutionId: opts.reconcileTicketByExecutionId } : {}),
+    ...(opts.getTicketHandoff ? { getTicketHandoff: opts.getTicketHandoff } : {}),
+    startCouncil: async input => {
+      const councils = opts.getCouncils?.()
+      if (!councils) throw new Error('会商模块未启用')
+      const created = councils.create({
+        mode: 'brief',
+        text: input.text,
+        ...(input.projectId ? { projectId: input.projectId } : {}),
+        ...(input.rounds ? { rounds: input.rounds } : {}),
+      })
+      return { id: created.id }
+    },
+    getCouncilStatus: councilId => {
+      const rec = opts.getCouncils?.()?.get(councilId)
+      if (!rec) return undefined
+      return { status: rec.status, ...(rec.brief ? { brief: rec.brief } : {}) }
+    },
+    runDirectorNode: async input => {
+      const director = opts.getDirector()
+      if (!director) throw new Error('总控助手尚未就绪')
+      const res = await director.chat({
+        text: input.prompt,
+        channel: 'web',
+        userId: 'mission-orchestrator',
+        ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      })
+      return { reply: res.reply }
+    },
+    ...(opts.resolveGoalInput ? { resolveGoalInput: opts.resolveGoalInput } : {}),
+    onError: error => console.error(`superagentd: mission error: ${error instanceof Error ? error.message : String(error)}`),
+  })
+  const remoteStore = new RemoteStore(opts.db)
+  const remoteNodes = new RemoteNodeService({
+    store: remoteStore,
+    ledger: opts.ledger,
+    events: opts.events,
+    stateDir: opts.stateDir,
+    workspaceRoot: opts.workspaceRoot,
+    ...(opts.getGatewayUrl ? { gatewayUrl: opts.getGatewayUrl } : {}),
+  })
 
   const scheduler = new SchedulerService({
     store: schedulerStore,
@@ -128,5 +196,22 @@ export function wireCorePlugins(opts: WireCorePluginsOptions): CorePluginsBundle
     ...(opts.createTicketPr ? { createTicketPr: opts.createTicketPr } : {}),
   }))
 
-  return { memories, skills, contracts, scheduler, runners, scriptRunner }
+  opts.plugins.register(createMissionsPlugin({
+    missions,
+    getTicketResult: ticketId => {
+      const info = opts.getTicketSummary(ticketId)
+      if (!info) return undefined
+      return {
+        outcome: info.outcome ?? 'closed',
+        summary: info.summary ?? '',
+        ...(info.artifacts ? { artifacts: info.artifacts } : {}),
+        ...(info.commitSha ? { commitSha: info.commitSha } : {}),
+      }
+    },
+    afterCommit: opts.afterCommit,
+  }))
+
+  opts.plugins.register(createRemoteNodesPlugin(remoteNodes))
+
+  return { memories, skills, contracts, scheduler, runners, scriptRunner, missions, remoteNodes }
 }

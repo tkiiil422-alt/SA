@@ -18,14 +18,13 @@ export interface FailureDiagnosis {
 }
 
 const NEED_INFO_PATTERNS = [
-  /缺少.*(凭据|密钥|token|密码|口令|账号|配置|权限|说明|前提)/i,
-  /需要.*(确认|澄清|提供|授权|明确|指定)/i,
-  /未提供.*(url|地址|账号|表结构|口径|需求)/i,
-  /(401|403|unauthorized|forbidden|invalid api key|missing .*secret|access denied)/i,
+  /(缺少|缺乏|未配置|未设置|未提供).*(凭据|密钥|key|token|密码|口令|账号|配置|权限|说明|前提|口径|需求|表结构|url|地址)/i,
+  /(请提供|需要|待确认).*(确认|澄清|提供|授权|明确|指定|凭据|密钥|token|密码|账号|口径)/i,
+  /(401|403|unauthorized|forbidden|invalid api[_ -]?key|missing .*(secret|api[_ -]?key|token|credential|password)|access denied)/i,
 ]
 
 const ENV_ERROR_PATTERNS = [
-  /command not found|not recognized as an internal|No such file or directory.*bin/i,
+  /command not found|not recognized as an internal|No such file or directory.*bin|ENOENT/i,
   /ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|network is unreachable|socket hang up/i,
   /Read-only file system|Permission denied|EACCES|ENOSPC|no space left/i,
   /ModuleNotFoundError|Cannot find package|ERR_MODULE_NOT_FOUND|Failed to download|pip.*error|apt-get/i,

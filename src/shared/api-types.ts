@@ -201,7 +201,7 @@ export type MissionStatus = 'draft' | 'running' | 'paused' | 'completed' | 'fail
 export type MissionNodeKind = 'ticket' | 'council' | 'director' | 'approval'
 
 /** 单个任务节点状态。 */
-export type MissionNodeStatus = 'pending' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'skipped' | 'cancelled'
+export type MissionNodeStatus = 'pending' | 'dispatching' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'skipped' | 'cancelled'
 
 export interface MissionNodeRecord {
   id: string
@@ -213,8 +213,20 @@ export interface MissionNodeRecord {
   dependsOn: string[]
   config: Record<string, unknown>
   status: MissionNodeStatus
+  /** 稳定执行 ID：派单前先落盘，用于进程中断后对账找回原工单/外部动作，防止重复执行。 */
+  executionId: string | null
   ticketId: string | null
   councilId: string | null
+  /** 节点实际产出的文件路径或产物引用（直接透传给下游节点）。 */
+  artifacts: string[]
+  /** 代码改动类节点的产出提交 SHA（透传给下游节点核对或合并）。 */
+  commitSha: string | null
+  /** 人工审批绑定的真实操作人身份。 */
+  approvedBy: string | null
+  /** 人工审批绑定的计划版本号。 */
+  approvedPlanVersion: number | null
+  /** 审批幂等键，防止重复提交触发二次执行。 */
+  approvalIdempotencyKey: string | null
   outputSummary: string
   error: string | null
   retries: number
@@ -229,11 +241,42 @@ export interface MissionRecord {
   title: string
   goal: string
   status: MissionStatus
+  planVersion: number
   autoStart: boolean
   summary: string
   createdAt: string
   updatedAt: string
   nodes: MissionNodeRecord[]
+}
+
+/** 远程执行节点与作业状态。 */
+export interface RemoteNodeRecord {
+  id: string
+  name: string
+  sshConnection: string | null
+  capabilities: string[]
+  status: 'online' | 'offline' | 'draining'
+  maxJobs: number
+  lastHeartbeatAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface RemoteJobRecord {
+  id: string
+  executionId: string
+  ticketId: string | null
+  nodeId: string | null
+  requiredCapabilities: string[]
+  payload: Record<string, unknown>
+  status: 'queued' | 'claimed' | 'running' | 'completed' | 'failed' | 'cancelled'
+  leaseUntil: string | null
+  artifacts: { path: string; sha256: string; bytes: number }[]
+  summary: string
+  error: string | null
+  attempts: number
+  createdAt: string
+  updatedAt: string
 }
 
 export interface MissionListResponse {
