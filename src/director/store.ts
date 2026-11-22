@@ -375,6 +375,79 @@ export class DirectorStore {
     }
   }
 
+  /** 删除单个总控会话及其全部关联消息、审批、工单绑定与自动续接记录。 */
+  deleteSession(sessionId: string): boolean {
+    return this.deleteSessions([sessionId]).length > 0
+  }
+
+  /** 批量删除多个总控会话并级联清理关联数据，返回实际被删除的会话 ID 列表。 */
+  deleteSessions(sessionIds: readonly string[]): string[] {
+    const uniqueIds = [...new Set(sessionIds.map(s => s.trim()).filter(Boolean))]
+    if (uniqueIds.length === 0) return []
+    const deleted: string[] = []
+    this.db.exec('BEGIN')
+    try {
+      const checkStmt = this.db.prepare('SELECT id FROM director_sessions WHERE id = ?')
+      const delMsgs = this.db.prepare('DELETE FROM director_messages WHERE session_id = ?')
+      const delActs = this.db.prepare('DELETE FROM director_pending_actions WHERE session_id = ?')
+      const delLinks = this.db.prepare('DELETE FROM director_ticket_links WHERE session_id = ?')
+      const delUndel = this.db.prepare('DELETE FROM director_undelivered WHERE session_id = ?')
+      const delFw = this.db.prepare('DELETE FROM director_followups WHERE session_id = ?')
+      const delSess = this.db.prepare('DELETE FROM director_sessions WHERE id = ?')
+      for (const id of uniqueIds) {
+        if (!checkStmt.get(id)) continue
+        delMsgs.run(id)
+        delActs.run(id)
+        delLinks.run(id)
+        delUndel.run(id)
+        delFw.run(id)
+        delSess.run(id)
+        deleted.push(id)
+      }
+      this.db.exec('COMMIT')
+    } catch (err) {
+      this.db.exec('ROLLBACK')
+      throw err
+    }
+    return deleted
+  }
+
+  /** 批量删除某会话下的指定消息 ID，同时自动清理随附的 tool 结果消息以避免上下文断裂。 */
+  deleteMessages(sessionId: string, messageIds: readonly number[]): number {
+    if (!this.getSession(sessionId)) return 0
+    const uniqueIds = [...new Set(messageIds.filter(n => Number.isInteger(n) && n > 0))]
+    if (uniqueIds.length === 0) return 0
+    let removed = 0
+    this.db.exec('BEGIN')
+    try {
+      const selStmt = this.db.prepare('SELECT id, tool_calls_json FROM director_messages WHERE session_id = ? AND id = ?')
+      const delById = this.db.prepare('DELETE FROM director_messages WHERE session_id = ? AND id = ?')
+      const delToolByCallId = this.db.prepare('DELETE FROM director_messages WHERE session_id = ? AND role = \'tool\' AND tool_call_id = ?')
+      const orphanCallIds = new Set<string>()
+      for (const mid of uniqueIds) {
+        const row = selStmt.get(sessionId, mid) as { id: number; tool_calls_json?: string } | undefined
+        if (!row) continue
+        const calls = parseToolCalls(row.tool_calls_json ?? '')
+        if (calls) {
+          for (const c of calls) {
+            if (c.id) orphanCallIds.add(c.id)
+          }
+        }
+        const res = delById.run(sessionId, mid)
+        removed += Number(res.changes ?? 0)
+      }
+      for (const callId of orphanCallIds) {
+        delToolByCallId.run(sessionId, callId)
+      }
+      this.db.prepare('UPDATE director_sessions SET updated_at = ? WHERE id = ?').run(this.now().toISOString(), sessionId)
+      this.db.exec('COMMIT')
+    } catch (err) {
+      this.db.exec('ROLLBACK')
+      throw err
+    }
+    return removed
+  }
+
   // --- 高危操作二次确认 ---
 
   createPendingAction(input: {

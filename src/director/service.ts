@@ -932,6 +932,28 @@ export class DirectorService {
     return true
   }
 
+  deleteSession(sessionId: string): boolean {
+    const res = this.deleteSessions([sessionId])
+    return res.deleted > 0
+  }
+
+  deleteSessions(sessionIds: readonly string[]): { deleted: number; ids: string[] } {
+    const ids = this.store.deleteSessions(sessionIds)
+    if (ids.length > 0) {
+      this.logEvent('director.sessions_deleted', 'info', `已删除 ${ids.length} 个总控对话会话`, { ids })
+    }
+    return { deleted: ids.length, ids }
+  }
+
+  deleteMessages(sessionId: string, messageIds: readonly number[]): { ok: boolean; deleted: number } {
+    if (!this.store.getSession(sessionId)) return { ok: false, deleted: 0 }
+    const deleted = this.store.deleteMessages(sessionId, messageIds)
+    if (deleted > 0) {
+      this.logEvent('director.messages_deleted', 'info', `已从会话 ${sessionId} 删除 ${deleted} 条对话记录`, { sessionId, deleted })
+    }
+    return { ok: true, deleted }
+  }
+
   listPendingActions(sessionId?: string, onlyPending = false): PendingAction[] {
     return this.store.listPendingActions(sessionId, onlyPending).map(redactPendingAction)
   }

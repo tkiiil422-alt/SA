@@ -18,6 +18,14 @@ const DirectorActionDecideSchema = z.object({
   decision: z.enum(['approve', 'reject']),
 }).strict()
 
+const DirectorBatchDeleteSessionsSchema = z.object({
+  ids: z.array(z.string().trim().min(1).max(200)).min(1, '请至少选择一个会话').max(200, '单次最多删除 200 个会话'),
+}).strict()
+
+const DirectorBatchDeleteMessagesSchema = z.object({
+  messageIds: z.array(z.number().int().positive()).min(1, '请至少选择一条消息').max(500, '单次最多删除 500 条消息'),
+}).strict()
+
 function requireDirector(deps: AdminRouteDeps): DirectorService {
   if (deps.director === undefined) throw new AdminError('not_found', '这台服务器没有启用总控助手。', 404)
   return deps.director
@@ -41,6 +49,26 @@ export async function handleDirectorRoutes(deps: AdminRouteDeps, { req, res, url
     })
     return true
   }
+  if (route === '/director/sessions/batch-delete' && method === 'POST') {
+    const parsed = DirectorBatchDeleteSessionsSchema.safeParse(await parseJsonBody(req))
+    if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
+    const out = requireDirector(deps).deleteSessions(parsed.data.ids)
+    sendJson(res, 200, { ok: true, ...out })
+    return true
+  }
+  const dirMsgBatchDelMatch = /^\/director\/sessions\/([^/]+)\/messages\/batch-delete$/.exec(route)
+  if (dirMsgBatchDelMatch !== null && method === 'POST') {
+    const sid = decodeSegment(dirMsgBatchDelMatch[1] ?? '')
+    const parsed = DirectorBatchDeleteMessagesSchema.safeParse(await parseJsonBody(req))
+    if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
+    const out = sid ? requireDirector(deps).deleteMessages(sid, parsed.data.messageIds) : { ok: false, deleted: 0 }
+    if (!out.ok) {
+      sendJson(res, 404, { error: 'not_found', message: '找不到这个总控会话。' })
+      return true
+    }
+    sendJson(res, 200, out)
+    return true
+  }
   const dirResetMatch = /^\/director\/sessions\/([^/]+)\/reset$/.exec(route)
   if (dirResetMatch !== null && method === 'POST') {
     const sid = decodeSegment(dirResetMatch[1] ?? '')
@@ -52,6 +80,15 @@ export async function handleDirectorRoutes(deps: AdminRouteDeps, { req, res, url
     return true
   }
   const dirSessionMatch = /^\/director\/sessions\/([^/]+)$/.exec(route)
+  if (dirSessionMatch !== null && method === 'DELETE') {
+    const sid = decodeSegment(dirSessionMatch[1] ?? '')
+    if (!sid || !requireDirector(deps).deleteSession(sid)) {
+      sendJson(res, 404, { error: 'not_found', message: '找不到这个总控会话。' })
+      return true
+    }
+    sendJson(res, 200, { ok: true, id: sid })
+    return true
+  }
   if (dirSessionMatch !== null && method === 'GET') {
     const sid = decodeSegment(dirSessionMatch[1] ?? '')
     const detail = sid ? requireDirector(deps).getSessionDetail(sid) : undefined

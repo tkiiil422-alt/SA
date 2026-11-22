@@ -286,4 +286,63 @@ describe('Director V2.4 能力全面升级', () => {
     expect(aborted.reply).toContain('中止')
     deps.db.close()
   })
+
+  it('支持批量删除多个会话（级联清理全部关联表）与批量删除单会话内多条消息（自动清理关联 tool 消息）', async () => {
+    const deps = makeDeps()
+    const svc = new DirectorService({
+      host: deps.host,
+      options: deps.options,
+      ledger: deps.ledger,
+      events: deps.events,
+      store: deps.store,
+      goals: deps.goals,
+      contracts: deps.contracts,
+      plugins: deps.plugins,
+      redact: s => s,
+    })
+
+    const s1 = deps.store.getOrCreateSession('web', 'u_del_1')
+    const s2 = deps.store.getOrCreateSession('web', 'u_del_2')
+    const sKeep = deps.store.getOrCreateSession('web', 'u_keep')
+
+    deps.store.addMessage({ sessionId: s1.id, role: 'user', content: 's1 msg' })
+    deps.store.createPendingAction({ sessionId: s1.id, toolName: 'host_ops', args: {}, summary: 'test' })
+    deps.store.linkTicket('tk_1', s1)
+    deps.store.addUndelivered(s1, 'offline')
+    deps.store.createFollowup({ sessionId: s1.id, triggerKind: 'ticket.ended', targetId: 'tk_1', instruction: 'next' })
+
+    deps.store.addMessage({ sessionId: s2.id, role: 'user', content: 's2 msg' })
+
+    const mUser = deps.store.addMessage({ sessionId: sKeep.id, role: 'user', content: '保留对话第 1 条' })
+    const mAsstTool = deps.store.addMessage({
+      sessionId: sKeep.id,
+      role: 'assistant',
+      content: '查一下',
+      toolCalls: [{ id: 'tc_del_1', name: 'platform_query', arguments: { action: 'overview' } }],
+    })
+    deps.store.addMessage({ sessionId: sKeep.id, role: 'tool', content: '{"ok":true}', toolCallId: 'tc_del_1', toolName: 'platform_query' })
+    const mKeepFinal = deps.store.addMessage({ sessionId: sKeep.id, role: 'assistant', content: '保留这条最终回复' })
+
+    // 1. 批量删除 s1 与 s2
+    const batchRes = svc.deleteSessions([s1.id, s2.id, 'nonexistent_id'])
+    expect(batchRes.deleted).toBe(2)
+    expect(batchRes.ids).toEqual([s1.id, s2.id])
+    expect(deps.store.listSessions().map(s => s.id)).toEqual([sKeep.id])
+    expect(deps.store.recentMessages(s1.id)).toHaveLength(0)
+    expect(deps.store.listPendingActions(s1.id)).toHaveLength(0)
+    expect(deps.store.listFollowups(s1.id)).toHaveLength(0)
+    expect(deps.store.takeUndelivered(s1.id)).toHaveLength(0)
+
+    // 2. 在保留会话内批量删除用户消息与带 toolCalls 的助手消息，验证关联 tool 结果同步清理且最终回复保留
+    const delMsgsRes = svc.deleteMessages(sKeep.id, [mUser.id, mAsstTool.id])
+    expect(delMsgsRes).toEqual({ ok: true, deleted: 2 })
+    const remaining = deps.store.recentMessages(sKeep.id)
+    expect(remaining.map(m => m.id)).toEqual([mKeepFinal.id])
+
+    // 3. 单个删除最后一个会话
+    expect(svc.deleteSession(sKeep.id)).toBe(true)
+    expect(svc.deleteSession(sKeep.id)).toBe(false)
+    expect(deps.store.listSessions()).toHaveLength(0)
+    deps.db.close()
+  })
 })

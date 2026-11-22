@@ -5,8 +5,8 @@
  * - 流式 SSE 思考与工具调用实时进度（`POST /api/director/chat/stream`）+ 支持中途停止（AbortController）
  * - 实时 DAG 任务计划编排与幂等审批、高危操作二次确认与自动续接管理
  */
-import { useEffect, useRef, useState } from 'react'
-import { API, get, post } from './api'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { API, del, get, post } from './api'
 import { usePoll, ago, money } from './hooks'
 import { useLive } from './useLive'
 import { Icon } from './icons'
@@ -172,6 +172,11 @@ export function Director() {
   const [strategy, setStrategy] = useState<'auto' | 'plan_first' | 'council_first'>('auto')
   const [requireVerify, setRequireVerify] = useState(true)
   const [showOps, setShowOps] = useState(true)
+  // 会话列表与单会话消息的批量管理状态
+  const [manageSessions, setManageSessions] = useState(false)
+  const [pickedSessions, setPickedSessions] = useState<string[]>([])
+  const [manageMsgs, setManageMsgs] = useState(false)
+  const [pickedMsgIds, setPickedMsgIds] = useState<number[]>([])
 
   const { busy, run } = useAction()
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -192,11 +197,33 @@ export function Director() {
   const activeMissionsCount = missions.filter(m => m.status === 'running' || m.status === 'draft').length
 
   useEffect(() => {
+    if (selectedId && items.length > 0 && !items.some(s => s.id === selectedId)) {
+      const next = items.find(s => s.channel === 'web') ?? items[0]!
+      setSelectedId(next.id)
+      return
+    }
+    if (selectedId && sessionsPoll.d && items.length === 0) {
+      setSelectedId('')
+      setDetail(null)
+      return
+    }
     if (!selectedId && items.length > 0) {
       const preferred = items.find(s => s.channel === 'web') ?? items.find(s => s.channel === 'wechat') ?? items[0]!
       setSelectedId(preferred.id)
     }
-  }, [items, selectedId])
+  }, [items, selectedId, sessionsPoll.d])
+
+  useEffect(() => {
+    if (pickedSessions.length === 0) return
+    const valid = new Set(items.map(s => s.id))
+    const next = pickedSessions.filter(id => valid.has(id))
+    if (next.length !== pickedSessions.length) setPickedSessions(next)
+  }, [items, pickedSessions])
+
+  useEffect(() => {
+    setManageMsgs(false)
+    setPickedMsgIds([])
+  }, [selectedId])
 
   const loadDetail = async (sid: string) => {
     if (!sid) { setDetail(null); return }
@@ -385,6 +412,73 @@ export function Director() {
     })
   }
 
+  const toggleSessionPick = (id: string) => {
+    setPickedSessions(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id])
+  }
+
+  const toggleAllSessions = () => {
+    if (pickedSessions.length === items.length) setPickedSessions([])
+    else setPickedSessions(items.map(s => s.id))
+  }
+
+  const deletePickedSessions = async () => {
+    if (pickedSessions.length === 0) return
+    const count = pickedSessions.length
+    if (!await confirmAction(`永久删除已选中的 ${count} 个总控对话及其全部历史消息？此操作不可撤销。`, { title: '批量删除对话', okLabel: `删除 ${count} 个`, danger: true })) return
+    const toDelete = [...pickedSessions]
+    await run(async () => {
+      const r = await post('api/director/sessions/batch-delete', { ids: toDelete })
+      toast(`已删除 ${r?.deleted ?? count} 个对话会话`)
+    }, undefined, () => {
+      if (selectedId && toDelete.includes(selectedId)) {
+        setSelectedId('')
+        setDetail(null)
+      }
+      setPickedSessions([])
+      setManageSessions(false)
+      sessionsPoll.reload()
+    })
+  }
+
+  const deleteCurrentSession = async () => {
+    if (!selectedId) return
+    const title = activeSession?.title || activeSession?.userId || selectedId
+    if (!await confirmAction(`永久删除对话「${title}」及其全部消息记录？此操作不可撤销。`, { title: '删除对话', okLabel: '永久删除', danger: true })) return
+    const targetId = selectedId
+    await run(() => del(`api/director/sessions/${encodeURIComponent(targetId)}`), '已删除当前对话', () => {
+      setSelectedId('')
+      setDetail(null)
+      setPickedSessions(prev => prev.filter(x => x !== targetId))
+      sessionsPoll.reload()
+    })
+  }
+
+  const toggleMsgPick = (id: number) => {
+    setPickedMsgIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id])
+  }
+
+  const toggleAllMsgs = () => {
+    if (pickedMsgIds.length === visibleMessages.length) setPickedMsgIds([])
+    else setPickedMsgIds(visibleMessages.map(m => m.id))
+  }
+
+  const deletePickedMsgs = async () => {
+    if (!selectedId || pickedMsgIds.length === 0) return
+    const count = pickedMsgIds.length
+    if (!await confirmAction(`永久删除已勾选的 ${count} 条消息记录？对应工具调用明细也会一并清理。`, { title: '批量删除消息', okLabel: `删除 ${count} 条`, danger: true })) return
+    const targetSessionId = selectedId
+    const ids = [...pickedMsgIds]
+    await run(async () => {
+      const r = await post(`api/director/sessions/${encodeURIComponent(targetSessionId)}/messages/batch-delete`, { messageIds: ids })
+      toast(`已删除 ${r?.deleted ?? count} 条消息`)
+    }, undefined, () => {
+      setPickedMsgIds([])
+      setManageMsgs(false)
+      void loadDetail(targetSessionId)
+      sessionsPoll.reload()
+    })
+  }
+
   const decideAction = (id: string, decision: 'approve' | 'reject') => run(async () => {
     const r = await post(`api/director/actions/${encodeURIComponent(id)}/decide`, { decision })
     toast(r?.message || (decision === 'approve' ? '已批准执行' : '已拒绝'), !r?.ok)
@@ -489,29 +583,80 @@ export function Director() {
 
     {/* 主三栏工作区（纯 CSS Grid 响应式，绝不写内联 gridTemplateColumns） */}
     <div className={showOps ? 'dir__layout has-ops' : 'dir__layout'}>
-      {/* 左栏：会话列表 */}
+      {/* 左栏：会话列表（支持多选批量删除） */}
       <aside className="dir__side dir__pane-sessions">
         <div className="dir__sidehead">
           <b>会话列表</b>
-          <button type="button" className="ghost small" onClick={startWebChat}>＋ 网页对话</button>
+          <div className="dir__sideacts">
+            {items.length > 0 && (
+              <button
+                type="button"
+                className={manageSessions ? 'ghost small is-active' : 'ghost small'}
+                disabled={busy}
+                onClick={() => {
+                  setManageSessions(v => {
+                    if (v) setPickedSessions([])
+                    return !v
+                  })
+                }}
+              >
+                {manageSessions ? '完成' : '批量删除'}
+              </button>
+            )}
+            {!manageSessions && <button type="button" className="ghost small" onClick={startWebChat}>＋ 新建</button>}
+          </div>
         </div>
+        {manageSessions && items.length > 0 && <div className="dir__bulkbar" role="region" aria-label="会话批量操作">
+          <label className="dir__checkall">
+            <input
+              type="checkbox"
+              checked={pickedSessions.length === items.length && items.length > 0}
+              onChange={toggleAllSessions}
+            />
+            <span>{pickedSessions.length === items.length ? '取消全选' : '全选'} ({pickedSessions.length}/{items.length})</span>
+          </label>
+          <button
+            type="button"
+            className="danger small"
+            disabled={busy || pickedSessions.length === 0}
+            onClick={() => void deletePickedSessions()}
+          >
+            删除 ({pickedSessions.length})
+          </button>
+        </div>}
         {items.length === 0
           ? <Empty>还没有总控对话。直接在对话区输入目标即可开始。</Empty>
           : <div className="dir__sessions">
-            {items.map(s => <button
-              key={s.id}
-              type="button"
-              className={s.id === selectedId ? 'dir__sess is-on' : 'dir__sess'}
-              onClick={() => pickSession(s.id)}
-            >
-              <div className="dir__sesstop">
-                <span className="dir__tag">{CHANNEL_LABEL[s.channel] || s.channel}</span>
-                <b>{s.title || s.userId}</b>
-                {s.pendingActions > 0 && <span className="nb need">{s.pendingActions}</span>}
-              </div>
-              <span className="meta dir__preview">{s.lastMessage || '（新会话）'}</span>
-              <span className="meta">{s.messageCount} 条 · {ago(s.updatedAt)}</span>
-            </button>)}
+            {items.map(s => {
+              const picked = pickedSessions.includes(s.id)
+              const cls = [
+                'dir__sess',
+                !manageSessions && s.id === selectedId ? 'is-on' : '',
+                manageSessions && picked ? 'is-picked' : '',
+              ].filter(Boolean).join(' ')
+              return <button
+                key={s.id}
+                type="button"
+                className={cls}
+                onClick={() => manageSessions ? toggleSessionPick(s.id) : pickSession(s.id)}
+              >
+                <div className="dir__sesstop">
+                  {manageSessions && <input
+                    type="checkbox"
+                    className="dir__chk"
+                    checked={picked}
+                    onChange={() => toggleSessionPick(s.id)}
+                    onClick={e => e.stopPropagation()}
+                    aria-label={`选择会话 ${s.title || s.userId}`}
+                  />}
+                  <span className="dir__tag">{CHANNEL_LABEL[s.channel] || s.channel}</span>
+                  <b>{s.title || s.userId}</b>
+                  {s.pendingActions > 0 && <span className="nb need">{s.pendingActions}</span>}
+                </div>
+                <span className="meta dir__preview">{s.lastMessage || '（新会话）'}</span>
+                <span className="meta">{s.messageCount} 条 · {ago(s.updatedAt)}</span>
+              </button>
+            })}
           </div>}
       </aside>
 
@@ -532,10 +677,48 @@ export function Director() {
                 同步{CHANNEL_LABEL[activeSession.channel]}
               </label>
             )}
-            <button type="button" className="ghost small" disabled={sending} onClick={() => void sendMessage('/状态')}>/状态</button>
+            <button type="button" className="ghost small only-desktop" disabled={sending} onClick={() => void sendMessage('/状态')}>/状态</button>
+            {activeSession && visibleMessages.length > 0 && (
+              <button
+                type="button"
+                className={manageMsgs ? 'ghost small is-active' : 'ghost small'}
+                disabled={busy || sending}
+                onClick={() => {
+                  setManageMsgs(v => {
+                    if (v) setPickedMsgIds([])
+                    return !v
+                  })
+                }}
+              >
+                {manageMsgs ? '退出清理' : '删消息'}
+              </button>
+            )}
             {activeSession && <button type="button" className="ghost small" disabled={busy || sending} onClick={resetCurrent}>新对话</button>}
+            {activeSession && <button type="button" className="ghost small danger" disabled={busy || sending} onClick={() => void deleteCurrentSession()}>删除会话</button>}
           </div>
         </div>
+
+        {manageMsgs && visibleMessages.length > 0 && <div className="dir__bulkbar" role="region" aria-label="消息批量删除">
+          <label className="dir__checkall">
+            <input
+              type="checkbox"
+              checked={pickedMsgIds.length === visibleMessages.length && visibleMessages.length > 0}
+              onChange={toggleAllMsgs}
+            />
+            <span>{pickedMsgIds.length === visibleMessages.length ? '取消全选' : '全选消息'} ({pickedMsgIds.length}/{visibleMessages.length})</span>
+          </label>
+          <div className="dir__bulkacts">
+            <button
+              type="button"
+              className="danger small"
+              disabled={busy || pickedMsgIds.length === 0}
+              onClick={() => void deletePickedMsgs()}
+            >
+              删除所选 ({pickedMsgIds.length})
+            </button>
+            <button type="button" className="ghost small" onClick={() => { setManageMsgs(false); setPickedMsgIds([]) }}>取消</button>
+          </div>
+        </div>}
 
         {activeSession?.summary && <details className="dir__summary">
           <summary>早期记忆摘要（已压缩）</summary>
@@ -582,23 +765,47 @@ export function Director() {
           </div>}
 
           {visibleMessages.map(m => {
+            const picked = pickedMsgIds.includes(m.id)
+            const wrapMsg = (node: ReactNode, alignRight = false) => {
+              if (!manageMsgs) return node
+              return <div
+                key={m.id}
+                className={[
+                  'dir__msgpick',
+                  alignRight ? 'is-right' : '',
+                  picked ? 'is-picked' : '',
+                ].filter(Boolean).join(' ')}
+                onClick={() => toggleMsgPick(m.id)}
+              >
+                <input
+                  type="checkbox"
+                  className="dir__chk"
+                  checked={picked}
+                  onChange={() => toggleMsgPick(m.id)}
+                  onClick={e => e.stopPropagation()}
+                  aria-label={`选择消息 #${m.id}`}
+                />
+                {node}
+              </div>
+            }
+
             if (m.role === 'event') {
-              return <div key={m.id} className={m.archived ? 'dir__event is-arch' : 'dir__event'}>
+              return wrapMsg(<div key={m.id} className={m.archived ? 'dir__event is-arch' : 'dir__event'}>
                 <div className="dir__eventhead">
                   <span className="dir__tag">平台动态</span>
                   <span className="meta">{ago(m.createdAt)}</span>
                 </div>
                 <div className="dir__eventbody"><Markdown text={m.content} /></div>
-              </div>
+              </div>)
             }
             if (m.role === 'user') {
-              return <div key={m.id} className={m.archived ? 'dir__msg is-user is-arch' : 'dir__msg is-user'}>
+              return wrapMsg(<div key={m.id} className={m.archived ? 'dir__msg is-user is-arch' : 'dir__msg is-user'}>
                 <div className="dir__bubble">{m.content}</div>
                 <span className="meta">{ago(m.createdAt)}</span>
-              </div>
+              </div>, true)
             }
             const calls = m.toolCalls ?? []
-            return <div key={m.id} className={m.archived ? 'dir__msg is-ai is-arch' : 'dir__msg is-ai'}>
+            return wrapMsg(<div key={m.id} className={m.archived ? 'dir__msg is-ai is-arch' : 'dir__msg is-ai'}>
               {calls.length > 0 && <details className="dir__tools">
                 <summary>
                   <span className="dir__tools-dot" aria-hidden="true" />
@@ -633,11 +840,11 @@ export function Director() {
                   {typeof m.meta?.model === 'string' && ` · ${m.meta.model}`}
                   {typeof m.meta?.toolsCount === 'number' && m.meta.toolsCount > 0 && ` · ${m.meta.toolsCount} 次工具`}
                 </span>
-                {m.content && <button type="button" className="dir__copybtn" onClick={() => copyText(m.content)} title="复制回复">
+                {m.content && !manageMsgs && <button type="button" className="dir__copybtn" onClick={() => copyText(m.content)} title="复制回复">
                   <Icon name="copy" size={13} />复制
                 </button>}
               </div>
-            </div>
+            </div>)
           })}
 
           {sending && <div className="dir__msg is-ai">
