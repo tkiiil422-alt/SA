@@ -128,7 +128,6 @@ const COMPACT_KEEP_TAIL = 16
 const TURN_TIMEOUT_MS = 240_000
 /** 单次用户请求因超时/模型故障中断后最多自动续跑次数。 */
 const MAX_TURN_RESUMES = 3
-const STEP_TIMEOUT_MS = 60_000
 const TYPING_PULSE_MS = 8_000
 
 const CONFIRM_RE = /^\/?(?:确认|同意|批准|ok|yes)(?:\s+#?([A-Za-z0-9]{4}))?$/i
@@ -665,9 +664,12 @@ export class DirectorService {
 
     const toolsUsed: DirectorToolAudit[] = []
     const maxRetries = Math.max(0, Math.min(20, cfg.maxRetries ?? 5))
-    // 重试次数调高时，按每次额外重试增加 12 秒单步预算（上限 4 分钟），避免高重试配置被旧固定超时提前截断
-    const stepTimeoutMs = Math.min(240_000, STEP_TIMEOUT_MS + Math.max(0, maxRetries - 3) * 12_000)
-    const turnTimeoutMs = Math.max(TURN_TIMEOUT_MS, stepTimeoutMs + 150_000)
+    // 支持 20–60 分钟级高推理模型等待：单步与流式首包超时均由设置项直接管控
+    const stepTimeoutMs = Math.max(30_000, Math.min(3_600_000, (cfg.stepTimeoutSec ?? 1800) * 1000))
+    const firstByteTimeoutMs = cfg.firstByteTimeoutSec === 0
+      ? 0
+      : Math.max(5_000, Math.min(3_600_000, (cfg.firstByteTimeoutSec ?? 1500) * 1000))
+    const turnTimeoutMs = Math.max(TURN_TIMEOUT_MS, stepTimeoutMs + 180_000)
     let deadline = Date.now() + turnTimeoutMs
     const maxSteps = Math.max(1, Math.min(15, cfg.maxToolSteps))
     const sessionKey = `director-${input.channel}-${input.userId}`
@@ -713,6 +715,7 @@ export class DirectorService {
         stream: true,
         cacheTtl: '5m',
         maxRetries,
+        firstByteTimeoutMs,
       })
 
       this.recordUsage(activeModel.provider, activeModel.model, result.status ?? 0, result.usage, result.latencyMs)
@@ -736,7 +739,7 @@ export class DirectorService {
             message: `主模型 ${prevRef} 响应异常，已自动切换至备选模型 ${alt.ref} 继续处理…`,
           })
           // 备选模型拥有独立的完整重试额度与单步时间预算（不再被主模型重试耗尽的时间挤占，也不再硬限 2 次）
-          deadline = Math.max(deadline, Date.now() + stepTimeoutMs + 30_000)
+          deadline = Math.max(deadline, Date.now() + stepTimeoutMs + 60_000)
           result = await this.doCallTool(activeModel.target, {
             model: activeModel.model,
             system: systemPrompt,
@@ -749,6 +752,7 @@ export class DirectorService {
             stream: true,
             cacheTtl: '5m',
             maxRetries,
+            firstByteTimeoutMs,
           })
           this.recordUsage(activeModel.provider, activeModel.model, result.status ?? 0, result.usage, result.latencyMs)
         }

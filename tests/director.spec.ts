@@ -1,4 +1,5 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -1197,5 +1198,70 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
     expect(env.options.get().models.providers.map(p => p.id)).toEqual(['default'])
 
     service.close()
+  })
+
+  it('forwards configured director.stepTimeoutSec and firstByteTimeoutSec (including 0 to disable) to callTool', async () => {
+    const env = setup()
+    env.options.update('director', { ...env.options.get().director, stepTimeoutSec: 1800, firstByteTimeoutSec: 1500 })
+
+    const seen: Array<{ timeoutMs: number; firstByteTimeoutMs?: number }> = []
+    const service = new DirectorService({
+      host: env.fake.host,
+      options: env.options,
+      ledger: env.ledger,
+      events: env.events,
+      store: env.store,
+      redact: env.redact,
+      callTool: async (_target, _req, opts) => {
+        seen.push({ timeoutMs: opts.timeoutMs, firstByteTimeoutMs: opts.firstByteTimeoutMs })
+        return { ok: true, status: 200, text: 'ok', latencyMs: 5, toolCalls: [] }
+      },
+    })
+
+    await service.chat({ channel: 'web', userId: 'owner', text: '长推理测试1' })
+    expect(seen[0]).toEqual({ timeoutMs: 1_800_000, firstByteTimeoutMs: 1_500_000 })
+
+    env.options.update('director', { ...env.options.get().director, stepTimeoutSec: 2400, firstByteTimeoutSec: 0 })
+    await service.chat({ channel: 'web', userId: 'owner', text: '长推理测试2' })
+    expect(seen[1]).toEqual({ timeoutMs: 2_400_000, firstByteTimeoutMs: 0 })
+    service.close()
+  })
+
+  it('uses nodeHttpFetch cleanly for >240s long-timeout streaming SSE tool responses', async () => {
+    const sseBody = [
+      'data: {"choices":[{"delta":{"content":"长推理思考完毕，"}}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_long_1","function":{"name":"platform_query","arguments":"{\\"action\\":\\"platform_overview\\",\\"params_json\\":\\"{}\\"}"}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50,"completion_tokens":12}}\n\n',
+      'data: [DONE]\n\n',
+    ].join('')
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' })
+      res.end(sseBody)
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', () => resolve()))
+    try {
+      const addr = server.address() as { port: number }
+      const res = await callToolModel(
+        { api: 'openai-completions', baseUrl: `http://127.0.0.1:${addr.port}/v1`, apiKey: 'sk-test' },
+        {
+          model: 'reasoning-model',
+          system: 'sys',
+          messages: [{ role: 'user', content: 'run' }],
+          tools: [{ name: 'platform_query', description: 'q', parameters: { type: 'object', properties: {} } }],
+          maxTokens: 1024,
+        },
+        { timeoutMs: 300_000, stream: true, firstByteTimeoutMs: 0, maxRetries: 0 },
+      )
+      expect(res.ok).toBe(true)
+      expect(res.text).toBe('长推理思考完毕，')
+      expect(res.toolCalls).toEqual([{
+        id: 'call_long_1',
+        name: 'platform_query',
+        arguments: { action: 'platform_overview', params_json: '{}' },
+      }])
+      expect(res.usage?.completion_tokens).toBe(12)
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
   })
 })

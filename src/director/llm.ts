@@ -4,6 +4,8 @@
  * 同时兼容 OpenAI Chat Completions (`openai-completions`) 与 Anthropic Messages (`anthropic-messages`)，
  * 复用平台统一的用量解析（`gateway/usage.ts`）、前缀缓存策略（`sessionId` / `cache_control`）与密钥脱敏。
  */
+import { request as httpRequest, type IncomingHttpHeaders } from 'node:http'
+import { request as httpsRequest } from 'node:https'
 import { createSseUsageParser, usageFrom, type Usage } from '../gateway/usage.ts'
 import {
   appendSafetyFilterHint,
@@ -50,7 +52,7 @@ export interface ToolModelOptions {
   maxRetries?: number
   /** 首次重试基准退避毫秒数，默认 600。 */
   retryDelayMs?: number
-  /** 流式请求在该毫秒数内未收到上游任何响应头即视为连接挂起，中止本次尝试并换新连接重试（默认 45000，仅 stream 生效）。 */
+  /** 流式请求在该毫秒数内未收到上游任何响应头即视为连接挂起，中止本次尝试并换新连接重试（默认 45000，传 0 关闭；仅 stream 生效）。 */
   firstByteTimeoutMs?: number
 }
 
@@ -362,6 +364,169 @@ async function readToolStream(
   return { text, toolCalls, truncated, ...(seen ? { usage: seen } : {}) }
 }
 
+const NULL_BODY_STATUSES = new Set([101, 204, 205, 304])
+
+function makeAbortError(reason: unknown): Error {
+  if (reason instanceof Error) return reason
+  return Object.assign(new Error(typeof reason === 'string' && reason ? reason : 'The operation was aborted'), { name: 'AbortError' })
+}
+
+function toNodeHeaders(raw: RequestInit['headers'] | undefined): { headers: Record<string, string>; forceClose: boolean } {
+  const headers: Record<string, string> = {}
+  let forceClose = false
+  if (!raw) return { headers, forceClose }
+  new Headers(raw).forEach((value, key) => {
+    headers[key] = value
+    if (key.toLowerCase() === 'connection' && value.toLowerCase() === 'close') forceClose = true
+  })
+  return { headers, forceClose }
+}
+
+function toWebHeaders(raw: IncomingHttpHeaders): Headers {
+  const headers = new Headers()
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === 'string') headers.append(k, v)
+    else if (Array.isArray(v)) {
+      for (const item of v) headers.append(k, item)
+    }
+  }
+  return headers
+}
+
+/**
+ * 基于 `node:http` / `node:https` 的零依赖长超时 Fetch 适配器。
+ * 绕开 Node.js 内置 undici `fetch` 默认 5 分钟的 `headersTimeout` / `bodyTimeout` 硬限制，
+ * 将 socket 超时设为 0，使高推理模型请求可稳定等待 20–60 分钟并严格响应外部 `AbortSignal`。
+ */
+export function nodeHttpFetch(input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> {
+  const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+  const parsed = new URL(urlStr)
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return Promise.reject(new TypeError(`Unsupported protocol: ${parsed.protocol}`))
+  }
+
+  const signal = init?.signal ?? undefined
+  if (signal?.aborted) {
+    return Promise.reject(makeAbortError(signal.reason))
+  }
+
+  const { headers, forceClose } = toNodeHeaders(init?.headers)
+  let bodyBuf: Buffer | undefined
+  if (typeof init?.body === 'string') {
+    bodyBuf = Buffer.from(init.body, 'utf8')
+  } else if (init?.body instanceof Uint8Array) {
+    bodyBuf = Buffer.from(init.body)
+  } else if (init?.body instanceof ArrayBuffer) {
+    bodyBuf = Buffer.from(init.body)
+  }
+  if (bodyBuf && !('content-length' in headers)) {
+    headers['content-length'] = String(bodyBuf.byteLength)
+  }
+
+  const requester = parsed.protocol === 'https:' ? httpsRequest : httpRequest
+  return new Promise<Response>((resolve, reject) => {
+    let settled = false
+    const req = requester(parsed, {
+      method: init?.method ?? 'GET',
+      headers,
+      timeout: 0,
+      ...(forceClose ? { agent: false } : {}),
+    })
+    req.setTimeout(0)
+
+    let activeRes: import('node:http').IncomingMessage | undefined
+    let onStreamAbort: ((err: Error) => void) | undefined
+
+    const cleanupSignal = (): void => {
+      if (signal) signal.removeEventListener('abort', onAbort)
+    }
+    const onAbort = (): void => {
+      const err = makeAbortError(signal?.reason)
+      cleanupSignal()
+      req.destroy(err)
+      if (activeRes) activeRes.destroy(err)
+      if (!settled) {
+        settled = true
+        reject(err)
+      } else {
+        onStreamAbort?.(err)
+      }
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    req.on('error', err => {
+      cleanupSignal()
+      if (!settled) {
+        settled = true
+        reject(err)
+      } else {
+        onStreamAbort?.(err)
+      }
+    })
+
+    req.on('response', res => {
+      activeRes = res
+      const status = res.statusCode ?? 502
+      const resHeaders = toWebHeaders(res.headers)
+      if (NULL_BODY_STATUSES.has(status)) {
+        res.resume()
+        cleanupSignal()
+        if (!settled) {
+          settled = true
+          resolve(new Response(null, { status, statusText: res.statusMessage ?? '', headers: resHeaders }))
+        }
+        return
+      }
+
+      let streamDone = false
+      const bodyStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const finishError = (err: Error): void => {
+            if (streamDone) return
+            streamDone = true
+            cleanupSignal()
+            try { controller.error(err) } catch { /* stream already errored */ }
+          }
+          onStreamAbort = finishError
+
+          res.on('data', (chunk: Buffer) => {
+            if (streamDone) return
+            controller.enqueue(new Uint8Array(chunk))
+            if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+              res.pause()
+            }
+          })
+          res.on('end', () => {
+            if (streamDone) return
+            streamDone = true
+            cleanupSignal()
+            try { controller.close() } catch { /* stream already closed */ }
+          })
+          res.on('error', err => finishError(err))
+          res.on('aborted', () => finishError(new Error('Upstream response aborted')))
+        },
+        pull() {
+          if (!streamDone) res.resume()
+        },
+        cancel() {
+          streamDone = true
+          cleanupSignal()
+          res.destroy()
+          req.destroy()
+        },
+      })
+
+      if (!settled) {
+        settled = true
+        resolve(new Response(bodyStream, { status, statusText: res.statusMessage ?? '', headers: resHeaders }))
+      }
+    })
+
+    if (bodyBuf && bodyBuf.byteLength > 0) req.write(bodyBuf)
+    req.end()
+  })
+}
+
 /** 发起一次带工具定义的模型调用，绝不抛异常，密钥永不出现在错误文案中。 */
 export async function callToolModel(
   target: ModelTarget,
@@ -423,7 +588,8 @@ export async function callToolModel(
 
   const deadline = started + opts.timeoutMs
   const payload = JSON.stringify(body)
-  const doFetch = opts.fetch ?? fetch
+  // 超过 4 分钟的长超时请求默认切换至 nodeHttpFetch，规避 Node 内置 undici 5 分钟隐性 headers/body 超时限制
+  const doFetch = opts.fetch ?? (opts.timeoutMs > 240_000 ? nodeHttpFetch : fetch)
   const maxRetries = Math.max(0, opts.maxRetries ?? 3)
   const retryDelayMs = Math.max(0, opts.retryDelayMs ?? 600)
   const minRetryBudgetMs = 2_000
@@ -435,10 +601,11 @@ export async function callToolModel(
     }
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), remaining)
-    // 上游「接了连接却长时间不吐字」是网关最常见的挂起形态：先用较短的首字节看门狗截断并重试，而不是干等满整个步骤预算。
+    // 上游「接了连接却长时间不吐字」是网关最常见的挂起形态：先用首字节看门狗截断并重试（传 0 可关闭以等待超长静默思考）。
     let stalled = false
-    const firstByteMs = Math.max(5_000, opts.firstByteTimeoutMs ?? 45_000)
-    const stallTimer = opts.stream === true && firstByteMs < remaining
+    const rawFirstByte = opts.firstByteTimeoutMs
+    const firstByteMs = rawFirstByte === 0 ? 0 : Math.max(5_000, rawFirstByte ?? 45_000)
+    const stallTimer = opts.stream === true && firstByteMs > 0 && firstByteMs < remaining
       ? setTimeout(() => { stalled = true; controller.abort() }, firstByteMs)
       : undefined
     // 重试时禁用 keep-alive 连接复用，强制建立全新 TCP+TLS 连接，避免撞到代理/TUN 半开旧套接字。

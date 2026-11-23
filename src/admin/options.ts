@@ -388,6 +388,10 @@ export const DirectorSchema = z.object({
   maxToolSteps: z.number().int('必须是整数').min(1, '至少 1 步').max(15, '最多 15 步').default(8),
   /** Max automatic retries on transient model/network failures (0 = disable retry). */
   maxRetries: z.number().int('必须是整数').min(0, '不能小于 0').max(20, '最多 20 次').default(5),
+  /** Max single-step model request timeout in seconds (30..3600, default 1800 = 30 min). */
+  stepTimeoutSec: z.number().int('必须是整数').min(30, '最少 30 秒').max(3600, '最多 3600 秒').default(1800),
+  /** Max seconds to wait for streaming response headers before treating upstream as hung (0 disables, 0..3600, default 1500 = 25 min). */
+  firstByteTimeoutSec: z.number().int('必须是整数').min(0, '不能小于 0').max(3600, '最多 3600 秒').default(1500),
   /** Daily budget cap dedicated to Director calls (USD); 0 means only the global budget applies. */
   dailyUsd: z.number().min(0, '不能小于 0').max(1000, '最多 $1000').default(5),
   /** Optional operator guidance appended to the Director's system prompt. */
@@ -1118,6 +1122,8 @@ export function defaultOptions(env: NodeJS.ProcessEnv): Options {
       debounceMs: 1500,
       maxToolSteps: 8,
       maxRetries: 5,
+      stepTimeoutSec: 1800,
+      firstByteTimeoutSec: 1500,
       dailyUsd: 5,
       extraPrompt: '',
       autoHeal: true,

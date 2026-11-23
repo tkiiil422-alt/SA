@@ -83,14 +83,14 @@ export interface GatewayOptions {
   maxBodyBytes?: number
   /**
    * Deadline for the upstream exchange, in milliseconds: waiting for the response headers and then for data while the
-   * stream idles. Defaults to 600 000. Zero disables the timer.
+   * stream idles. Defaults to 1 800 000 (30 min). Zero disables the timer.
    */
   upstreamTimeoutMs?: number
-  /** Deadline for the upstream response headers alone; a hung upstream is cut so the client can retry. Default 150 000. */
+  /** Deadline for the upstream response headers alone; a hung upstream is cut so the client can retry. Default 1 500 000 (25 min). */
   headersTimeoutMs?: number
   /**
    * An event stream that carries only keep-alive pings (or nothing) for this long is treated as stalled and cut, even
-   * though bytes keep arriving. Default 240 000. Zero disables the check.
+   * though bytes keep arriving. Default 1 500 000 (25 min). Zero disables the check.
    */
   stallTimeoutMs?: number
 }
@@ -113,9 +113,9 @@ const CLIENT_CREDENTIALS = new Set(['authorization', 'x-api-key'])
 const DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024
 /** How much of an over-limit body is read so its older images can be dropped; beyond this it is refused unread. */
 const HARD_BODY_CAP_BYTES = 96 * 1024 * 1024
-const DEFAULT_UPSTREAM_TIMEOUT_MS = 600_000
-const DEFAULT_HEADERS_TIMEOUT_MS = 150_000
-const DEFAULT_STALL_TIMEOUT_MS = 240_000
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 1_800_000
+const DEFAULT_HEADERS_TIMEOUT_MS = 1_500_000
+const DEFAULT_STALL_TIMEOUT_MS = 1_500_000
 
 /** Whether an SSE chunk carries real content, not just blank lines, comments or ping events. */
 export function sseHasContent(chunk: Buffer): boolean {
@@ -604,6 +604,8 @@ export function createGateway(options: GatewayOptions): Gateway {
       else res.destroy()
     })
   })
+  // 解除 Node.js HTTP Server 默认 5 分钟请求超时限制，匹配长推理上游超时策略
+  server.requestTimeout = 0
 
   return {
     listen() {

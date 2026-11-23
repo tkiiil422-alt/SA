@@ -185,6 +185,8 @@ describe('defaultOptions', () => {
         debounceMs: 1500,
         maxToolSteps: 8,
         maxRetries: 5,
+        stepTimeoutSec: 1800,
+        firstByteTimeoutSec: 1500,
         dailyUsd: 5,
         extraPrompt: '',
         autoHeal: true,
@@ -590,5 +592,16 @@ describe('OptionsStore change listeners', () => {
     expect(() => options.update('budget', { enabled: false, perTicketUsd: 0.5, dailyUsd: 2 })).not.toThrow()
     expect(secondCalled).toBe(true)
     expect((JSON.parse(readFileSync(file, 'utf8')) as Options).budget.enabled).toBe(false)
+  })
+
+  it('validates director long-reasoning timeout bounds (stepTimeoutSec and firstByteTimeoutSec)', () => {
+    const options = store()
+    const base = options.get().director
+    expect(() => options.update('director', { ...base, stepTimeoutSec: 30, firstByteTimeoutSec: 0 })).not.toThrow()
+    expect(() => options.update('director', { ...base, stepTimeoutSec: 3600, firstByteTimeoutSec: 3600 })).not.toThrow()
+    expect(() => options.update('director', { ...base, stepTimeoutSec: 29 })).toThrow(/30/)
+    expect(() => options.update('director', { ...base, stepTimeoutSec: 3601 })).toThrow(/3600/)
+    expect(() => options.update('director', { ...base, firstByteTimeoutSec: -1 })).toThrow(/0/)
+    expect(() => options.update('director', { ...base, firstByteTimeoutSec: 3601 })).toThrow(/3600/)
   })
 })

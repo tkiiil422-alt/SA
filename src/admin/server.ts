@@ -72,6 +72,8 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
       res.end(payload)
     })
   })
+  // 取消 Node 默认 5 分钟请求总超时，避免长推理 SSE 对话被服务端提前掐断
+  server.requestTimeout = 0
 
   return {
     listen: () => new Promise((resolve, reject) => {
