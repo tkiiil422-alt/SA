@@ -197,7 +197,9 @@ export function Director() {
     if (!el) return
     stickToBottomRef.current = true
     setShowJumpBottom(false)
-    if (behavior === 'smooth' && typeof el.scrollTo === 'function') {
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+    // 距离超过 2 屏时直接瞬时定位，避免长对话 smooth 滚动慢吞吞或中途反复触发回底按钮
+    if (behavior === 'smooth' && dist <= el.clientHeight * 2 && typeof el.scrollTo === 'function') {
       el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
     } else {
       el.scrollTop = el.scrollHeight
