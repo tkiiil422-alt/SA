@@ -50,6 +50,8 @@ export interface ToolModelOptions {
   maxRetries?: number
   /** 首次重试基准退避毫秒数，默认 600。 */
   retryDelayMs?: number
+  /** 流式请求在该毫秒数内未收到上游任何响应头即视为连接挂起，中止本次尝试并换新连接重试（默认 45000，仅 stream 生效）。 */
+  firstByteTimeoutMs?: number
 }
 
 export interface ToolModelResult {
@@ -433,6 +435,12 @@ export async function callToolModel(
     }
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), remaining)
+    // 上游「接了连接却长时间不吐字」是网关最常见的挂起形态：先用较短的首字节看门狗截断并重试，而不是干等满整个步骤预算。
+    let stalled = false
+    const firstByteMs = Math.max(5_000, opts.firstByteTimeoutMs ?? 45_000)
+    const stallTimer = opts.stream === true && firstByteMs < remaining
+      ? setTimeout(() => { stalled = true; controller.abort() }, firstByteMs)
+      : undefined
     // 重试时禁用 keep-alive 连接复用，强制建立全新 TCP+TLS 连接，避免撞到代理/TUN 半开旧套接字。
     const attemptHeaders = attempt > 0 ? { ...headers, connection: 'close' } : headers
     try {
@@ -442,6 +450,7 @@ export async function callToolModel(
         body: payload,
         signal: controller.signal,
       })
+      if (stallTimer) clearTimeout(stallTimer)
       if (opts.stream === true && response.ok && (response.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
         const streamed = await readToolStream(target.api, response)
         return {
@@ -498,10 +507,9 @@ export async function callToolModel(
         ...(extracted.truncated ? { truncated: true } : {}),
       }
     } catch (error) {
-      const timedOut = controller.signal.aborted
-      const canRetry = !timedOut
+      const timedOut = controller.signal.aborted && !stalled
+      const canRetry = (stalled || (!timedOut && isRetryableNetworkError(error)))
         && attempt < maxRetries
-        && isRetryableNetworkError(error)
         && (deadline - Date.now()) > minRetryBudgetMs
       if (canRetry) {
         const wait = Math.min(
@@ -515,10 +523,13 @@ export async function callToolModel(
       const suffix = attempt > 0 ? `（已自动重试 ${attempt} 次）` : ''
       const message = timedOut
         ? `模型调用超时（${Math.round(opts.timeoutMs / 1000)} 秒）`
-        : `${describeFetchError(error)}${suffix}`
+        : stalled
+          ? `上游连接挂起：${Math.round(firstByteMs / 1000)} 秒内无任何响应${suffix}`
+          : `${describeFetchError(error)}${suffix}`
       return { ok: false, text: '', toolCalls: [], latencyMs, error: redact(message) }
     } finally {
       clearTimeout(timer)
+      if (stallTimer) clearTimeout(stallTimer)
     }
   }
   return { ok: false, text: '', toolCalls: [], latencyMs: Date.now() - started, error: `模型调用超时（${Math.round(opts.timeoutMs / 1000)} 秒）` }

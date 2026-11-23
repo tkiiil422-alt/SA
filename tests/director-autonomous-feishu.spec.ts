@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OptionsStore, defaultOptions } from '../src/admin/options.ts'
 import type { AdminHost } from '../src/admin/host.ts'
 import { DirectorBridge } from '../src/director/bridge.ts'
+import { callToolModel } from '../src/director/llm.ts'
 import { DirectorService } from '../src/director/service.ts'
 import { DirectorStore } from '../src/director/store.ts'
 import { DirectorWatchdog } from '../src/director/watchdog.ts'
@@ -495,6 +496,63 @@ describe('模型故障/超时不丢需求：重试额度完整生效 + 自动续
       const pushed = JSON.stringify([...h.mocks.sendFeishu.mock.calls, ...h.mocks.sendFeishuCard.mock.calls])
       expect(pushed).toContain('已为你处理完成')
       h.db.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('上游网关挂起（接了连接却不吐字）：首字节看门狗截断并换新连接重试', () => {
+  const target = { api: 'openai-completions' as const, baseUrl: 'https://gw.example.com/v1', apiKey: 'sk-x' }
+  const req = { model: 'm', system: 's', messages: [{ role: 'user' as const, content: 'hi' }], tools: [], maxTokens: 64 }
+
+  function hangingFetch(hangTimes: number) {
+    let calls = 0
+    const seenConnection: (string | undefined)[] = []
+    const fn: typeof fetch = (_url, init) => {
+      calls += 1
+      seenConnection.push((init?.headers as Record<string, string> | undefined)?.connection)
+      if (calls <= hangTimes) {
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })))
+        })
+      }
+      return Promise.resolve(new Response(JSON.stringify({ choices: [{ message: { content: '恢复正常' }, finish_reason: 'stop' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }))
+    }
+    return { fn, calls: () => calls, seenConnection }
+  }
+
+  it('连续 2 次挂起后第 3 次成功：不必干等满整个步骤预算，且重试使用 connection: close 新连接', async () => {
+    vi.useFakeTimers()
+    try {
+      const h = hangingFetch(2)
+      const p = callToolModel(target, req, { timeoutMs: 144_000, stream: true, maxRetries: 10, retryDelayMs: 50, fetch: h.fn })
+      await vi.advanceTimersByTimeAsync(100_000)
+      const res = await p
+      expect(res.ok).toBe(true)
+      expect(res.text).toBe('恢复正常')
+      expect(h.calls()).toBe(3)
+      expect(h.seenConnection[0]).toBeUndefined()
+      expect(h.seenConnection[1]).toBe('close')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('重试额度用尽仍挂起时给出清晰的「上游连接挂起」提示而不是笼统的超时', async () => {
+    vi.useFakeTimers()
+    try {
+      const h = hangingFetch(99)
+      const p = callToolModel(target, req, { timeoutMs: 144_000, stream: true, maxRetries: 1, retryDelayMs: 50, fetch: h.fn })
+      await vi.advanceTimersByTimeAsync(120_000)
+      const res = await p
+      expect(res.ok).toBe(false)
+      expect(res.error).toContain('上游连接挂起')
+      expect(res.error).toContain('已自动重试 1 次')
+      expect(h.calls()).toBe(2)
     } finally {
       vi.useRealTimers()
     }
