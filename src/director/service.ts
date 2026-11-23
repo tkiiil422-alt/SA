@@ -1112,7 +1112,14 @@ export class DirectorService {
    * 3 秒内即时返回 `{ toast, card }` 锁定卡片防连点，耗时操作在后台异步执行并原位刷新卡片与汇报。
    */
   async handleFeishuCardAction(event: FeishuCardActionEvent): Promise<FeishuCardCallbackResponse> {
-    if (this.deps.feishuAllowCheck && !this.deps.feishuAllowCheck(event.operatorOpenId)) {
+    const allowed = !this.deps.feishuAllowCheck || this.deps.feishuAllowCheck(event.operatorOpenId)
+    this.logEvent(
+      allowed ? 'director.feishu_card_click' : 'director.feishu_card_denied',
+      allowed ? 'info' : 'warn',
+      allowed ? `飞书卡片按钮点击：${event.actionValue.kind}` : `飞书卡片按钮被拒绝（操作人不在授权名单）：${event.actionValue.kind}`,
+      { kind: event.actionValue.kind, decision: 'decision' in event.actionValue ? event.actionValue.decision : undefined, op: 'op' in event.actionValue ? event.actionValue.op : undefined },
+    )
+    if (!allowed) {
       return { toast: { type: 'error', content: '你不在飞书授权操作员名单中，无权执行此操作' } }
     }
     const val = event.actionValue
