@@ -116,9 +116,16 @@ export function Sheet({ title, onClose, children }: { title: string; onClose: ()
   useEffect(() => { const f = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }; addEventListener('keydown', f); return () => removeEventListener('keydown', f) }, [onClose])
   return <div className="sheet" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
     <div className="sheet__body" role="dialog" aria-label={title}>
+      <span className="sheet__grab" aria-hidden="true" />
       <div className="sheet__head"><b>{title}</b><button type="button" className="ghost" onClick={onClose} aria-label="关闭">✕</button></div>
       {children}
     </div>
+  </div>
+}
+
+export function Skeleton({ rows = 3 }: { rows?: number }) {
+  return <div className="skel" aria-hidden="true">
+    {Array.from({ length: rows }, (_, i) => <span key={i} className="skel__line" />)}
   </div>
 }
 
@@ -186,25 +193,31 @@ export function useMediaQuery(query: string): boolean {
   return matches
 }
 
-export type ThemeMode = 'system' | 'light' | 'dark'
-const THEME_KEY = 'sa-theme'
+export type ThemeMode = 'light' | 'carbon' | 'obsidian'
+const THEME_KEY = 'sa-theme-v2'
+const THEME_META: Record<ThemeMode, { label: string; dark: boolean; color: string }> = {
+  carbon: { label: '暖炭绒黑', dark: true, color: '#141413' },
+  obsidian: { label: '纯粹曜黑', dark: true, color: '#09090B' },
+  light: { label: '瓷白工作室', dark: false, color: '#F5F5F7' },
+}
+const THEME_ORDER: ThemeMode[] = ['carbon', 'obsidian', 'light']
 
-export function useTheme(): { mode: ThemeMode; dark: boolean; cycle: () => void } {
-  const systemDark = useMediaQuery('(prefers-color-scheme: dark)')
+export function useTheme(): { mode: ThemeMode; dark: boolean; label: string; setMode: (m: ThemeMode) => void; cycle: () => void } {
   const [mode, setMode] = useState<ThemeMode>(() => {
     try {
       const saved = localStorage.getItem(THEME_KEY)
-      return saved === 'light' || saved === 'dark' ? saved : 'system'
-    } catch { return 'system' }
+      return saved === 'light' || saved === 'carbon' || saved === 'obsidian' ? saved : 'carbon'
+    } catch { return 'carbon' }
   })
-  const dark = mode === 'dark' || (mode === 'system' && systemDark)
+  const meta = THEME_META[mode]
   useEffect(() => {
-    if (mode === 'system') document.documentElement.removeAttribute('data-theme')
-    else document.documentElement.setAttribute('data-theme', mode)
+    document.documentElement.setAttribute('data-theme', mode)
+    const themeColor = document.querySelector('meta[name="theme-color"]')
+    if (themeColor) themeColor.setAttribute('content', meta.color)
     try { localStorage.setItem(THEME_KEY, mode) } catch { /* ignore */ }
-  }, [mode])
-  const cycle = () => setMode(prev => prev === 'system' ? (systemDark ? 'light' : 'dark') : prev === 'dark' ? 'light' : 'dark')
-  return { mode, dark, cycle }
+  }, [mode, meta.color])
+  const cycle = () => setMode(prev => THEME_ORDER[(THEME_ORDER.indexOf(prev) + 1) % THEME_ORDER.length]!)
+  return { mode, dark: meta.dark, label: meta.label, setMode, cycle }
 }
 
 /** Safe, dependency-free Markdown renderer (no dangerouslySetInnerHTML) for AI reports & pentest PoCs. */

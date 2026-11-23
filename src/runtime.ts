@@ -2213,6 +2213,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       workspaceRoot,
       feishu,
       wechat,
+      host: config.adminHost,
       port: config.adminPort,
     })
     cleanup.push(() => adminServer.close())

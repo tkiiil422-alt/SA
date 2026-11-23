@@ -37,7 +37,7 @@ function sendNotFound(res: ServerResponse): void {
     'content-length': String(Buffer.byteLength(payload)),
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
-    'x-frame-options': 'DENY',
+    ...(process.env.SA_ALLOW_IFRAME === '1' ? {} : { 'x-frame-options': 'DENY' }),
     'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'",
   })
   res.end(payload)
@@ -66,7 +66,7 @@ export function createAdminServer(options: AdminServerOptions): AdminServer {
         'content-length': String(Buffer.byteLength(payload)),
         'cache-control': 'no-store',
         'x-content-type-options': 'nosniff',
-        'x-frame-options': 'DENY',
+        ...(process.env.SA_ALLOW_IFRAME === '1' ? {} : { 'x-frame-options': 'DENY' }),
         'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'",
       })
       res.end(payload)

@@ -1,0 +1,1 @@
+import{j as e}from"./index-exIgAfP-.js";import{SecurityWorkbench as r}from"./pentest-X-JDKVUU.js";function t(){return e.jsxDEV(r,{mode:"defense"},void 0,!1,{fileName:"/app/applet/web/src/defense.tsx",lineNumber:5,columnNumber:10},this)}export{t as Defense};

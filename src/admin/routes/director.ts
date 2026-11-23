@@ -18,6 +18,13 @@ const DirectorActionDecideSchema = z.object({
   decision: z.enum(['approve', 'reject']),
 }).strict()
 
+const DirectorCreateSessionSchema = z.object({
+  channel: z.enum(['web', 'feishu', 'wechat']).default('web'),
+  userId: z.string().trim().min(1).max(200).optional(),
+  title: z.string().trim().max(120).optional(),
+  resetIfExists: z.boolean().default(false),
+}).strict()
+
 const DirectorBatchDeleteSessionsSchema = z.object({
   ids: z.array(z.string().trim().min(1).max(200)).min(1, '请至少选择一个会话').max(200, '单次最多删除 200 个会话'),
 }).strict()
@@ -36,6 +43,24 @@ export async function handleDirectorRoutes(deps: AdminRouteDeps, { req, res, url
 
   if (route === '/director/status' && method === 'GET') {
     sendJson(res, 200, requireDirector(deps).status())
+    return true
+  }
+  if (route === '/director/sessions' && method === 'POST') {
+    const parsed = DirectorCreateSessionSchema.safeParse(await parseJsonBody(req))
+    if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
+    const svc = requireDirector(deps)
+    const { channel, resetIfExists } = parsed.data
+    const nowTag = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+    const userId = parsed.data.userId || `${channel}-${Date.now().toString(36)}`
+    const defaultTitle = channel === 'feishu'
+      ? `飞书对话 (${userId.slice(0, 14)})`
+      : channel === 'wechat'
+        ? `微信对话 (${userId.slice(0, 14)})`
+        : `网页对话 ${nowTag}`
+    const title = parsed.data.title || defaultTitle
+    const session = svc.store.getOrCreateSession(channel, userId, title)
+    if (resetIfExists) svc.resetSession(session.id)
+    sendJson(res, 201, { ok: true, session })
     return true
   }
   if (route === '/director/sessions' && method === 'GET') {

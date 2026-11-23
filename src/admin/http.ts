@@ -36,6 +36,15 @@ export const SECURITY_HEADERS: Record<string, string> = {
   'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'",
 }
 
+export function securityHeaders(): Record<string, string> {
+  if (process.env.SA_ALLOW_IFRAME !== '1') return SECURITY_HEADERS
+  return {
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'",
+  }
+}
+
 export interface BodyResult {
   ok: boolean
   text?: string
@@ -109,7 +118,7 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': String(Buffer.byteLength(payload)),
-    ...SECURITY_HEADERS,
+    ...securityHeaders(),
     ...headers,
   })
   res.end(payload)
@@ -167,12 +176,18 @@ export function serveTarArchive(res: ServerResponse, dir: string, name: string):
   })
 }
 
-export function sessionCookie(token: string): string {
-  return `sa_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_MAX_AGE_SEC}`
+function cookiePolicy(req?: IncomingMessage): string {
+  if (process.env.SA_ALLOW_IFRAME !== '1') return 'SameSite=Strict'
+  const proto = req ? header(req, 'x-forwarded-proto').toLowerCase() : ''
+  return proto.includes('https') ? 'SameSite=None; Secure; Partitioned' : 'SameSite=Lax'
 }
 
-export function clearSessionCookie(): string {
-  return 'sa_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'
+export function sessionCookie(token: string, req?: IncomingMessage): string {
+  return `sa_session=${token}; HttpOnly; ${cookiePolicy(req)}; Path=/; Max-Age=${SESSION_MAX_AGE_SEC}`
+}
+
+export function clearSessionCookie(req?: IncomingMessage): string {
+  return `sa_session=; HttpOnly; ${cookiePolicy(req)}; Path=/; Max-Age=0`
 }
 
 export function clampInt(value: string | null, fallback: number, min: number, max: number): number {

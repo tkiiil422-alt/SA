@@ -21,7 +21,9 @@ export type LauncherConfig = z.infer<typeof LauncherSchema>
 export const ConfigFileSchema = z.object({
   stateDir: z.string().trim().min(1),
   maxSlots: z.number().int().min(1).max(64).default(3),
-  /** Port of the admin console on 127.0.0.1; 0 picks a free port (tests). The public entry is the host's reverse proxy. */
+  /** Host address of the admin console; defaults to 127.0.0.1 (set 0.0.0.0 for container/dev preview). */
+  adminHost: z.string().trim().min(1).default('127.0.0.1'),
+  /** Port of the admin console on adminHost; 0 picks a free port (tests). */
   adminPort: z.number().int().min(0).max(65535).default(0),
   operatorId: z.string().trim().min(1).default('operator'),
   /** Name of the environment variable holding the real DeepSeek key; the key itself is never stored. */
@@ -34,6 +36,7 @@ export type ConfigFile = z.infer<typeof ConfigFileSchema>
 export interface Config {
   stateDir: string
   maxSlots: number
+  adminHost: string
   adminPort: number
   operatorId: string
   deepseekApiKeyEnv: string
@@ -96,6 +99,7 @@ export function parseConfig(value: unknown): Config {
   return {
     stateDir: parsed.stateDir,
     maxSlots: parsed.maxSlots,
+    adminHost: parsed.adminHost,
     adminPort: parsed.adminPort,
     operatorId: parsed.operatorId,
     deepseekApiKeyEnv: parsed.deepseekApiKeyEnv,

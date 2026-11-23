@@ -18,7 +18,6 @@ import {
 } from './host.ts'
 import {
   API_PREFIX,
-  SECURITY_HEADERS,
   clampInt,
   clearSessionCookie,
   cookieValue,
@@ -30,6 +29,7 @@ import {
   issuesOf,
   labelSummary,
   parseJsonBody,
+  securityHeaders,
   sendJson,
   sessionCookie,
 } from './http.ts'
@@ -229,16 +229,21 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
       runningSteps: facts.runningSteps ?? [],
       open,
       ended,
-      alerts: buildAlerts(facts, budget, totals.usd, auth.usingGeneratedPassword),
+      alerts: buildAlerts(facts, budget, totals.usd, !devAutoAuthEnabled() && auth.usingGeneratedPassword),
     })
     cachedBoard = { at: nowMs, body }
     return body
+  }
+
+  function devAutoAuthEnabled(): boolean {
+    return process.env.SA_DEV_AUTO_AUTH === '1' && !process.env.SA_ADMIN_PASSWORD
   }
 
   function authenticate(req: IncomingMessage): AuthState {
     if (checkCliToken(cliToken ?? '', header(req, 'authorization'))) return { authenticated: true, via: 'bearer' }
     const token = cookieValue(header(req, 'cookie'), 'sa_session')
     if (token !== undefined && auth.verify(token)) return { authenticated: true, via: 'cookie', token }
+    if (devAutoAuthEnabled()) return { authenticated: true, via: 'cookie' }
     return { authenticated: false, via: 'none' }
   }
 
@@ -352,16 +357,16 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
         }
         return
       }
-      sendJson(res, 200, { ok: true }, { 'set-cookie': sessionCookie(result.token) })
+      sendJson(res, 200, { ok: true }, { 'set-cookie': sessionCookie(result.token, req) })
       return
     }
     if (route === '/logout' && method === 'POST') {
       if (state.token !== undefined) auth.logout(state.token)
-      sendJson(res, 200, { ok: true }, { 'set-cookie': clearSessionCookie() })
+      sendJson(res, 200, { ok: true }, { 'set-cookie': clearSessionCookie(req) })
       return
     }
     if (route === '/me' && method === 'GET') {
-      sendJson(res, 200, { authenticated: true, usingGeneratedPassword: auth.usingGeneratedPassword })
+      sendJson(res, 200, { authenticated: true, usingGeneratedPassword: !devAutoAuthEnabled() && auth.usingGeneratedPassword })
       return
     }
     if (route === '/password' && method === 'POST') {
@@ -376,14 +381,14 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
       }
       try { events.add({ kind: 'admin.password', level: 'warn', text: '管理口令已修改，所有登录已失效' }) }
       catch { /* best effort */ }
-      sendJson(res, 200, { ok: true, relogin: true }, { 'set-cookie': clearSessionCookie() })
+      sendJson(res, 200, { ok: true, relogin: true }, { 'set-cookie': clearSessionCookie(req) })
       return
     }
 
     // 实时看板 SSE 与概览
     if (route === '/live/stream' && method === 'GET') {
       res.writeHead(200, {
-        ...SECURITY_HEADERS,
+        ...securityHeaders(),
         'content-type': 'text/event-stream; charset=utf-8',
         'cache-control': 'no-store, no-transform',
         'x-accel-buffering': 'no',
@@ -438,7 +443,7 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
         host: facts.host,
         upstream: facts.upstream,
         ...(facts.runningSteps ? { runningSteps: facts.runningSteps } : {}),
-        alerts: buildAlerts(facts, budget, totals.usd, auth.usingGeneratedPassword),
+        alerts: buildAlerts(facts, budget, totals.usd, !devAutoAuthEnabled() && auth.usingGeneratedPassword),
         recent: events.recent(15),
       })
       return

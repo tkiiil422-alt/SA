@@ -65,6 +65,93 @@ export function createEvolutionPlugin(deps: EvolutionPluginDeps): SubsystemPlugi
       const { req, res, method, route, sendJson, parseJsonBody, invalid, decodeSegment } = ctx
       if (!route.startsWith('/evolution')) return false
 
+      if (route === '/evolution/overview' && method === 'GET') {
+        const allSkills = skills.list({ limit: 200 }).items
+        const pendingCandidates: Array<{
+          skillId: string
+          skillSlug: string
+          skillName: string
+          activeVersion: number
+          activeContent: string
+          candidate: ReturnType<SkillStore['listVersions']>[number]
+        }> = []
+        let totalVersions = 0
+        for (const sk of allSkills) {
+          const vers = skills.listVersions(sk.id)
+          totalVersions += vers.length
+          for (const v of vers) {
+            if (v.status === 'candidate') {
+              pendingCandidates.push({
+                skillId: sk.id,
+                skillSlug: sk.slug,
+                skillName: sk.name,
+                activeVersion: sk.activeVersion,
+                activeContent: sk.content,
+                candidate: v,
+              })
+            }
+          }
+        }
+        const proposals = pluginEvolution.listProposals(30)
+        const runs = benchmarks.listRuns(undefined, 10)
+        sendJson(res, 200, {
+          pendingCandidates,
+          stats: {
+            skills: allSkills.length,
+            totalVersions,
+            pendingCandidates: pendingCandidates.length,
+            proposals: proposals.length,
+            benchmarkRuns: runs.length,
+          },
+          proposals,
+          runs,
+        })
+        return true
+      }
+
+      const skVerDecision = /^\/evolution\/skills\/([^/]+)\/versions\/(\d+)\/(promote|reject)$/.exec(route)
+      if (skVerDecision !== null && method === 'POST') {
+        const idOrSlug = decodeSegment(skVerDecision[1] ?? '')
+        const verNum = Number(skVerDecision[2])
+        const op = skVerDecision[3]
+        const skill = idOrSlug ? (skills.get(idOrSlug) ?? skills.getBySlug(idOrSlug)) : undefined
+        if (!skill || !Number.isInteger(verNum) || verNum < 1) {
+          sendJson(res, 404, { error: 'not_found', message: '找不到对应的技能或版本号。' })
+          return true
+        }
+        const target = skills.getVersion(skill.id, verNum)
+        if (!target) {
+          sendJson(res, 404, { error: 'not_found', message: `找不到技能「${skill.name}」的候选版本 v${verNum}。` })
+          return true
+        }
+        const body = (await parseJsonBody(req).catch(() => ({}))) as Record<string, unknown>
+        const note = str(body?.reason) || (op === 'promote' ? '主人在控制台批准启用该进化版本' : '主人在控制台拒绝该候选修订')
+        if (op === 'promote') {
+          const updated = skills.promoteVersion(skill.id, verNum, { manualReview: 'approved', note })
+          try {
+            ctx.events.add({
+              kind: 'skill.promoted',
+              level: 'info',
+              text: `技能「${updated.name}」已批准升级至 v${updated.activeVersion}`,
+              data: { skillId: updated.id, version: updated.activeVersion },
+            })
+          } catch { /* ignore */ }
+          sendJson(res, 200, { ok: true, skill: updated })
+          return true
+        }
+        const rejected = skills.rejectVersion(skill.id, verNum, { manualReview: 'rejected', note })
+        try {
+          ctx.events.add({
+            kind: 'skill.candidate_rejected',
+            level: 'info',
+            text: `技能「${skill.name}」候选修订 v${verNum} 已被拒绝`,
+            data: { skillId: skill.id, version: verNum },
+          })
+        } catch { /* ignore */ }
+        sendJson(res, 200, { ok: true, version: rejected })
+        return true
+      }
+
       const skVer = /^\/evolution\/skills\/([^/]+)\/(versions|candidate|rollback|auto-correct)$/.exec(route)
       if (skVer !== null) {
         const idOrSlug = decodeSegment(skVer[1] ?? '')

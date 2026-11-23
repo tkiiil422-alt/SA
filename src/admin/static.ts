@@ -34,10 +34,13 @@ const CACHEABLE = new Set(['html', 'htm', 'css', 'js', 'mjs'])
 const COMPRESSIBLE = new Set(['html', 'htm', 'css', 'js', 'mjs', 'json', 'svg', 'txt', 'map'])
 /** Compressed copies keyed by path and ETag, so each file is gzipped once per change. */
 const gzipCache = new Map<string, Buffer>()
-const SECURITY_HEADERS: Record<string, string> = {
-  'x-content-type-options': 'nosniff',
-  'x-frame-options': 'DENY',
-  'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'",
+function securityHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'self'; style-src 'self' 'unsafe-inline'",
+  }
+  if (process.env.SA_ALLOW_IFRAME !== '1') headers['x-frame-options'] = 'DENY'
+  return headers
 }
 
 function canonical(path: string): string {
@@ -53,7 +56,7 @@ function isInside(root: string, target: string): boolean {
 function notFound(res: ServerResponse, head: boolean): void {
   const body = 'Not Found'
   res.writeHead(404, {
-    ...SECURITY_HEADERS,
+    ...securityHeaders(),
     'content-type': 'text/plain; charset=utf-8',
     'content-length': String(Buffer.byteLength(body)),
     'cache-control': 'no-store',
@@ -147,7 +150,7 @@ export function createStaticHandler(rootDir: string): StaticHandler {
     const extension = extname(real).slice(1).toLowerCase()
     const etag = `"${info.size.toString(16)}-${Math.trunc(info.mtimeMs).toString(16)}"`
     const headers: Record<string, string> = {
-      ...SECURITY_HEADERS,
+      ...securityHeaders(),
       'content-type': MIME[extension] ?? 'application/octet-stream',
       'cache-control': CACHEABLE.has(extension) ? 'no-cache' : 'public, max-age=3600',
       etag,

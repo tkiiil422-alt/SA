@@ -25,6 +25,7 @@ import {
   type FeishuCardActionEvent,
   type FeishuCardCallbackResponse,
 } from '../sources/feishu-cards.ts'
+import { detectIntentSignals } from './intent-learner.ts'
 
 export interface DirectorServiceDeps extends Omit<DirectorToolsDeps, 'store' | 'onAudit'> {
   store: DirectorStore
@@ -143,11 +144,20 @@ const READ_ONLY_HOST_ACTIONS = new Set([
   'podman_ps', 'podman_images', 'podman_logs', 'service_status',
 ])
 
+const READ_ONLY_SUBSYSTEM_ACTIONS = new Set([
+  'memory_recall', 'skill_list', 'contracts_list', 'schedules_list',
+  'missions_list', 'evolution_benchmarks', 'plugin_proposals_list',
+])
+
 function isReadOnlyToolCall(tc: ToolCall): boolean {
   if (tc.name === 'platform_query') return true
   if (tc.name === 'host_ops') {
     const act = typeof tc.arguments.action === 'string' ? tc.arguments.action.trim() : ''
     return READ_ONLY_HOST_ACTIONS.has(act)
+  }
+  if (tc.name === 'subsystem_action') {
+    const act = typeof tc.arguments.action === 'string' ? tc.arguments.action.trim() : ''
+    return READ_ONLY_SUBSYSTEM_ACTIONS.has(act)
   }
   return false
 }
@@ -600,6 +610,34 @@ export class DirectorService {
     } else {
       this.store.addMessage({ sessionId: session.id, role: 'user', content: text })
       this.logEvent('director.message', 'info', `总控收到消息（${input.channel}）`, { sessionId: session.id, channel: input.channel })
+      // 0 Token 意图学习：识别用户显式偏好/红线/口径，自动沉淀到长期记忆，越用越懂主人
+      if (this.deps.plugins) {
+        const signals = detectIntentSignals(text)
+        for (const sig of signals) {
+          void this.deps.plugins.dispatchDirectorAction(
+            'memory_save',
+            {
+              scope: 'user',
+              kind: sig.kind,
+              title: sig.title,
+              content: sig.content,
+              tags: sig.tags,
+              pinned: sig.pinned,
+              confidence: sig.confidence,
+              source: 'auto_intent',
+            },
+            { sessionId: session.id, channel: input.channel, userId: input.userId },
+          ).then(r => {
+            if (r.matched) {
+              this.logEvent('director.intent_learned', 'info', `已自动学习主人偏好：${sig.title}`, {
+                sessionId: session.id,
+                kind: sig.kind,
+                pinned: sig.pinned,
+              })
+            }
+          }).catch(() => undefined)
+        }
+      }
     }
 
     const active = this.store.activeMessages(session.id, ACTIVE_WINDOW_MESSAGES + 12)
@@ -1129,7 +1167,9 @@ export class DirectorService {
         ? `mis:${val.missionId}:${val.nodeKey}:v${val.planVersion}`
         : val.kind === 'vault_request'
           ? `sec:${val.requestId}`
-          : `tk:${val.ticketId}:${val.op}`
+          : val.kind === 'council_commit'
+            ? `cn:${val.councilId}`
+            : `tk:${val.ticketId}:${val.op}`
     if (this.cardActionLocks.has(lockKey)) {
       return { toast: { type: 'info', content: '操作正在处理中，请勿重复点击' } }
     }
@@ -1283,6 +1323,48 @@ export class DirectorService {
             }),
           },
         }
+      } finally {
+        this.cardActionLocks.delete(lockKey)
+      }
+    }
+
+    if (val.kind === 'council_commit') {
+      this.cardActionLocks.add(lockKey)
+      try {
+        const councils = this.deps.councils
+        const rec = councils?.get(val.councilId)
+        if (!councils || !rec) {
+          return { toast: { type: 'warning', content: `找不到会商 ${val.councilId}` } }
+        }
+        if (rec.ticketId) {
+          return { toast: { type: 'info', content: `会商已关联工单 ${rec.ticketId}` } }
+        }
+        const brief = (rec.brief ?? '').trim()
+        if (!brief) {
+          return { toast: { type: 'warning', content: '会商尚未生成任务书，无法开工' } }
+        }
+        const created = await this.deps.host.createTicket(brief, undefined, undefined, rec.projectId)
+        if (created.ticketId) {
+          councils.attachTicket(rec.id, created.ticketId)
+          const sess = this.store.getOrCreateSession('feishu', event.operatorOpenId)
+          this.store.linkTicket(created.ticketId, sess)
+        }
+        const msg = created.ticketId ? `已按会商结论创建并启动工单 ${created.ticketId}` : '已提交会商开工请求'
+        return {
+          toast: { type: 'success', content: msg.slice(0, 80) },
+          card: {
+            type: 'raw',
+            data: buildSettledCard({
+              title: `${val.title || rec.topic}（已开工）`,
+              template: 'green',
+              markdown: `**会商**：\`${rec.id}\`\n${created.ticketId ? `**工单**：\`${created.ticketId}\`\n` : ''}\n${msg}`,
+              statusLine: '✅ 已由你在飞书一键按结论开工',
+            }),
+          },
+        }
+      } catch (err) {
+        const msg = this.deps.redact(err instanceof Error ? err.message : String(err))
+        return { toast: { type: 'error', content: `开工失败：${msg.slice(0, 70)}` } }
       } finally {
         this.cardActionLocks.delete(lockKey)
       }
@@ -1667,9 +1749,15 @@ export class DirectorService {
     ].join('\n')
   }
 
-  /** 低开销采集实时平台态势快照注入系统提示词，避免首轮盲查显著提速。 */
+  /** 低开销并发采集实时平台态势快照注入系统提示词，避免首轮盲查显著提速。 */
   private async buildLiveSnapshot(): Promise<string> {
     const lines: string[] = []
+    const missionsPromise = this.deps.plugins?.dispatchDirectorQuery(
+      'missions_list',
+      { limit: 5 },
+      { sessionId: 'snapshot', channel: 'web', userId: 'snapshot' },
+    ).catch(() => undefined)
+
     try {
       const ov = this.deps.host.overview()
       lines.push(`- 槽位：${ov.slots.used}/${ov.slots.max}｜接单：${ov.paused ? '已暂停' : '正常'}｜开放工单 ${ov.tickets.open}（运行中 ${ov.tickets.running}，等你回答 ${ov.tickets.needsPerson}）`)
@@ -1681,7 +1769,12 @@ export class DirectorService {
     try {
       const open = this.deps.host.listTickets({ status: 'open', limit: 6, offset: 0 })
       if (open.items.length > 0) {
-        lines.push(`- 当前开放工单：${open.items.map(t => `${t.id}「${t.title.slice(0, 28)}」[${t.stage}]`).join('；')}`)
+        lines.push(`- 当前开放工单：${open.items.map(t => {
+          const st = typeof t.stage === 'string'
+            ? t.stage
+            : (t.stage && 'action' in t.stage && t.stage.action ? `${t.stage.stage}:${t.stage.action}` : t.stage?.stage) || 'running'
+          return `${t.id}「${t.title.slice(0, 28)}」[${st}]`
+        }).join('；')}`)
       }
     } catch { /* mock host */ }
 
@@ -1693,11 +1786,7 @@ export class DirectorService {
     } catch { /* ignore */ }
 
     try {
-      const mRes = await this.deps.plugins?.dispatchDirectorQuery(
-        'missions_list',
-        { limit: 5 },
-        { sessionId: 'snapshot', channel: 'web', userId: 'snapshot' },
-      )
+      const mRes = await missionsPromise
       if (mRes?.matched) {
         const items = ((mRes.result as { items?: { id: string; title: string; status: string; planVersion: number; nodes: { key: string; status: string }[] }[] })?.items ?? [])
           .filter(m => m.status === 'running' || m.status === 'draft' || m.status === 'paused')

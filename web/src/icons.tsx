@@ -47,6 +47,13 @@ const P: Record<string, ReactNode> = {
   memory: <><path d="M9.5 4.5a3.5 3.5 0 0 0-3.5 3.5v.5A3 3 0 0 0 4 11.3a3 3 0 0 0 1.8 2.7v.5a3.5 3.5 0 0 0 3.7 3.5h.5V4.5zM14.5 4.5a3.5 3.5 0 0 1 3.5 3.5v.5A3 3 0 0 1 20 11.3a3 3 0 0 1-1.8 2.7v.5a3.5 3.5 0 0 1-3.7 3.5H14V4.5z" /></>,
   schedules: <><circle cx="12" cy="13" r="7.5" /><path d="M12 9v4l2.8 1.8M9 3.5h6M12 3.5V5.5" /></>,
   server: <><rect x="4" y="4.5" width="16" height="15" rx="2" /><path d="M8 9h8M8 13h5" /></>,
+  arrowUp: <path d="M12 19V5.5M6.5 11 12 5.5 17.5 11" />,
+  menu: <path d="M4.5 7.5h15M4.5 12h15M4.5 16.5h15" />,
+  globe: <><circle cx="12" cy="12" r="8.5" /><path d="M3.8 12h16.4M12 3.5c2.4 2.5 3.6 5.3 3.6 8.5s-1.2 6-3.6 8.5c-2.4-2.5-3.6-5.3-3.6-8.5s1.2-6 3.6-8.5z" /></>,
+  feishu: <path d="M5 6.5 13 4l6 4.5-6.5 4.5L5 6.5zm0 0 4.5 11.5 9.5-5.5-5-1.5" />,
+  grid: <><rect x="4.5" y="4.5" width="6" height="6" rx="1.5" /><rect x="13.5" y="4.5" width="6" height="6" rx="1.5" /><rect x="4.5" y="13.5" width="6" height="6" rx="1.5" /><rect x="13.5" y="13.5" width="6" height="6" rx="1.5" /></>,
+  chevronDown: <path d="m6.5 9.5 5.5 5.5 5.5-5.5" />,
+  panelRight: <><rect x="3.5" y="4.5" width="17" height="15" rx="2" /><path d="M15 4.5v15" /></>,
 }
 
 export function Icon({ name, size = 18, stroke = 1.7 }: { name: string; size?: number; stroke?: number }) {

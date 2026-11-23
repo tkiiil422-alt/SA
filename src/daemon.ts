@@ -9,15 +9,25 @@ function option(name: string): string | undefined {
   return index >= 0 ? process.argv[index + 1] : undefined
 }
 
-const configPath = option('--config')
-if (!configPath) {
-  console.error('Usage: superagentd --config <path>')
-  process.exit(1)
+const configPath = option('--config') ?? process.env.SA_CONFIG_PATH ?? 'examples/config.local.json'
+
+function applyEnvOverrides(config: ReturnType<typeof loadConfig>): ReturnType<typeof loadConfig> {
+  const hostEnv = process.env.SA_ADMIN_HOST?.trim() || process.env.HOST?.trim()
+  const portRaw = process.env.SA_ADMIN_PORT?.trim() || process.env.PORT?.trim()
+  const parsedPort = portRaw !== undefined && portRaw !== '' ? Number(portRaw) : undefined
+  const adminPort = parsedPort !== undefined && Number.isInteger(parsedPort) && parsedPort >= 0 && parsedPort <= 65535
+    ? parsedPort
+    : config.adminPort
+  return {
+    ...config,
+    adminHost: hostEnv || config.adminHost,
+    adminPort,
+  }
 }
 
 try {
-  const runtime = await createRuntime(loadConfig(configPath))
-  console.log(`superagentd ready: control ${runtime.controlUrl}, state ${runtime.stateDir}`)
+  const runtime = await createRuntime(applyEnvOverrides(loadConfig(configPath)))
+  console.log(`superagentd ready: admin ${runtime.adminUrl}, control ${runtime.controlUrl}, state ${runtime.stateDir}`)
   let stopping = false
   const shutdown = async (signal: string): Promise<void> => {
     if (stopping) return

@@ -12,6 +12,9 @@
  * the current packages, repack an existing dev image with a newer Pi version in ~20s without re-downloading gigabytes
  * of toolchains, and the Pi version page can automatically inherit the current dev base when upgrading Pi.
  */
+import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { defaultRunner, parsePiVersion, PI_REPO, type Runner } from './pi-versions.ts'
 
 export const DEV_REPO = 'localhost/superagent-dev'
@@ -51,6 +54,42 @@ export interface DevImageView {
   packages: string[]
   features: string[]
 }
+export const SHARED_CACHE_BUCKETS = [
+  { id: 'npm', label: 'npm 缓存', desc: 'Node.js npm 包下载缓存' },
+  { id: 'pnpm-store', label: 'pnpm 存储', desc: 'pnpm 内容寻址全局包仓库' },
+  { id: 'yarn', label: 'Yarn 缓存', desc: 'Yarn 离线包缓存' },
+  { id: 'bun', label: 'Bun 缓存', desc: 'Bun 安装包缓存' },
+  { id: 'pip', label: 'pip 缓存', desc: 'Python wheel 与源码包缓存' },
+  { id: 'uv', label: 'uv 缓存', desc: 'uv 极速 Python 依赖缓存' },
+  { id: 'go-mod', label: 'Go 模块缓存', desc: 'GOMODCACHE 下载模块缓存' },
+  { id: 'go-build', label: 'Go 编译缓存', desc: 'GOCACHE 增量编译缓存' },
+  { id: 'cargo', label: 'Cargo 缓存', desc: 'Rust crates 与索引缓存' },
+  { id: 'huggingface', label: 'HF 模型缓存', desc: 'HuggingFace 模型与数据集缓存' },
+  { id: 'playwright', label: 'Playwright 缓存', desc: '浏览器二进制缓存' },
+] as const
+
+export type SharedCacheBucketId = (typeof SHARED_CACHE_BUCKETS)[number]['id']
+
+export interface SharedCacheBucketView {
+  id: SharedCacheBucketId
+  label: string
+  desc: string
+  bytes: number
+  files: number
+  exists: boolean
+}
+
+export interface SharedEnvView {
+  enabled: boolean
+  mirrorsEnabled: boolean
+  cacheDir: string
+  toolsDir: string
+  totalCacheBytes: number
+  totalToolsBytes: number
+  buckets: SharedCacheBucketView[]
+  tools: string[]
+}
+
 export interface DevStatusView {
   /** The image new tickets start with. */
   image: string
@@ -63,6 +102,7 @@ export interface DevStatusView {
   recommendedDev?: DevImageView
   imagesError?: string
   available: { features: readonly DevFeature[] }
+  shared?: SharedEnvView
   job?: DevJobView
 }
 
@@ -81,6 +121,10 @@ export interface DevEnvDeps {
   run?: Runner
   now?: () => Date
   note?: (level: 'info' | 'warn' | 'error', text: string, data?: Record<string, unknown>) => void
+  /** Override host shared cache directory (default: SA_CACHE_ROOT or ~/superagent-cache). */
+  cacheDir?: string
+  /** Override host shared global tools directory (default: SA_TOOLS_ROOT or ~/superagent-tools). */
+  toolsDir?: string
 }
 
 /** Offline self-test of a dev image, in a container shaped like a worker's (read-only root, tmpfs HOME, keep-id). */
@@ -132,6 +176,92 @@ export function pickRecommendedDev(devImages: readonly DevImageView[]): DevImage
   const candidates = nonProbe.length > 0 ? nonProbe : [...devImages]
   const rich = candidates.find(i => i.features.length > 0 || i.packages.length > 0)
   return rich ?? candidates[0]
+}
+
+const VALID_BUCKET_SET = new Set<string>(SHARED_CACHE_BUCKETS.map(b => b.id))
+
+function dirStats(root: string, maxEntries = 8_000): { bytes: number; files: number; exists: boolean } {
+  if (!existsSync(root)) return { bytes: 0, files: 0, exists: false }
+  let bytes = 0
+  let files = 0
+  let visited = 0
+  const stack = [root]
+  while (stack.length > 0 && visited < maxEntries) {
+    const dir = stack.pop()!
+    let entries: string[]
+    try { entries = readdirSync(dir) } catch { continue }
+    for (const name of entries) {
+      if (++visited > maxEntries) break
+      const full = join(dir, name)
+      try {
+        const st = lstatSync(full)
+        if (st.isSymbolicLink()) continue
+        if (st.isDirectory()) stack.push(full)
+        else if (st.isFile()) { bytes += st.size; files += 1 }
+      } catch { /* ignore unreadable entries */ }
+    }
+  }
+  return { bytes, files, exists: true }
+}
+
+/** Pure inspection of shared worker cache & global tools directories on the host. */
+export function inspectSharedEnv(cacheDir: string, toolsDir: string): SharedEnvView {
+  const buckets: SharedCacheBucketView[] = SHARED_CACHE_BUCKETS.map(b => {
+    const st = dirStats(join(cacheDir, b.id), 4_000)
+    return { id: b.id, label: b.label, desc: b.desc, bytes: st.bytes, files: st.files, exists: st.exists }
+  })
+  const totalCacheBytes = buckets.reduce((acc, b) => acc + b.bytes, 0)
+  const toolsStat = dirStats(toolsDir, 6_000)
+
+  const binDirs = [
+    join(toolsDir, 'bin'),
+    join(toolsDir, 'npm', 'bin'),
+    join(toolsDir, 'pnpm'),
+    join(toolsDir, 'go', 'bin'),
+  ]
+  const toolNames = new Set<string>()
+  for (const d of binDirs) {
+    if (!existsSync(d)) continue
+    try {
+      for (const entry of readdirSync(d)) {
+        if (!entry.startsWith('.') && toolNames.size < 60) toolNames.add(entry)
+      }
+    } catch { /* ignore */ }
+  }
+
+  return {
+    enabled: process.env.SA_DEV_SHARED !== '0',
+    mirrorsEnabled: process.env.SA_DEV_MIRRORS !== '0',
+    cacheDir,
+    toolsDir,
+    totalCacheBytes,
+    totalToolsBytes: toolsStat.bytes,
+    buckets,
+    tools: [...toolNames].sort(),
+  }
+}
+
+/** Safely cleans one allowlisted shared cache bucket (or 'all' cache buckets). Never touches shared global tools. */
+export function cleanSharedCache(cacheDir: string, bucket: string): { cleaned: string[]; freedBytes: number } {
+  const targets: string[] = bucket === 'all'
+    ? SHARED_CACHE_BUCKETS.map(b => b.id)
+    : (VALID_BUCKET_SET.has(bucket) ? [bucket] : [])
+  if (targets.length === 0) {
+    throw new DevEnvError(`不允许清理缓存桶「${bucket}」，仅支持：all 或 ${SHARED_CACHE_BUCKETS.map(b => b.id).join('、')}。`, 400)
+  }
+  let freedBytes = 0
+  const cleaned: string[] = []
+  for (const id of targets) {
+    const dir = join(cacheDir, id)
+    const before = dirStats(dir, 6_000)
+    if (before.exists) {
+      rmSync(dir, { recursive: true, force: true })
+      mkdirSync(dir, { recursive: true })
+      freedBytes += before.bytes
+      cleaned.push(id)
+    }
+  }
+  return { cleaned, freedBytes }
 }
 
 export class DevEnvService {
@@ -198,12 +328,21 @@ export class DevEnvService {
     return exists.code === 0 ? base : undefined
   }
 
+  private resolveCacheDir(): string {
+    return this.deps.cacheDir ?? process.env.SA_CACHE_ROOT ?? join(homedir(), 'superagent-cache')
+  }
+
+  private resolveToolsDir(): string {
+    return this.deps.toolsDir ?? process.env.SA_TOOLS_ROOT ?? join(homedir(), 'superagent-tools')
+  }
+
   async status(): Promise<DevStatusView> {
     const image = this.deps.getImage()
     const [labels, devList] = await Promise.all([this.labels(image), this.listDevImages()])
     const base = labels['io.superagent.base']
     const hasBase = Boolean(base && base.startsWith(`${DEV_REPO}:`))
     const recommendedDev = !hasBase ? pickRecommendedDev(devList.items) : undefined
+    const shared = inspectSharedEnv(this.resolveCacheDir(), this.resolveToolsDir())
     return {
       image,
       ...(hasBase ? { base } : {}),
@@ -213,8 +352,21 @@ export class DevEnvService {
       ...(recommendedDev ? { recommendedDev } : {}),
       ...(devList.error ? { imagesError: devList.error } : {}),
       available: { features: DEV_FEATURES },
+      shared,
       ...(this.job ? { job: { ...this.job, log: [...this.job.log] } } : {}),
     }
+  }
+
+  cleanSharedCache(bucket: string): { ok: true; cleaned: string[]; freedBytes: number; shared: SharedEnvView } {
+    const cacheDir = this.resolveCacheDir()
+    const toolsDir = this.resolveToolsDir()
+    const result = cleanSharedCache(cacheDir, bucket)
+    this.deps.note?.('info', `清理共享缓存（${bucket}），释放 ${Math.round(result.freedBytes / 1024)} KB`, {
+      bucket,
+      cleaned: result.cleaned.join(','),
+      freedBytes: result.freedBytes,
+    })
+    return { ok: true, ...result, shared: inspectSharedEnv(cacheDir, toolsDir) }
   }
 
   /** Starts a full dev+Pi build in the background; one at a time. */

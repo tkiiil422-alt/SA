@@ -12,6 +12,7 @@ import type { SubsystemPlugin } from '../plugins/types.ts'
 import type { MemoryKind, MemoryScope, MemoryStore } from './store.ts'
 import type { SkillScope, SkillStore } from '../skills/store.ts'
 import { issuesOf } from '../admin/http.ts'
+import { buildOwnerIntentProfile } from '../director/intent-learner.ts'
 
 export interface MemoryPluginDeps {
   memories: MemoryStore
@@ -126,6 +127,20 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
         const limit = clampInt(url.searchParams.get('limit'), 8, 1, 20)
         const items = memories.recall({ query: q, ...(projectId ? { projectId } : {}), limit, recordUse: false })
         sendJson(res, 200, { items })
+        return true
+      }
+
+      if (route === '/memories/profile' && method === 'GET') {
+        const all = memories.list({ limit: 200 }).items
+        const profile = buildOwnerIntentProfile(all)
+        sendJson(res, 200, {
+          preferences: profile.preferences,
+          decisions: profile.decisions,
+          pitfalls: profile.pitfalls,
+          recentCorrections: profile.recentCorrections,
+          autoLearnedCount: profile.autoLearnedCount,
+          totalActive: profile.totalActive,
+        })
         return true
       }
 
@@ -352,7 +367,8 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
           content: redact(content),
           tags: strArr(args.tags),
           ...(typeof args.pinned === 'boolean' ? { pinned: args.pinned } : {}),
-          source: 'director',
+          ...(typeof args.confidence === 'number' && Number.isFinite(args.confidence) ? { confidence: Math.max(0.1, Math.min(1, args.confidence)) } : {}),
+          source: str(args.source).slice(0, 40) || 'director',
         })
         return { ok: true, item }
       },
@@ -431,6 +447,11 @@ export function createMemoryAndSkillsPlugin(deps: MemoryPluginDeps): SubsystemPl
         '- 写入动作（`subsystem_action`）：`memory_save({title,content,scope?:"user"|"project",kind?:"preference"|"fact"|"pitfall"|"decision",projectId?,tags?,pinned?})`、`memory_update`、`memory_delete`、`skill_save({name,slug?,description?,scope?,triggers?,content})`、`skill_delete`',
         '- 当主人明确交代长期偏好、环境约定或避坑经验时，主动用 `memory_save` 沉淀；当形成可复用操作 SOP 时，可建议或主动用 `skill_save` 沉淀为技能。',
       )
+
+      const profile = buildOwnerIntentProfile(memories.list({ limit: 120 }).items)
+      if (profile.promptBlock) {
+        blocks.push('', profile.promptBlock)
+      }
 
       if (pinned.length > 0) {
         blocks.push('', '### 置顶长期记忆（高优先级）')

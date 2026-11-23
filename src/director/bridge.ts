@@ -11,7 +11,11 @@ import type { EventLog } from '../ledger/events.ts'
 import type { DirectorService } from './service.ts'
 import type { DirectorFollowup, DirectorSession, FollowupTriggerKind } from './store.ts'
 import {
+  buildCouncilCompletedCard,
   buildMissionApprovalCard,
+  buildNoticeCard,
+  buildTicketAttentionCard,
+  buildTicketCompletedCard,
   buildTicketDecisionCard,
   buildVaultRequestCard,
 } from '../sources/feishu-cards.ts'
@@ -338,7 +342,7 @@ export class DirectorBridge {
     return undefined
   }
 
-  /** 为适合飞书一键点击确认/决策的事件构造 JSON 2.0 交互卡片。 */
+  /** 为各类平台推送事件构造结构化飞书 JSON 2.0 卡片（交互按钮卡片 + 结构化战报/进度/告警卡片）。 */
   private buildInteractiveCardForEvent(
     event: PlatformNoticeEvent,
     fallbackBody: string,
@@ -378,6 +382,55 @@ export class DirectorBridge {
         reason,
         diagnosis: fallbackBody,
         ...(exhaustedAttempts > 0 ? { attempts: exhaustedAttempts } : {}),
+      })
+    }
+    if (event.kind === 'ticket.ended') {
+      return buildTicketCompletedCard({
+        ticketId: event.ticketId,
+        title: event.title,
+        outcome: event.outcome,
+        summary: event.summary || fallbackBody,
+        ...(event.costUsd !== undefined ? { costUsd: event.costUsd } : {}),
+        ...(event.previews ? { previews: event.previews } : {}),
+      })
+    }
+    if (event.kind === 'ticket.attention') {
+      return buildTicketAttentionCard({
+        ticketId: event.ticketId,
+        title: event.title,
+        kind: event.state,
+        question: event.question || event.summary,
+      })
+    }
+    if (event.kind === 'council.ended') {
+      const brief = event.conclusion || fallbackBody
+      return buildCouncilCompletedCard({
+        councilId: event.councilId,
+        topic: event.topic,
+        status: event.status,
+        ...(brief ? { brief } : {}),
+        canCommit: event.status === 'done' && !event.ticketId,
+      })
+    }
+    if (event.kind === 'budget.blocked') {
+      return buildNoticeCard({
+        title: `预算上限暂停：${event.title}`,
+        subtitle: `工单 ${event.ticketId}`,
+        template: 'red',
+        markdown: `**暂停原因**\n${event.reason}`,
+        footnote: '回复「调高预算到 XX 美元并重试」即可快速恢复',
+      })
+    }
+    if (event.kind === 'milestone.progress') {
+      return buildNoticeCard({
+        title: `阶段进度播报：${event.title}`,
+        subtitle: `工单 ${event.ticketId}`,
+        template: 'wathet',
+        meta: [
+          { label: '已运行', value: `${event.elapsedMinutes} 分钟` },
+          { label: '当前阶段', value: event.stage },
+        ],
+        markdown: event.lastStep ? `**当前步骤**\n${event.lastStep}` : '任务持续推进中，完成后自动发送交付战报。',
       })
     }
     return undefined

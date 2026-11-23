@@ -84,14 +84,43 @@ function postText(content: unknown): string | undefined {
   for (const paragraph of locale.content) {
     if (!Array.isArray(paragraph)) continue
     lines.push(paragraph.map(segment => {
-      if (!isObject(segment) || (segment.tag !== 'text' && segment.tag !== 'a')) return ''
-      return typeof segment.text === 'string' ? segment.text : ''
+      if (!isObject(segment)) return ''
+      if (segment.tag === 'text') return typeof segment.text === 'string' ? segment.text : ''
+      if (segment.tag === 'a') {
+        const label = typeof segment.text === 'string' ? segment.text : ''
+        const href = typeof segment.href === 'string' ? segment.href : ''
+        return label || href
+      }
+      if (segment.tag === 'code_block') {
+        const code = typeof segment.text === 'string' ? segment.text : ''
+        const lang = typeof segment.language === 'string' ? segment.language : ''
+        return code ? `\n\`\`\`${lang}\n${code}\n\`\`\`\n` : ''
+      }
+      return ''
     }).join(''))
   }
   return lines.join('\n')
 }
 
-/** The plain text of a message: `@_user_N` placeholders removed; unsupported types get a marker. */
+function interactiveText(content: unknown): string | undefined {
+  if (!isObject(content)) return undefined
+  const lines: string[] = []
+  if (typeof content.title === 'string' && content.title.trim()) lines.push(content.title.trim())
+  if (Array.isArray(content.elements)) {
+    for (const row of content.elements) {
+      if (!Array.isArray(row)) continue
+      const rowText = row
+        .map(el => (isObject(el) && typeof el.text === 'string' ? el.text : ''))
+        .filter(Boolean)
+        .join('')
+        .trim()
+      if (rowText) lines.push(rowText)
+    }
+  }
+  return lines.length > 0 ? lines.join('\n') : undefined
+}
+
+/** The plain text of a message: `@_user_N` placeholders removed; rich/attachment types get readable markers. */
 function contentText(type: string, raw: unknown): string {
   const unsupported = `[不支持的消息类型: ${type}]`
   let content: unknown = raw
@@ -105,6 +134,10 @@ function contentText(type: string, raw: unknown): string {
   let text: string | undefined
   if (type === 'text' && isObject(content) && typeof content.text === 'string') text = content.text
   else if (type === 'post') text = postText(content)
+  else if (type === 'interactive') text = interactiveText(content)
+  else if (type === 'file' && isObject(content) && typeof content.file_name === 'string') text = `[文件: ${content.file_name}]`
+  else if (type === 'audio' && isObject(content)) text = '[语音消息]'
+  else if (type === 'media' && isObject(content) && typeof content.file_name === 'string') text = `[媒体文件: ${content.file_name}]`
   if (text === undefined) return unsupported
   return text.replace(PLACEHOLDER, '').trim()
 }
@@ -446,9 +479,26 @@ export class FeishuSource implements SourceScope {
     }
   }
 
+  private isTokenError(error: unknown): boolean {
+    const msg = describe(error)
+    return /HTTP 401|错误码 (?:99991661|99991663|99991668)\b/.test(msg)
+  }
+
+  private async withFreshToken<T>(cfg: FeishuOptions, work: (token: string) => Promise<T>): Promise<T> {
+    const token = await this.tenantToken(cfg)
+    try {
+      return await work(token)
+    } catch (error) {
+      if (!this.isTokenError(error)) throw error
+      this.token = undefined
+      const refreshed = await this.tenantToken(cfg)
+      return work(refreshed)
+    }
+  }
+
   /**
-   * 总控助手专用发送：以 Markdown 卡片（JSON 2.0）发出，卡片被拒时退回纯文本。
-   * `replyTo` 存在时回复该条消息（保持对话串），否则按 `openId`（或 `chatId`）发新消息，用于主动汇报。
+   * 总控助手专用发送：以 Markdown 卡片（JSON 2.0）发出，卡片被拒时退回纯文本；
+   * 遇到 tenant_access_token 过期时自动刷新重试一次，避免拿过期令牌降级纯文本。
    */
   async sendMarkdown(input: { openId?: string; chatId?: string; replyTo?: string; text: string }): Promise<void> {
     const cfg = this.options.config()
@@ -457,14 +507,22 @@ export class FeishuSource implements SourceScope {
     if (!text) return
     if (!input.replyTo && !input.openId && !input.chatId) throw new Error('飞书发送缺少目标（openId / chatId / replyTo）')
     try {
-      const token = await this.tenantToken(cfg)
-      for (const part of splitForFeishu(text, FEISHU_CARD_CHUNK)) {
-        const card = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: part }] } })
-        try {
-          await this.postMessage(cfg, token, input, 'interactive', card)
-        } catch {
-          await this.postMessage(cfg, token, input, 'text', JSON.stringify({ text: part }))
-        }
+      const parts = splitForFeishu(text, FEISHU_CARD_CHUNK)
+      for (let i = 0; i < parts.length; i += 1) {
+        const part = parts[i]!
+        const suffix = parts.length > 1 ? `\n\n<font color="grey">（第 ${i + 1}/${parts.length} 段）</font>` : ''
+        const card = JSON.stringify({
+          schema: '2.0',
+          body: { elements: [{ tag: 'markdown', content: `${part}${suffix}` }] },
+        })
+        await this.withFreshToken(cfg, async token => {
+          try {
+            await this.postMessage(cfg, token, input, 'interactive', card)
+          } catch (cardErr) {
+            if (this.isTokenError(cardErr)) throw cardErr
+            await this.postMessage(cfg, token, input, 'text', JSON.stringify({ text: part }))
+          }
+        })
       }
     } catch (error) {
       this.token = undefined
@@ -475,7 +533,7 @@ export class FeishuSource implements SourceScope {
 
   /**
    * 发送 JSON 2.0 交互式按钮卡片，返回消息 ID 供异步执行完毕后原位更新状态。
-   * 卡片被拒时自动退回 `fallbackText` 纯文本不丢通知。
+   * 令牌过期自动刷新重试；卡片结构被拒时自动退回 `fallbackText` 纯文本不丢通知。
    */
   async sendCard(input: {
     openId?: string
@@ -488,17 +546,19 @@ export class FeishuSource implements SourceScope {
     if (!cfg.enabled) throw new Error('飞书未启用')
     if (!input.replyTo && !input.openId && !input.chatId) throw new Error('飞书发送缺少目标（openId / chatId / replyTo）')
     try {
-      const token = await this.tenantToken(cfg)
-      try {
-        const messageId = await this.postMessage(cfg, token, input, 'interactive', JSON.stringify(input.card))
-        return messageId ? { messageId } : {}
-      } catch (cardErr) {
-        if (input.fallbackText?.trim()) {
-          const messageId = await this.postMessage(cfg, token, input, 'text', JSON.stringify({ text: input.fallbackText.trim().slice(0, 3800) }))
+      return await this.withFreshToken(cfg, async token => {
+        try {
+          const messageId = await this.postMessage(cfg, token, input, 'interactive', JSON.stringify(input.card))
           return messageId ? { messageId } : {}
+        } catch (cardErr) {
+          if (this.isTokenError(cardErr)) throw cardErr
+          if (input.fallbackText?.trim()) {
+            const messageId = await this.postMessage(cfg, token, input, 'text', JSON.stringify({ text: input.fallbackText.trim().slice(0, 3800) }))
+            return messageId ? { messageId } : {}
+          }
+          throw cardErr
         }
-        throw cardErr
-      }
+      })
     } catch (error) {
       this.token = undefined
       this.emit({ kind: 'feishu.send_failed', level: 'warn', text: '飞书交互卡片发送失败', data: { error: describe(error) } })
@@ -511,11 +571,13 @@ export class FeishuSource implements SourceScope {
     const cfg = this.options.config()
     if (!cfg.enabled || !messageId.trim()) return
     try {
-      const token = await this.tenantToken(cfg)
-      await this.request(cfg, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, 'PATCH', {
-        content: JSON.stringify(card),
-      }, token)
+      await this.withFreshToken(cfg, async token => {
+        await this.request(cfg, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, 'PATCH', {
+          content: JSON.stringify(card),
+        }, token)
+      })
     } catch (error) {
+      this.token = undefined
       this.emit({ kind: 'feishu.send_failed', level: 'warn', text: '飞书交互卡片原位更新失败', data: { error: describe(error), messageId } })
     }
   }
@@ -650,17 +712,40 @@ function credentialKey(cfg: FeishuOptions): string {
 /** 单张卡片的 Markdown 字数上限（远低于飞书 30KB 卡片限制，留足 JSON 转义余量）。 */
 const FEISHU_CARD_CHUNK = 3500
 
-/** 按换行优先切分长文本，避免单条消息超限。 */
+/** 按换行优先切分长文本，并自动维护 Markdown 代码块围栏闭合，避免跨段代码块错乱。 */
 export function splitForFeishu(text: string, maxChars: number): string[] {
   if (text.length <= maxChars) return [text]
   const parts: string[] = []
   let rest = text
+  let openFence: string | null = null
+  const trackFence = (chunk: string, current: string | null): string | null => {
+    let state = current
+    for (const line of chunk.split('\n')) {
+      const m = /^\s*(`{3,})([^\s`]*)/.exec(line)
+      if (!m) continue
+      if (state === null) state = m[1]! + (m[2] ?? '')
+      else if (line.trim().startsWith('```')) state = null
+    }
+    return state
+  }
   while (rest.length > maxChars) {
-    let cut = rest.lastIndexOf('\n', maxChars)
-    if (cut < maxChars * 0.5) cut = maxChars
-    parts.push(rest.slice(0, cut))
+    const prefix = openFence ? `${openFence}\n` : ''
+    const budget = Math.max(120, maxChars - prefix.length - 8)
+    if (rest.length <= budget) {
+      parts.push(`${prefix}${rest}`)
+      return parts
+    }
+    let cut = rest.lastIndexOf('\n', budget)
+    if (cut < budget * 0.5) cut = budget
+    const rawChunk = rest.slice(0, cut)
+    const nextFence = trackFence(rawChunk, openFence)
+    const closedChunk = nextFence ? `${prefix}${rawChunk}\n\`\`\`` : `${prefix}${rawChunk}`
+    parts.push(closedChunk)
+    openFence = nextFence
     rest = rest.slice(cut).replace(/^\n/, '')
   }
-  if (rest.length > 0) parts.push(rest)
+  if (rest.length > 0) {
+    parts.push(openFence ? `${openFence}\n${rest}` : rest)
+  }
   return parts
 }

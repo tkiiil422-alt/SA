@@ -107,6 +107,13 @@ export async function handleCouncilsAndRuntimeRoutes(deps: AdminRouteDeps, { req
       await dev(() => devEnv.removeDevImage(image.trim()))
       return true
     }
+    if (route === '/devenv/cache/clean' && method === 'POST') {
+      const body = await parseJsonBody(req)
+      const bucket = body && typeof body === 'object' ? (body as Record<string, unknown>).bucket : undefined
+      if (typeof bucket !== 'string' || !bucket.trim() || bucket.length > 64) throw new AdminError('invalid', '缺少要清理的缓存桶名称 bucket。', 400)
+      await dev(() => Promise.resolve(devEnv.cleanSharedCache(bucket.trim())))
+      return true
+    }
     sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
     return true
   }

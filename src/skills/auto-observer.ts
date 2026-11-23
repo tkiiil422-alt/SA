@@ -35,6 +35,11 @@ export class SkillAutoObserver {
   }): SkillVersionRecord[] {
     const uses = this.deps.skills.listTicketSkillUses(input.ticketId)
     if (uses.length === 0) return []
+    const isVerifiedSuccess = (input.outcome === 'completed' || input.outcome === 'merged') && input.acceptanceStatus === 'met'
+    if (isVerifiedSuccess) {
+      for (const u of uses) this.reworkHits.delete(u.skillId)
+      return []
+    }
     const isProblem = input.acceptanceStatus === 'unmet' || input.outcome === 'dropped' || input.outcome === 'failed'
     if (!isProblem) return []
 

@@ -75,23 +75,31 @@ if [[ -n "${SA_SECRET_NAMES:-}" ]]; then
 fi
 
 # Development environment shared by all tickets:
-#   /cache  download caches (npm, pnpm, pip, uv): a package fetched once is not downloaded again;
-#   /opt/sa tools a ticket installs globally (npm -g, uv tool, uv-installed Pythons): still there for the next ticket.
+#   /cache  download caches (npm, pnpm, yarn, bun, pip, uv, go, cargo, huggingface, playwright): fetched once, reused across tickets;
+#   /opt/sa tools a ticket installs globally (npm -g, pnpm, uv tool, uv-installed Pythons, go install): still there for the next ticket.
 # HOME is a tmpfs owned by the worker (`U`), so tools that write there work. SA_DEV_SHARED=0 turns the mounts off;
 # SA_DEV_MIRRORS=0 keeps the official package registries instead of the mirrors.
 DEV_ARGS=()
 if [[ "${SA_DEV_SHARED:-1}" != "0" ]]; then
   CACHE_ROOT="${SA_CACHE_ROOT:-$HOME/superagent-cache}"
   TOOLS_ROOT="${SA_TOOLS_ROOT:-$HOME/superagent-tools}"
-  mkdir -p "$CACHE_ROOT" "$TOOLS_ROOT/bin" "$TOOLS_ROOT/npm/bin" "$TOOLS_ROOT/pnpm"
+  mkdir -p \
+    "$CACHE_ROOT/npm" "$CACHE_ROOT/pnpm-store" "$CACHE_ROOT/yarn" "$CACHE_ROOT/bun" \
+    "$CACHE_ROOT/pip" "$CACHE_ROOT/uv" "$CACHE_ROOT/go-mod" "$CACHE_ROOT/go-build" \
+    "$CACHE_ROOT/cargo" "$CACHE_ROOT/huggingface" "$CACHE_ROOT/playwright" \
+    "$TOOLS_ROOT/bin" "$TOOLS_ROOT/npm/bin" "$TOOLS_ROOT/pnpm" "$TOOLS_ROOT/go/bin"
   DEV_ARGS+=(
     --volume "$CACHE_ROOT:/cache:rw"
     --volume "$TOOLS_ROOT:/opt/sa:rw"
     --env PIP_CACHE_DIR=/cache/pip --env UV_CACHE_DIR=/cache/uv
     --env npm_config_cache=/cache/npm --env npm_config_store_dir=/cache/pnpm-store
+    --env YARN_CACHE_FOLDER=/cache/yarn --env BUN_INSTALL_CACHE_DIR=/cache/bun
+    --env GOMODCACHE=/cache/go-mod --env GOCACHE=/cache/go-build
+    --env CARGO_HOME=/cache/cargo --env HF_HOME=/cache/huggingface
+    --env PLAYWRIGHT_BROWSERS_PATH=/cache/playwright
     --env UV_PYTHON_INSTALL_DIR=/opt/sa/python --env UV_TOOL_DIR=/opt/sa/uv-tools --env UV_TOOL_BIN_DIR=/opt/sa/bin
-    --env npm_config_prefix=/opt/sa/npm --env PNPM_HOME=/opt/sa/pnpm
-    --env PATH=/opt/sa/bin:/opt/sa/npm/bin:/opt/sa/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    --env npm_config_prefix=/opt/sa/npm --env PNPM_HOME=/opt/sa/pnpm --env GOPATH=/opt/sa/go
+    --env PATH=/opt/sa/bin:/opt/sa/npm/bin:/opt/sa/pnpm:/opt/sa/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   )
 fi
 if [[ "${SA_DEV_MIRRORS:-1}" != "0" ]]; then
@@ -99,6 +107,7 @@ if [[ "${SA_DEV_MIRRORS:-1}" != "0" ]]; then
     --env PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
     --env UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
     --env npm_config_registry=https://registry.npmmirror.com
+    --env GOPROXY=https://goproxy.cn,direct
   )
 fi
 

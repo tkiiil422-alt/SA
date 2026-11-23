@@ -1,16 +1,17 @@
 /**
- * 总控助手 AI 指挥中心（#/director）：
- * - 桌面端三栏指挥台（会话栏 · 流式对话主区 · 实时 DAG 计划板）
- * - 手机端类原生全屏对话布局（顶部三段视图切换「对话 / 会话 / 计划板」、横向快捷芯片栏、可折叠上下文约束抽屉、吸底输入区）
- * - 流式 SSE 思考与工具调用实时进度（`POST /api/director/chat/stream`）+ 支持中途停止（AbortController）
- * - 实时 DAG 任务计划编排与幂等审批、高危操作二次确认与自动续接管理
+ * 总控助手主工作台（默认首页 #/director）：
+ * - PC 端：左侧宽幅总控主对话画布（~62%）+ 右侧实时任务执行与进度面板（~38%，可折叠）
+ * - 手机端：打开即总控对话 + 顶部可展开实时进度条（零臃肿 5 格底栏）
+ * - 新开对话支持自由选择「网页对话」或「飞书对话」（自动关联/输入飞书 ID 并默认同步推送）
+ * - 完整保留：SSE 流式推理与中途停止、会话历史与批量删除、消息批量删除、高危操作审批、自动续接、上下文约束与 DAG 计划审批
  */
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { API, del, get, post } from './api'
 import { usePoll, ago, money } from './hooks'
-import { useLive } from './useLive'
+import { useLive, useTick } from './useLive'
 import { Icon } from './icons'
-import { Empty, Markdown, confirmAction, toast, useAction } from './ui'
+import { Empty, Markdown, Sheet, confirmAction, toast, useAction } from './ui'
+import { LiveProgressPanel } from './live-progress'
 import type {
   DirectorProgressEvent,
   MissionListResponse,
@@ -74,43 +75,6 @@ interface PendingFollowup {
 }
 
 const CHANNEL_LABEL: Record<string, string> = { wechat: '微信', web: '网页', feishu: '飞书' }
-const SCOPE_LABEL: Record<string, string> = { all: '全平台动态', wechat_only: '仅微信派单', off: '已静默' }
-const MISSION_STATUS: Record<MissionRecord['status'], string> = {
-  draft: '草稿',
-  running: '执行中',
-  paused: '已暂停',
-  completed: '已交付',
-  failed: '受阻',
-  cancelled: '已取消',
-}
-const MISSION_TONE: Record<MissionRecord['status'], string> = {
-  draft: 'human',
-  running: 'run',
-  paused: 'human',
-  completed: 'done',
-  failed: 'bad',
-  cancelled: 'done',
-}
-const NODE_STATUS: Record<MissionNodeRecord['status'], string> = {
-  pending: '等待依赖',
-  dispatching: '派单中',
-  running: '执行中',
-  waiting_approval: '待审批',
-  completed: '已完成',
-  failed: '失败',
-  skipped: '已跳过',
-  cancelled: '已取消',
-}
-const NODE_TONE: Record<MissionNodeRecord['status'], string> = {
-  pending: 'done',
-  dispatching: 'run',
-  running: 'run',
-  waiting_approval: 'human',
-  completed: 'done',
-  failed: 'bad',
-  skipped: 'done',
-  cancelled: 'done',
-}
 
 const STARTER_CARDS: { title: string; desc: string; tag: string; prompt: string; sendNow?: boolean }[] = [
   {
@@ -121,22 +85,22 @@ const STARTER_CARDS: { title: string; desc: string; tag: string; prompt: string;
   },
   {
     title: '网页改动 + 浏览器自检交付',
-    desc: '修改功能并运行 browser_verify 留证截图、生成交付回执',
+    desc: '修改功能并运行 browser_verify 留证截图与交付回执',
     tag: '研发工厂',
     prompt: '请修改指定项目的网页功能，要求提交表单后刷新页面数据仍然存在，并运行 browser_verify 完成断言与截图留证，最后提交审查与交付回执。具体修改：\n',
   },
   {
-    title: '周期销售周报（0 Token 核对）',
-    desc: '建立可修订任务约定：按付款日期归集、金额保留两位小数',
-    tag: '定时约定',
-    prompt: '请创建一个每周五执行的销售周报定时任务，建立任务约定：按付款日期归集、所有金额保留两位小数，并在交付回执中附上核对证据。',
-  },
-  {
     title: '全平台健康与花费体检',
-    desc: '一键查看活跃工单、主机负载、定时任务与今日花费',
+    desc: '一键排查活跃工单、定时巡检、主机负载与今日花费',
     tag: '秒查现状',
     prompt: '请排查当前所有进行中任务、定时巡检状态、今日花费与异常告警，给我一份简明汇总。',
     sendNow: true,
+  },
+  {
+    title: '沉淀我的偏好与工作口径',
+    desc: '告诉总控长期习惯，自动写入主人意图画像并持续遵循',
+    tag: '越用越懂',
+    prompt: '记住我的长期习惯：以后所有汇报先给核心结论再列明细，修改代码前必须先跑单测并附验证结果。',
   },
 ]
 
@@ -145,8 +109,6 @@ const QUICK_CHIPS: { label: string; cmd?: string; fill?: string }[] = [
   { label: '/计划', cmd: '/计划' },
   { label: '/帮助', cmd: '/帮助' },
   { label: 'DAG 拆解', fill: STARTER_CARDS[0]!.prompt },
-  { label: '网页+自检', fill: STARTER_CARDS[1]!.prompt },
-  { label: '周五周报', fill: STARTER_CARDS[2]!.prompt },
 ]
 
 export function Director() {
@@ -154,38 +116,44 @@ export function Director() {
   const missionsPoll = usePoll<MissionListResponse>('api/missions?limit=12', 4000)
   const projectsPoll = usePoll<{ items: { id: string; name: string; status: string }[] }>('api/projects', 30000)
   const { board } = useLive()
+  useTick()
 
   const [selectedId, setSelectedId] = useState<string>('')
   const [detail, setDetail] = useState<{ session: SessionItem; messages: DirMessage[]; pendingActions: PendingAct[]; followups?: PendingFollowup[] } | null>(null)
   const [detailErr, setDetailErr] = useState('')
   const [input, setInput] = useState('')
-  const [syncWechat, setSyncWechat] = useState(true)
+  const [syncChannel, setSyncChannel] = useState(true)
   const [sending, setSending] = useState(false)
   const [streamEvents, setStreamEvents] = useState<DirectorProgressEvent[]>([])
 
-  // 移动端三段切换视图（默认直接进入对话主区）
-  const [mobilePane, setMobilePane] = useState<'chat' | 'sessions' | 'ops'>('chat')
-  // 需求上下文约束抽屉（可折叠，保持输入区清爽）
+  // 面板与抽屉开关
+  const [showProgress, setShowProgress] = useState(true)
+  const [mobileProgressOpen, setMobileProgressOpen] = useState(false)
+  const [sessionsOpen, setSessionsOpen] = useState(false)
+  const [newChatOpen, setNewChatOpen] = useState(false)
+  const [newChatChannel, setNewChatChannel] = useState<'web' | 'feishu'>('web')
+  const [newChatTitle, setNewChatTitle] = useState('')
+  const [feishuTarget, setFeishuTarget] = useState('')
+  const [feishuReset, setFeishuReset] = useState(false)
+
+  // 上下文约束与更多操作
   const [ctxOpen, setCtxOpen] = useState(false)
   const [bindProjectId, setBindProjectId] = useState('')
   const [bindMode, setBindMode] = useState<ProjectWorkspaceMode>('worktree')
   const [strategy, setStrategy] = useState<'auto' | 'plan_first' | 'council_first'>('auto')
   const [requireVerify, setRequireVerify] = useState(true)
-  const [showOps, setShowOps] = useState(true)
-  // 会话列表与单会话消息的批量管理状态
+  const [chatMenuOpen, setChatMenuOpen] = useState(false)
+  const [showJumpBottom, setShowJumpBottom] = useState(false)
+
+  // 会话与消息批量管理
   const [manageSessions, setManageSessions] = useState(false)
   const [pickedSessions, setPickedSessions] = useState<string[]>([])
   const [removedSessionIds, setRemovedSessionIds] = useState<string[]>([])
   const [manageMsgs, setManageMsgs] = useState(false)
   const [pickedMsgIds, setPickedMsgIds] = useState<number[]>([])
-  // 手机端沉浸聊天控制：快捷工具抽屉、会话更多操作菜单、回到底部悬浮提示
-  const [toolsOpen, setToolsOpen] = useState(false)
-  const [chatMenuOpen, setChatMenuOpen] = useState(false)
-  const [showJumpBottom, setShowJumpBottom] = useState(false)
 
   const { busy, run } = useAction()
   const feedRef = useRef<HTMLDivElement>(null)
-  const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const abortRef = useRef<AbortController | null>(null)
   const stickToBottomRef = useRef(true)
@@ -198,7 +166,6 @@ export function Director() {
     stickToBottomRef.current = true
     setShowJumpBottom(false)
     const dist = el.scrollHeight - el.scrollTop - el.clientHeight
-    // 距离超过 2 屏时直接瞬时定位，避免长对话 smooth 滚动慢吞吞或中途反复触发回底按钮
     if (behavior === 'smooth' && dist <= el.clientHeight * 2 && typeof el.scrollTo === 'function') {
       el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
     } else {
@@ -219,19 +186,28 @@ export function Director() {
   const items = removedSessionIds.length > 0
     ? rawItems.filter(s => !removedSessionIds.includes(s.id))
     : rawItems
+  const feishuSessions = items.filter(s => s.channel === 'feishu')
   const st = sessionsPoll.d?.status
   const globalPending = sessionsPoll.d?.pendingActions ?? []
   const missions = missionsPoll.d?.items ?? []
   const readyProjects = (projectsPoll.d?.items ?? []).filter(p => p.status === 'ready')
 
-  const waitingApprovals = missions.reduce(
-    (sum, m) => sum + m.nodes.filter(n => n.status === 'waiting_approval').length,
-    0,
-  )
-  const opsAttention = waitingApprovals + globalPending.length
-  const activeMissionsCount = missions.filter(m => m.status === 'running' || m.status === 'draft').length
+  const openTickets = board?.open ?? []
+  const needCount = openTickets.filter(t => t.needsPerson).length
+  const runningSteps = board?.runningSteps ?? []
+  const runningCount = runningSteps.length
+  const slotsMax = board?.slots.max ?? 0
+  const todayUsd = board?.usage.todayUsd ?? 0
+  const waitingApprovals = missions.reduce((sum, m) => sum + m.nodes.filter(n => n.status === 'waiting_approval').length, 0)
+  const progressAlertCount = needCount + waitingApprovals
 
-  // 当后端轮询数据已不再包含被删会话时，自动释放乐观隐藏集合
+  // 同步外部「新开对话」事件（来自左轨 + 按钮）
+  useEffect(() => {
+    const onNew = () => openNewChatModal()
+    window.addEventListener('sa-director-new-chat', onNew)
+    return () => window.removeEventListener('sa-director-new-chat', onNew)
+  }, [feishuSessions.length])
+
   useEffect(() => {
     if (removedSessionIds.length === 0) return
     const rawSet = new Set(rawItems.map(s => s.id))
@@ -251,7 +227,7 @@ export function Director() {
       return
     }
     if (!selectedId && items.length > 0) {
-      const preferred = items.find(s => s.channel === 'web') ?? items.find(s => s.channel === 'wechat') ?? items[0]!
+      const preferred = items.find(s => s.channel === 'web') ?? items.find(s => s.channel === 'feishu') ?? items[0]!
       setSelectedId(preferred.id)
     }
   }, [items, selectedId, sessionsPoll.d])
@@ -293,13 +269,24 @@ export function Director() {
 
   useEffect(() => () => { abortRef.current?.abort() }, [])
 
+  // 承接其他页转交的总控指令
+  useEffect(() => {
+    try {
+      const handoff = sessionStorage.getItem('sa-director-handoff')
+      if (handoff && handoff.trim()) {
+        sessionStorage.removeItem('sa-director-handoff')
+        setInput(handoff)
+        setTimeout(() => textareaRef.current?.focus(), 60)
+      }
+    } catch { /* ignore */ }
+  }, [])
+
   const activeSession = detail?.session ?? items.find(s => s.id === selectedId)
   const messages = detail?.messages ?? []
   const visibleMessages = messages.filter(m => m.role !== 'tool')
   const lastMsgId = visibleMessages.length > 0 ? visibleMessages[visibleMessages.length - 1]!.id : 0
   const detailSessionId = detail?.session?.id ?? ''
 
-  // 切换会话时重置滚底标记与更多菜单
   useEffect(() => {
     setChatMenuOpen(false)
     lastSessionScrolledRef.current = ''
@@ -308,51 +295,44 @@ export function Director() {
     setShowJumpBottom(false)
   }, [selectedId])
 
-  // 打开总控页 / 首次加载历史消息 / 切回手机端「对话」分栏 / 收到新消息或流式进度时自动定位到最新内容
   useLayoutEffect(() => {
-    if (mobilePane !== 'chat') return
     if (!detailSessionId && !sending) return
-    const sessionKey = `${detailSessionId}:${mobilePane}`
-    const isInitialForSession = lastSessionScrolledRef.current !== sessionKey && visibleMessages.length > 0
-    const hasNewMessage = lastMsgId > lastMsgIdRef.current
+    const isInitial = lastSessionScrolledRef.current !== detailSessionId && visibleMessages.length > 0
+    const hasNew = lastMsgId > lastMsgIdRef.current
 
-    if (isInitialForSession) {
-      lastSessionScrolledRef.current = sessionKey
+    if (isInitial) {
+      lastSessionScrolledRef.current = detailSessionId
       lastMsgIdRef.current = lastMsgId
       scrollToBottom('auto')
       const raf = requestAnimationFrame(() => scrollToBottom('auto'))
       return () => cancelAnimationFrame(raf)
     }
 
-    if (hasNewMessage || sending) {
+    if (hasNew || sending) {
       lastMsgIdRef.current = lastMsgId
       if (stickToBottomRef.current || sending) {
         const raf = requestAnimationFrame(() => scrollToBottom(sending ? 'auto' : 'smooth'))
         return () => cancelAnimationFrame(raf)
       }
     }
-  }, [detailSessionId, visibleMessages.length, lastMsgId, sending, streamEvents.length, mobilePane])
+  }, [detailSessionId, visibleMessages.length, lastMsgId, sending, streamEvents.length])
 
-  // 手机端软键盘弹出导致可视高度变化时，若原本停留在最新位置则继续紧贴底部
   useEffect(() => {
     const vv = window.visualViewport
     if (!vv) return
     const onResize = () => {
-      if (mobilePane === 'chat' && stickToBottomRef.current) {
-        scrollToBottom('auto')
-      }
+      if (stickToBottomRef.current) scrollToBottom('auto')
     }
     vv.addEventListener('resize', onResize)
     return () => vv.removeEventListener('resize', onResize)
-  }, [mobilePane])
+  }, [])
 
-  // 聊天输入框单行起跳、随内容自动增高（最多 ~4 行），把首屏高度留给聊天记录
   useLayoutEffect(() => {
     const ta = textareaRef.current
     if (!ta) return
     ta.style.height = 'auto'
-    const maxH = window.innerWidth < 900 ? 104 : 140
-    ta.style.height = `${Math.min(maxH, Math.max(40, ta.scrollHeight))}px`
+    const maxH = window.innerWidth < 900 ? 108 : 152
+    ta.style.height = `${Math.min(maxH, Math.max(44, ta.scrollHeight))}px`
   }, [input])
 
   const toolResultMap = new Map<string, DirMessage>()
@@ -384,6 +364,38 @@ export function Director() {
   if (strategy === 'plan_first') activeContextTags.push('先出 DAG 方案')
   if (strategy === 'council_first') activeContextTags.push('先多角色会商')
 
+  const openNewChatModal = () => {
+    setNewChatChannel('web')
+    setNewChatTitle('')
+    setFeishuTarget(feishuSessions[0]?.userId || '')
+    setFeishuReset(false)
+    setNewChatOpen(true)
+  }
+
+  const createNewConversation = async () => {
+    if (newChatChannel === 'feishu' && !feishuTarget.trim()) {
+      toast('请选择已有飞书会话，或输入飞书接收者 ID（open_id / chat_id）', true)
+      return
+    }
+    await run(async () => {
+      const body: Record<string, unknown> = {
+        channel: newChatChannel,
+        ...(newChatTitle.trim() ? { title: newChatTitle.trim() } : {}),
+        ...(newChatChannel === 'feishu' ? { userId: feishuTarget.trim(), resetIfExists: feishuReset } : {}),
+      }
+      const res = await post<{ ok: boolean; session: SessionItem }>('api/director/sessions', body)
+      if (res?.session?.id) {
+        setSelectedId(res.session.id)
+        if (newChatChannel === 'feishu') setSyncChannel(true)
+        await loadDetail(res.session.id)
+      }
+      setNewChatOpen(false)
+      setSessionsOpen(false)
+      sessionsPoll.reload()
+      setTimeout(() => textareaRef.current?.focus(), 60)
+    }, newChatChannel === 'feishu' ? '已开启飞书总控对话（回复将自动同步飞书）' : '已开启全新网页对话')
+  }
+
   const stopSending = () => {
     abortRef.current?.abort()
     abortRef.current = null
@@ -392,16 +404,14 @@ export function Director() {
     toast('已中止当前推理')
   }
 
-  /** 通过 SSE 流式发送消息并实时渲染思考与工具调用进度，异常时优雅回退普通 POST。 */
   const sendMessage = async (overrideText?: string) => {
     const raw = (overrideText ?? input).trim()
     if (!raw || sending) return
     const text = overrideText ? raw : composeWithContext(raw)
     setSending(true)
     setStreamEvents([])
-    setMobilePane('chat')
-    setToolsOpen(false)
     setChatMenuOpen(false)
+    setMobileProgressOpen(false)
     stickToBottomRef.current = true
     if (!overrideText) setInput('')
     requestAnimationFrame(() => scrollToBottom('auto'))
@@ -413,7 +423,7 @@ export function Director() {
       text,
       channel: targetChannel,
       userId: targetUserId,
-      deliverToWechat: imChannel ? syncWechat : false,
+      deliverToWechat: imChannel ? syncChannel : false,
     }
 
     const ctl = new AbortController()
@@ -461,7 +471,7 @@ export function Director() {
         finalResult = await post('api/director/chat', payload)
       }
 
-      if (imChannel && syncWechat && finalResult) {
+      if (imChannel && syncChannel && finalResult) {
         const label = CHANNEL_LABEL[targetChannel] || targetChannel
         if (finalResult.wechatDelivered === true) toast(`回复已同步推送到${label}`)
         else if (finalResult.wechatDelivered === false) toast(`回复已生成，但推送${label}失败：${finalResult.wechatError || '未知错误'}`, true)
@@ -485,24 +495,14 @@ export function Director() {
     }
   }
 
-  const startWebChat = () => {
-    const existing = items.find(s => s.channel === 'web' && s.userId === 'console')
-    if (existing) {
-      setSelectedId(existing.id)
-      setMobilePane('chat')
-      return
-    }
-    void sendMessage('/状态')
-  }
-
   const pickSession = (id: string) => {
     setSelectedId(id)
-    setMobilePane('chat')
+    setSessionsOpen(false)
   }
 
   const fillInput = (text: string) => {
     setInput(text)
-    setMobilePane('chat')
+    setMobileProgressOpen(false)
     setTimeout(() => textareaRef.current?.focus(), 40)
   }
 
@@ -515,8 +515,8 @@ export function Director() {
 
   const resetCurrent = async () => {
     if (!selectedId) return
-    if (!await confirmAction('清空当前会话的短期记忆？历史审计记录会保留，仅重新开始对话上下文。', { title: '开启新对话', okLabel: '确认清空' })) return
-    await run(() => post(`api/director/sessions/${encodeURIComponent(selectedId)}/reset`, {}), '已开启新对话', () => {
+    if (!await confirmAction('清空当前会话的短期记忆？历史审计记录会保留，仅重新开始对话上下文。', { title: '清空上下文', okLabel: '确认清空' })) return
+    await run(() => post(`api/director/sessions/${encodeURIComponent(selectedId)}/reset`, {}), '已清空当前对话上下文', () => {
       void loadDetail(selectedId)
       sessionsPoll.reload()
     })
@@ -622,231 +622,128 @@ export function Director() {
     run(() => post(`api/missions/${encodeURIComponent(m.id)}/nodes/${encodeURIComponent(node.key)}/retry`, {}), `已局部重试「${node.title}」`, missionsPoll.reload)
 
   const pendingFollowups = (detail?.followups ?? []).filter(f => f.status === 'pending' || f.status === 'running')
-  const openTickets = board?.open ?? []
+  const firstRunning = runningSteps[0]
+  const firstRunningTitle = firstRunning ? (openTickets.find(t => t.id === firstRunning.id)?.title || '') : ''
 
-  return <div className="dir" data-mpane={mobilePane}>
-    {/* 顶部指挥台页头 */}
-    <header className="phead dir__head">
-      <div className="dir__titlewrap">
-        <div className="dir__titlerow">
-          <h1>总控指挥中心</h1>
-          {st && <span className="pill" data-tone={st.enabled ? 'run' : 'bad'}>
-            {st.enabled ? '在线' : '已关闭'}
-          </span>}
-        </div>
-        <p className="phead__sub only-desktop">自然语言理解需求、并行拆解 DAG 计划、自动绑定任务约定与证据验收</p>
-      </div>
-      <div className="dir__headactions">
-        <button type="button" className="ghost small only-desktop" onClick={() => setShowOps(v => !v)}>
-          <Icon name="sidebar" size={15} />
-          {showOps ? '收起计划板' : '展开计划板'}
-        </button>
-        <a className="btn small" href="#/settings/director"><Icon name="settings" size={14} />设置</a>
-        <a className="btn small only-desktop" href="#/memory"><Icon name="memory" size={14} />记忆进化</a>
-        <a className="btn small only-desktop" href="#/schedules"><Icon name="schedules" size={14} />定时巡检</a>
-      </div>
-    </header>
-
-    {/* 顶部运行指标条（PC 网格 / 手机横向滚动胶囊条） */}
-    {st && <div className="dir__stats" aria-label="总控运行指标">
-      <div className="dir__stat"><span>总控模型</span><b className="mono">{st.model || '—'}</b></div>
-      <div className="dir__stat"><span>今日花费</span><b>{money(st.todayUsd || 0)}{st.dailyUsd > 0 ? <small className="meta"> / {money(st.dailyUsd)}</small> : null}</b></div>
-      <div className="dir__stat"><span>活跃计划</span><b>{activeMissionsCount} 个</b></div>
-      <div className="dir__stat"><span>进行中工单</span><b>{openTickets.length} 张</b></div>
-      <div className="dir__stat"><span>主动汇报</span><b>{SCOPE_LABEL[st.notifyScope] || st.notifyScope}</b></div>
-      <div className={opsAttention > 0 ? 'dir__stat is-alert' : 'dir__stat'}>
-        <span>待审批事项</span>
-        <b>{opsAttention > 0 ? `${opsAttention} 项待确认` : '全部畅通'}</b>
-      </div>
-    </div>}
-
-    {/* 高危二次确认横幅（全局可见） */}
-    {globalPending.length > 0 && <section className="dir__pending" aria-label="待确认高危操作">
-      <div className="sechead">
-        <h2>待确认的高危操作</h2>
-        <span className="sechead__note">回复「/确认 短码」或点击按钮</span>
-      </div>
-      {globalPending.map(act => <div key={act.id} className="card dir__act">
-        <div className="dir__actmain">
-          <p className="dir__acttitle"><span className="pill" data-tone="human">#{act.id}</span> <b>{act.toolName}</b></p>
-          <p>{act.summary}</p>
-          <p className="meta">发起于 {ago(act.createdAt)} · 过期 {new Date(act.expiresAt).toLocaleTimeString()}</p>
-        </div>
-        <div className="dir__actbtns">
-          <button type="button" className="primary" disabled={busy} onClick={() => decideAction(act.id, 'approve')}>批准执行</button>
-          <button type="button" className="danger" disabled={busy} onClick={() => decideAction(act.id, 'reject')}>拒绝</button>
-        </div>
-      </div>)}
-    </section>}
-
-    {/* 手机端专属三段视图切换栏（PC 端自动隐藏） */}
-    <div className="dir__mnav" role="tablist" aria-label="总控视图切换">
-      <button type="button" role="tab" aria-selected={mobilePane === 'chat'} className={mobilePane === 'chat' ? 'is-on' : ''} onClick={() => setMobilePane('chat')}>
-        对话{sending ? ' · 推理中' : ''}
+  return <div className={showProgress ? 'studio-dir has-progress' : 'studio-dir'}>
+    {/* 手机端顶部可展开「实时进度条」 */}
+    <div className="dir-mstrip only-mobile">
+      <button
+        type="button"
+        className="dir-mstrip__btn"
+        aria-expanded={mobileProgressOpen}
+        onClick={() => setMobileProgressOpen(v => !v)}
+      >
+        <span className="dir-mstrip__main">
+          <i className={runningCount > 0 ? 'lp__dot is-run' : progressAlertCount > 0 ? 'lp__dot is-warn' : 'lp__dot'} />
+          <span className="dir-mstrip__text">
+            {runningCount > 0
+              ? `${runningCount}/${slotsMax} 运行中${firstRunningTitle ? ` · ${firstRunningTitle}` : ''}`
+              : progressAlertCount > 0
+                ? `${progressAlertCount} 项待你拍板`
+                : `${slotsMax || 3} 个工位待命`}
+          </span>
+        </span>
+        <span className="dir-mstrip__right mono">
+          <span>{money(todayUsd)}</span>
+          <Icon name="chevronDown" size={14} />
+        </span>
       </button>
-      <button type="button" role="tab" aria-selected={mobilePane === 'sessions'} className={mobilePane === 'sessions' ? 'is-on' : ''} onClick={() => setMobilePane('sessions')}>
-        会话 ({items.length})
-      </button>
-      <button type="button" role="tab" aria-selected={mobilePane === 'ops'} className={mobilePane === 'ops' ? 'is-on' : ''} onClick={() => setMobilePane('ops')}>
-        计划板 ({missions.length})
-        {opsAttention > 0 && <span className="nb need">{opsAttention}</span>}
-      </button>
+      {runningCount > 0 && <span className="dir-mstrip__line" aria-hidden="true" />}
     </div>
 
-    {/* 主三栏工作区（纯 CSS Grid 响应式，绝不写内联 gridTemplateColumns） */}
-    <div className={showOps ? 'dir__layout has-ops' : 'dir__layout'}>
-      {/* 左栏：会话列表（支持多选批量删除） */}
-      <aside className="dir__side dir__pane-sessions">
-        <div className="dir__sidehead">
-          <b>会话列表</b>
-          <div className="dir__sideacts">
-            {items.length > 0 && (
-              <button
-                type="button"
-                className={manageSessions ? 'ghost small is-active' : 'ghost small'}
-                disabled={busy}
-                onClick={() => {
-                  setManageSessions(v => {
-                    if (v) setPickedSessions([])
-                    return !v
-                  })
-                }}
-              >
-                {manageSessions ? '完成' : '批量删除'}
-              </button>
-            )}
-            {!manageSessions && <button type="button" className="ghost small" onClick={startWebChat}>＋ 新建</button>}
-          </div>
-        </div>
-        {manageSessions && items.length > 0 && <div className="dir__bulkbar" role="region" aria-label="会话批量操作">
-          <label className="dir__checkall">
-            <input
-              type="checkbox"
-              checked={pickedSessions.length === items.length && items.length > 0}
-              onChange={toggleAllSessions}
-            />
-            <span>{pickedSessions.length === items.length ? '取消全选' : '全选'} ({pickedSessions.length}/{items.length})</span>
-          </label>
+    {/* 手机端展开的实时任务进度面板 */}
+    {mobileProgressOpen && (
+      <div className="dir-mprogress only-mobile">
+        <LiveProgressPanel
+          compact
+          missions={missions}
+          onReloadMissions={missionsPoll.reload}
+          onMissionOp={missionOp}
+          onApproveMissionNode={approveMissionNode}
+          onRetryMissionNode={retryMissionNode}
+          onIntervene={fillInput}
+          busy={busy}
+        />
+      </div>
+    )}
+
+    {/* 左侧宽幅主舞台：总控对话画布 */}
+    <section className="dir-stage" aria-label="总控助手对话">
+      {/* 轻盈顶栏 */}
+      <header className="dir-bar">
+        <div className="dir-bar__left">
           <button
             type="button"
-            className="danger small"
-            disabled={busy || pickedSessions.length === 0}
-            onClick={() => void deletePickedSessions()}
+            className="dir-sessbtn"
+            onClick={() => setSessionsOpen(true)}
+            title="切换或管理历史对话"
           >
-            删除 ({pickedSessions.length})
+            <span className="dir-chan">{CHANNEL_LABEL[activeSession?.channel || 'web'] || '网页'}</span>
+            <b>{activeSession ? (activeSession.title || activeSession.userId) : '新网页对话'}</b>
+            <Icon name="chevronDown" size={14} />
           </button>
-        </div>}
-        {items.length === 0
-          ? <Empty>还没有总控对话。直接在对话区输入目标即可开始。</Empty>
-          : <div className="dir__sessions">
-            {items.map(s => {
-              const picked = pickedSessions.includes(s.id)
-              const cls = [
-                'dir__sess',
-                !manageSessions && s.id === selectedId ? 'is-on' : '',
-                manageSessions && picked ? 'is-picked' : '',
-              ].filter(Boolean).join(' ')
-              return <button
-                key={s.id}
-                type="button"
-                className={cls}
-                onClick={() => manageSessions ? toggleSessionPick(s.id) : pickSession(s.id)}
-              >
-                <div className="dir__sesstop">
-                  {manageSessions && <input
-                    type="checkbox"
-                    className="dir__chk"
-                    checked={picked}
-                    onChange={() => toggleSessionPick(s.id)}
-                    onClick={e => e.stopPropagation()}
-                    aria-label={`选择会话 ${s.title || s.userId}`}
-                  />}
-                  <span className="dir__tag">{CHANNEL_LABEL[s.channel] || s.channel}</span>
-                  <b>{s.title || s.userId}</b>
-                  {s.pendingActions > 0 && <span className="nb need">{s.pendingActions}</span>}
-                </div>
-                <span className="meta dir__preview">{s.lastMessage || '（新会话）'}</span>
-                <span className="meta">{s.messageCount} 条 · {ago(s.updatedAt)}</span>
-              </button>
-            })}
-          </div>}
-      </aside>
-
-      {/* 中栏：核心流式对话区 */}
-      <section className="dir__chat dir__pane-chat">
-        <div className="dir__chathead">
-          <div className="dir__chatinfo">
-            <div className="dir__chattitle">
-              {st && <i className={st.enabled ? 'dir__dot is-on' : 'dir__dot'} aria-hidden="true" />}
-              <b>{activeSession ? (activeSession.title || activeSession.userId) : '新网页对话'}</b>
-            </div>
-            <span className="meta only-desktop">
-              {activeSession ? `通道：${CHANNEL_LABEL[activeSession.channel] || activeSession.channel}` : '直接交代目标，总控自动建立会话'}
-              {activeSession?.focusTicketId && <> · 聚焦：<a href={`#/tickets/${encodeURIComponent(activeSession.focusTicketId)}`}>{activeSession.focusTicketId.slice(0, 10)}</a></>}
+          {st && (
+            <span className="dir-bar__meta only-desktop mono">
+              {st.model || '未配置模型'}
+              <span aria-hidden="true"> · </span>
+              <span data-ok={st.enabled}>{st.enabled ? '在线' : '已关闭'}</span>
             </span>
-          </div>
-          {/* 桌面端平铺操作按钮 */}
-          <div className="dir__chattools only-desktop">
-            {activeSession && (activeSession.channel === 'wechat' || activeSession.channel === 'feishu') && (
-              <label className="dir__synclabel">
-                <input type="checkbox" checked={syncWechat} onChange={e => setSyncWechat(e.target.checked)} />
-                同步{CHANNEL_LABEL[activeSession.channel]}
-              </label>
-            )}
-            <button type="button" className="ghost small" disabled={sending} onClick={() => void sendMessage('/状态')}>/状态</button>
-            {activeSession && visibleMessages.length > 0 && (
-              <button
-                type="button"
-                className={manageMsgs ? 'ghost small is-active' : 'ghost small'}
-                disabled={busy || sending}
-                onClick={() => {
-                  setManageMsgs(v => {
-                    if (v) setPickedMsgIds([])
-                    return !v
-                  })
-                }}
-              >
-                {manageMsgs ? '退出清理' : '删消息'}
-              </button>
-            )}
-            {activeSession && <button type="button" className="ghost small" disabled={busy || sending} onClick={resetCurrent}>新对话</button>}
-            {activeSession && <button type="button" className="ghost small danger" disabled={busy || sending} onClick={() => void deleteCurrentSession()}>删除会话</button>}
-          </div>
-          {/* 手机端极简单行操作（把垂直空间留给对话消息） */}
-          <div className="dir__chattools only-mobile">
-            {activeSession && (
-              <button type="button" className="ghost small" disabled={busy || sending} onClick={resetCurrent}>新对话</button>
-            )}
-            <button
-              type="button"
-              className={chatMenuOpen ? 'ghost small is-active dir__morebtn' : 'ghost small dir__morebtn'}
-              aria-label="更多会话操作"
-              aria-expanded={chatMenuOpen}
-              onClick={() => setChatMenuOpen(v => !v)}
-            >
-              ⋯
-            </button>
-          </div>
+          )}
         </div>
 
-        {/* 手机端展开的会话操作条 */}
-        {chatMenuOpen && <div className="dir__mactions only-mobile">
+        <div className="dir-bar__right">
           {activeSession && (activeSession.channel === 'wechat' || activeSession.channel === 'feishu') && (
-            <label className="dir__synclabel">
-              <input type="checkbox" checked={syncWechat} onChange={e => setSyncWechat(e.target.checked)} />
-              同步{CHANNEL_LABEL[activeSession.channel]}
+            <label className="dir-sync only-desktop">
+              <input type="checkbox" checked={syncChannel} onChange={e => setSyncChannel(e.target.checked)} />
+              <span>同步{CHANNEL_LABEL[activeSession.channel]}</span>
             </label>
           )}
+          <button type="button" className="dir-newbtn" onClick={openNewChatModal}>
+            <Icon name="new" size={14} />
+            <span>新对话</span>
+          </button>
+          <button
+            type="button"
+            className={chatMenuOpen ? 'ghost small dir-iconbtn is-active' : 'ghost small dir-iconbtn'}
+            aria-label="更多会话操作"
+            aria-expanded={chatMenuOpen}
+            onClick={() => setChatMenuOpen(v => !v)}
+          >
+            <Icon name="more" size={16} />
+          </button>
+          <button
+            type="button"
+            className={showProgress ? 'ghost small dir-iconbtn only-desktop is-active' : 'ghost small dir-iconbtn only-desktop'}
+            title={showProgress ? '收起右侧任务进度' : '展开右侧任务进度'}
+            aria-label={showProgress ? '收起右侧任务进度' : '展开右侧任务进度'}
+            onClick={() => setShowProgress(v => !v)}
+          >
+            <Icon name="panelRight" size={16} />
+            {progressAlertCount > 0 && !showProgress && <span className="dir-dotbadge">{progressAlertCount}</span>}
+          </button>
+        </div>
+      </header>
+
+      {/* 会话更多操作下拉条 */}
+      {chatMenuOpen && (
+        <div className="dir-menu" role="region" aria-label="会话操作">
+          {activeSession && (activeSession.channel === 'wechat' || activeSession.channel === 'feishu') && (
+            <label className="dir-sync only-mobile">
+              <input type="checkbox" checked={syncChannel} onChange={e => setSyncChannel(e.target.checked)} />
+              <span>同步{CHANNEL_LABEL[activeSession.channel]}</span>
+            </label>
+          )}
+          <button type="button" className="ghost small" onClick={() => { setChatMenuOpen(false); setSessionsOpen(true) }}>
+            历史会话 ({items.length})
+          </button>
           {activeSession && visibleMessages.length > 0 && (
             <button
               type="button"
               className={manageMsgs ? 'ghost small is-active' : 'ghost small'}
               disabled={busy || sending}
               onClick={() => {
-                setManageMsgs(v => {
-                  if (v) setPickedMsgIds([])
-                  return !v
-                })
+                setManageMsgs(v => { if (v) setPickedMsgIds([]); return !v })
                 setChatMenuOpen(false)
               }}
             >
@@ -854,19 +751,44 @@ export function Director() {
             </button>
           )}
           {activeSession && (
-            <button
-              type="button"
-              className="ghost small danger"
-              disabled={busy || sending}
-              onClick={() => { setChatMenuOpen(false); void deleteCurrentSession() }}
-            >
-              删除会话
+            <button type="button" className="ghost small" disabled={busy || sending} onClick={() => { setChatMenuOpen(false); void resetCurrent() }}>
+              清空上下文
             </button>
           )}
-          <a className="btn small" href="#/settings/director" onClick={() => setChatMenuOpen(false)}>总控设置</a>
-        </div>}
+          {activeSession && (
+            <button type="button" className="ghost small danger" disabled={busy || sending} onClick={() => { setChatMenuOpen(false); void deleteCurrentSession() }}>
+              删除当前会话
+            </button>
+          )}
+          <a className="ghost small" href="#/settings/director" onClick={() => setChatMenuOpen(false)}>总控设置</a>
+        </div>
+      )}
 
-        {manageMsgs && visibleMessages.length > 0 && <div className="dir__bulkbar" role="region" aria-label="消息批量删除">
+      {/* 高危二次确认横幅 */}
+      {globalPending.length > 0 && (
+        <div className="dir-pendingwrap" role="region" aria-label="待确认高危操作">
+          {globalPending.map(act => (
+            <div key={act.id} className="dir-actcard">
+              <div className="dir-actmain">
+                <div className="dir-acthead">
+                  <span className="dir-actcode mono">#{act.id}</span>
+                  <b>{act.toolName}</b>
+                  <span className="meta">发起于 {ago(act.createdAt)}</span>
+                </div>
+                <p>{act.summary}</p>
+              </div>
+              <div className="dir-actbtns">
+                <button type="button" className="primary small" disabled={busy} onClick={() => decideAction(act.id, 'approve')}>批准执行</button>
+                <button type="button" className="danger small" disabled={busy} onClick={() => decideAction(act.id, 'reject')}>拒绝</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* 批量删消息工具条 */}
+      {manageMsgs && visibleMessages.length > 0 && (
+        <div className="dir__bulkbar" role="region" aria-label="消息批量删除">
           <label className="dir__checkall">
             <input
               type="checkbox"
@@ -876,348 +798,460 @@ export function Director() {
             <span>{pickedMsgIds.length === visibleMessages.length ? '取消全选' : '全选消息'} ({pickedMsgIds.length}/{visibleMessages.length})</span>
           </label>
           <div className="dir__bulkacts">
-            <button
-              type="button"
-              className="danger small"
-              disabled={busy || pickedMsgIds.length === 0}
-              onClick={() => void deletePickedMsgs()}
-            >
+            <button type="button" className="danger small" disabled={busy || pickedMsgIds.length === 0} onClick={() => void deletePickedMsgs()}>
               删除所选 ({pickedMsgIds.length})
             </button>
             <button type="button" className="ghost small" onClick={() => { setManageMsgs(false); setPickedMsgIds([]) }}>取消</button>
           </div>
-        </div>}
-
-        {activeSession?.summary && <details className="dir__summary">
-          <summary>早期记忆摘要（已压缩）</summary>
-          <p>{activeSession.summary}</p>
-        </details>}
-
-        {pendingFollowups.length > 0 && <div className="dir__summary">
-          <b>已登记的自动续接（{pendingFollowups.length}）</b>
-          {pendingFollowups.map(fw => <div key={fw.id} className="dir__fwrow">
-            <span>
-              <span className="dir__tag">{fw.status === 'running' ? '续接中' : '等完工'}</span>{' '}
-              <code className="mono">{fw.targetId.slice(0, 12)}</code> → {fw.instruction}
-            </span>
-            {fw.status === 'pending' && <button type="button" className="ghost small danger" disabled={busy} onClick={() => cancelFollowup(fw.id)}>取消</button>}
-          </div>)}
-        </div>}
-
-        {detailErr && <p className="warn" style={{ margin: '4px 0' }}>{detailErr}</p>}
-
-        {/* 消息流（默认贴底展示最新内容，上翻查看历史时浮现回底胶囊） */}
-        <div className="dir__feedwrap">
-        <div className="dir__feed" ref={feedRef} onScroll={onFeedScroll}>
-          {visibleMessages.length === 0 && !sending && <div className="dir__welcome">
-            <div className="dir__welcome-head">
-              <div className="dir__avatar is-lg"><Icon name="director" size={22} /></div>
-              <div>
-                <h3>把任务目标直接交给我</h3>
-                <p className="meta">我会结合实时平台态势、项目源码和你的长期偏好自动规划、派单、自检并交付。</p>
-              </div>
-            </div>
-            <div className="dir__starters">
-              {STARTER_CARDS.map(card => <button
-                key={card.title}
-                type="button"
-                className="dir__starter"
-                onClick={() => card.sendNow ? void sendMessage(card.prompt) : fillInput(card.prompt)}
-              >
-                <div className="dir__starter-top">
-                  <b>{card.title}</b>
-                  <span className="dir__tag">{card.tag}</span>
-                </div>
-                <span className="meta">{card.desc}</span>
-              </button>)}
-            </div>
-          </div>}
-
-          {visibleMessages.map(m => {
-            const picked = pickedMsgIds.includes(m.id)
-            const wrapMsg = (node: ReactNode, alignRight = false) => {
-              if (!manageMsgs) return node
-              return <div
-                key={m.id}
-                className={[
-                  'dir__msgpick',
-                  alignRight ? 'is-right' : '',
-                  picked ? 'is-picked' : '',
-                ].filter(Boolean).join(' ')}
-                onClick={() => toggleMsgPick(m.id)}
-              >
-                <input
-                  type="checkbox"
-                  className="dir__chk"
-                  checked={picked}
-                  onChange={() => toggleMsgPick(m.id)}
-                  onClick={e => e.stopPropagation()}
-                  aria-label={`选择消息 #${m.id}`}
-                />
-                {node}
-              </div>
-            }
-
-            if (m.role === 'event') {
-              return wrapMsg(<div key={m.id} className={m.archived ? 'dir__event is-arch' : 'dir__event'}>
-                <div className="dir__eventhead">
-                  <span className="dir__tag">平台动态</span>
-                  <span className="meta">{ago(m.createdAt)}</span>
-                </div>
-                <div className="dir__eventbody"><Markdown text={m.content} /></div>
-              </div>)
-            }
-            if (m.role === 'user') {
-              return wrapMsg(<div key={m.id} className={m.archived ? 'dir__msg is-user is-arch' : 'dir__msg is-user'}>
-                <div className="dir__bubble">{m.content}</div>
-                <span className="meta">{ago(m.createdAt)}</span>
-              </div>, true)
-            }
-            const calls = m.toolCalls ?? []
-            return wrapMsg(<div key={m.id} className={m.archived ? 'dir__msg is-ai is-arch' : 'dir__msg is-ai'}>
-              {calls.length > 0 && <details className="dir__tools">
-                <summary>
-                  <span className="dir__tools-dot" aria-hidden="true" />
-                  <span>调用 {calls.length} 项工具：{calls.map(c => {
-                    const act = typeof c.arguments?.action === 'string' ? c.arguments.action : ''
-                    return act ? `${c.name}(${act})` : c.name
-                  }).join('、')}</span>
-                </summary>
-                <div className="dir__toollist">
-                  {calls.map(c => {
-                    const res = toolResultMap.get(c.id)
-                    const ok = res?.meta?.ok !== false
-                    return <div key={c.id} className="dir__toolitem">
-                      <div className="dir__toolhead">
-                        <b className="mono">{c.name}{typeof c.arguments?.action === 'string' ? `.${c.arguments.action}` : ''}</b>
-                        <span className="pill" data-tone={ok ? 'done' : 'bad'}>
-                          {ok ? '成功' : '失败'}{typeof res?.meta?.ms === 'number' ? ` · ${res.meta.ms}ms` : ''}
-                        </span>
-                      </div>
-                      <pre className="mono">{JSON.stringify(c.arguments ?? {}, null, 2)}</pre>
-                      {res && <pre className="mono dir__toolout">{res.content.slice(0, 1200)}{res.content.length > 1200 ? '\n…（已折叠）' : ''}</pre>}
-                    </div>
-                  })}
-                </div>
-              </details>}
-              {m.content && <div className="dir__bubble">
-                <Markdown text={m.content} />
-              </div>}
-              <div className="dir__msgfoot">
-                <span className="meta">
-                  {ago(m.createdAt)}
-                  {typeof m.meta?.model === 'string' && ` · ${m.meta.model}`}
-                  {typeof m.meta?.toolsCount === 'number' && m.meta.toolsCount > 0 && ` · ${m.meta.toolsCount} 次工具`}
-                </span>
-                {m.content && !manageMsgs && <button type="button" className="dir__copybtn" onClick={() => copyText(m.content)} title="复制回复">
-                  <Icon name="copy" size={13} />复制
-                </button>}
-              </div>
-            </div>)
-          })}
-
-          {sending && <div className="dir__msg is-ai">
-            <div className="dir__bubble dir__streamcard">
-              <div className="dir__streamhead">
-                <span className="dir__pulse" aria-hidden="true" />
-                <b>总控正在实时推理与调度…</b>
-                <button type="button" className="ghost small danger" onClick={stopSending}>停止</button>
-              </div>
-              {streamEvents.length > 0 && <ul className="dir__streamlist">
-                {streamEvents.map((ev, i) => <li key={i}>
-                  {ev.type === 'start' && `已连接总控模型 ${ev.model || ''}`}
-                  {ev.type === 'thinking' && `第 ${ev.step} 轮：${ev.message}`}
-                  {ev.type === 'tool_start' && `调用 ${ev.name}${ev.action ? `(${ev.action})` : ''}…`}
-                  {ev.type === 'tool_done' && `${ev.ok ? '✓' : '✗'} ${ev.name}${ev.action ? `(${ev.action})` : ''} (${ev.ms}ms)：${ev.summary}`}
-                </li>)}
-              </ul>}
-            </div>
-          </div>}
-          <div ref={bottomRef} />
         </div>
+      )}
+
+      {/* 对话主滚动区 */}
+      <div className="dir-feedwrap">
+        <div className="dir-feed" ref={feedRef} onScroll={onFeedScroll}>
+          <div className="dir-feed__inner">
+            {activeSession?.summary && (
+              <details className="dir-note">
+                <summary>早期记忆摘要（已压缩）</summary>
+                <p>{activeSession.summary}</p>
+              </details>
+            )}
+
+            {pendingFollowups.length > 0 && (
+              <div className="dir-note">
+                <b>已登记自动续接（{pendingFollowups.length}）</b>
+                {pendingFollowups.map(fw => (
+                  <div key={fw.id} className="dir__fwrow">
+                    <span>
+                      <code className="mono">{fw.targetId.slice(0, 12)}</code> → {fw.instruction}
+                    </span>
+                    {fw.status === 'pending' && (
+                      <button type="button" className="ghost small danger" disabled={busy} onClick={() => cancelFollowup(fw.id)}>取消</button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {detailErr && <p className="warn dir__err">{detailErr}</p>}
+
+            {visibleMessages.length === 0 && !sending && (
+              <div className="dir-hero">
+                <div className="dir-hero__head">
+                  <h1>有什么可以帮你？</h1>
+                  <p className="meta">直接交代目标、查询进度或沉淀偏好。我会结合实时工位、项目代码与你的长期习惯自动推进。</p>
+                </div>
+                <div className="dir-starters">
+                  {STARTER_CARDS.map(card => (
+                    <button
+                      key={card.title}
+                      type="button"
+                      className="dir-starter"
+                      onClick={() => card.sendNow ? void sendMessage(card.prompt) : fillInput(card.prompt)}
+                    >
+                      <div className="dir-starter__top">
+                        <b>{card.title}</b>
+                        <span className="meta">{card.tag}</span>
+                      </div>
+                      <span className="meta">{card.desc}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {visibleMessages.map(m => {
+              const picked = pickedMsgIds.includes(m.id)
+              const wrapMsg = (node: ReactNode, alignRight = false) => {
+                if (!manageMsgs) return node
+                return <div
+                  key={m.id}
+                  className={['dir__msgpick', alignRight ? 'is-right' : '', picked ? 'is-picked' : ''].filter(Boolean).join(' ')}
+                  onClick={() => toggleMsgPick(m.id)}
+                >
+                  <input
+                    type="checkbox"
+                    className="dir__chk"
+                    checked={picked}
+                    onChange={() => toggleMsgPick(m.id)}
+                    onClick={e => e.stopPropagation()}
+                    aria-label={`选择消息 #${m.id}`}
+                  />
+                  {node}
+                </div>
+              }
+
+              if (m.role === 'event') {
+                return wrapMsg(
+                  <div key={m.id} className={m.archived ? 'dir-event is-arch' : 'dir-event'}>
+                    <div className="dir-event__head">
+                      <span>平台动态</span>
+                      <span className="meta">{ago(m.createdAt)}</span>
+                    </div>
+                    <div className="dir-event__body"><Markdown text={m.content} /></div>
+                  </div>,
+                )
+              }
+
+              if (m.role === 'user') {
+                return wrapMsg(
+                  <div key={m.id} className={m.archived ? 'dir-turn is-user is-arch' : 'dir-turn is-user'}>
+                    <div className="dir-userbubble">{m.content}</div>
+                    <span className="meta dir-turn__time">{ago(m.createdAt)}</span>
+                  </div>,
+                  true,
+                )
+              }
+
+              const calls = m.toolCalls ?? []
+              return wrapMsg(
+                <div key={m.id} className={m.archived ? 'dir-turn is-ai is-arch' : 'dir-turn is-ai'}>
+                  {calls.length > 0 && (
+                    <details className="dir-trace">
+                      <summary>
+                        <span className="dir-trace__dot" aria-hidden="true" />
+                        <span>已调用 {calls.length} 项工具：{calls.map(c => {
+                          const act = typeof c.arguments?.action === 'string' ? c.arguments.action : ''
+                          return act ? `${c.name}(${act})` : c.name
+                        }).join('、')}</span>
+                      </summary>
+                      <div className="dir-trace__list">
+                        {calls.map(c => {
+                          const res = toolResultMap.get(c.id)
+                          const ok = res?.meta?.ok !== false
+                          return <div key={c.id} className="dir-trace__item">
+                            <div className="dir-trace__head">
+                              <b className="mono">{c.name}{typeof c.arguments?.action === 'string' ? `.${c.arguments.action}` : ''}</b>
+                              <span className="meta mono" data-tone={ok ? 'done' : 'bad'}>
+                                {ok ? '成功' : '失败'}{typeof res?.meta?.ms === 'number' ? ` · ${res.meta.ms}ms` : ''}
+                              </span>
+                            </div>
+                            <pre className="mono">{JSON.stringify(c.arguments ?? {}, null, 2)}</pre>
+                            {res && <pre className="mono dir-trace__out">{res.content.slice(0, 1200)}{res.content.length > 1200 ? '\n…（已折叠）' : ''}</pre>}
+                          </div>
+                        })}
+                      </div>
+                    </details>
+                  )}
+                  {m.content && (
+                    <div className="dir-prose">
+                      <Markdown text={m.content} />
+                    </div>
+                  )}
+                  <div className="dir-turn__foot">
+                    <span className="meta">
+                      {ago(m.createdAt)}
+                      {typeof m.meta?.model === 'string' && ` · ${m.meta.model}`}
+                      {typeof m.meta?.toolsCount === 'number' && m.meta.toolsCount > 0 && ` · ${m.meta.toolsCount} 次工具`}
+                    </span>
+                    {m.content && !manageMsgs && (
+                      <button type="button" className="dir-copy" onClick={() => copyText(m.content)} title="复制回复">
+                        <Icon name="copy" size={13} />复制
+                      </button>
+                    )}
+                  </div>
+                </div>,
+              )
+            })}
+
+            {sending && (
+              <div className="dir-turn is-ai">
+                <div className="dir-stream">
+                  <div className="dir-stream__head">
+                    <span className="dir__pulse" aria-hidden="true" />
+                    <b>总控正在推理与调度…</b>
+                    <button type="button" className="ghost small danger" onClick={stopSending}>停止</button>
+                  </div>
+                  {streamEvents.length > 0 && (
+                    <ul className="dir-stream__list mono">
+                      {streamEvents.map((ev, i) => (
+                        <li key={i}>
+                          {ev.type === 'start' && `已连接模型 ${ev.model || ''}`}
+                          {ev.type === 'thinking' && `第 ${ev.step} 轮 · ${ev.message}`}
+                          {ev.type === 'tool_start' && `调用 ${ev.name}${ev.action ? `(${ev.action})` : ''}…`}
+                          {ev.type === 'tool_done' && `${ev.ok ? '✓' : '✗'} ${ev.name}${ev.action ? `(${ev.action})` : ''} (${ev.ms}ms) ${ev.summary}`}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
         {showJumpBottom && (
-          <button type="button" className="dir__jump" onClick={() => scrollToBottom('smooth')} aria-label="回到底部最新消息">
-            ↓ 回到最新
+          <button type="button" className="dir-jump" onClick={() => scrollToBottom('smooth')} aria-label="回到底部最新消息">
+            ↓ 最新消息
           </button>
         )}
-        </div>
+      </div>
 
-        {/* 底部输入控制区（桌面常驻快捷芯片；手机默认单行极简输入，点 ＋ 展开快捷指令与约束） */}
-        <div className="dir__dock">
-          <div className={toolsOpen || activeContextTags.length > 0 ? 'dir__chipbar is-open' : 'dir__chipbar'}>
-            <button
-              type="button"
-              className={ctxOpen || activeContextTags.length > 0 ? 'dir__chip is-active' : 'dir__chip'}
-              onClick={() => setCtxOpen(v => !v)}
-            >
-              <Icon name="settings" size={13} />
-              约束{activeContextTags.length > 0 ? ` (${activeContextTags.length})` : ''}
-            </button>
-            {activeContextTags.map(tag => <span key={tag} className="dir__ctxtag">{tag}</span>)}
-            {QUICK_CHIPS.map(ch => <button
-              key={ch.label}
-              type="button"
-              className="dir__chip"
-              disabled={sending}
-              onClick={() => {
-                if (ch.cmd) {
-                  void sendMessage(ch.cmd)
-                } else {
-                  setToolsOpen(false)
-                  fillInput(ch.fill || '')
-                }
-              }}
-            >
-              {ch.label}
-            </button>)}
-          </div>
+      {/* 底部雕塑悬浮输入框 */}
+      <div className="dir-dock">
+        <div className="dir-dock__inner">
+          {ctxOpen && (
+            <div className="dir-ctxpanel">
+              <label className="dir-ctxfield">
+                <span>目标项目</span>
+                <select value={bindProjectId} onChange={e => setBindProjectId(e.target.value)}>
+                  <option value="">不限定项目</option>
+                  {readyProjects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+              </label>
+              {bindProjectId && (
+                <label className="dir-ctxfield">
+                  <span>代码模式</span>
+                  <select value={bindMode} onChange={e => setBindMode(e.target.value as ProjectWorkspaceMode)}>
+                    <option value="worktree">worktree 隔离分支</option>
+                    <option value="copy">copy 独立副本</option>
+                    <option value="direct">direct 直接改原件</option>
+                  </select>
+                </label>
+              )}
+              <label className="dir-ctxfield">
+                <span>执行策略</span>
+                <select value={strategy} onChange={e => setStrategy(e.target.value as any)}>
+                  <option value="auto">自动理解并派发</option>
+                  <option value="plan_first">先出 DAG 方案确认</option>
+                  <option value="council_first">先多角色会商</option>
+                </select>
+              </label>
+              <label className="dir-ctxcheck">
+                <input type="checkbox" checked={requireVerify} onChange={e => setRequireVerify(e.target.checked)} />
+                <span>要求客观证据验收</span>
+              </label>
+            </div>
+          )}
 
-          {ctxOpen && <div className="dir__ctxpanel">
-            <label className="dir__ctxfield">
-              <span>目标项目</span>
-              <select value={bindProjectId} onChange={e => setBindProjectId(e.target.value)}>
-                <option value="">不限定项目</option>
-                {readyProjects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </select>
-            </label>
-            {bindProjectId && <label className="dir__ctxfield">
-              <span>代码模式</span>
-              <select value={bindMode} onChange={e => setBindMode(e.target.value as ProjectWorkspaceMode)}>
-                <option value="worktree">worktree 隔离分支（推荐）</option>
-                <option value="copy">copy 独立副本</option>
-                <option value="direct">direct 直接改原件</option>
-              </select>
-            </label>}
-            <label className="dir__ctxfield">
-              <span>执行策略</span>
-              <select value={strategy} onChange={e => setStrategy(e.target.value as any)}>
-                <option value="auto">自动理解并派发</option>
-                <option value="plan_first">先出 DAG 方案确认再开工</option>
-                <option value="council_first">先多角色会商</option>
-              </select>
-            </label>
-            <label className="dir__ctxcheck">
-              <input type="checkbox" checked={requireVerify} onChange={e => setRequireVerify(e.target.checked)} />
-              <span>要求客观证据验收</span>
-            </label>
-          </div>}
-
-          <div className="dir__composer">
-            <button
-              type="button"
-              className={toolsOpen || ctxOpen || activeContextTags.length > 0 ? 'dir__plusbtn is-active only-mobile' : 'dir__plusbtn only-mobile'}
-              aria-label={toolsOpen ? '收起快捷工具' : '展开快捷指令与约束'}
-              aria-expanded={toolsOpen}
-              onClick={() => {
-                setToolsOpen(v => {
-                  if (v) setCtxOpen(false)
-                  return !v
-                })
-              }}
-            >
-              {toolsOpen ? '×' : '＋'}
-              {activeContextTags.length > 0 && <span className="dir__plusdot" aria-hidden="true" />}
-            </button>
+          <div className="dir-box">
             <textarea
               ref={textareaRef}
               rows={1}
               value={input}
               onChange={e => setInput(e.target.value)}
-              onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && input.trim()) { e.preventDefault(); void sendMessage() } }}
-              placeholder="发消息给总控助手…"
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && input.trim()) {
+                  if (window.innerWidth >= 960 || e.ctrlKey || e.metaKey) {
+                    e.preventDefault()
+                    void sendMessage()
+                  }
+                }
+              }}
+              placeholder={activeSession?.channel === 'feishu' ? '发消息给总控（将同步推送至飞书）…' : '向总控下达目标、拆解计划或干预任务…'}
             />
-            {sending
-              ? <button type="button" className="dir__sendbtn is-stop" onClick={stopSending} aria-label="停止推理">
-                <Icon name="x" size={18} />
-                <span>停止</span>
-              </button>
-              : <button type="button" className="primary dir__sendbtn" disabled={!input.trim()} onClick={() => void sendMessage()} aria-label="发送消息">
-                <Icon name="send" size={17} />
-                <span>发送</span>
-              </button>}
-          </div>
-        </div>
-      </section>
-
-      {/* 右栏：实时 DAG 任务计划板 + 活跃工单 */}
-      <aside className="dir__side dir__ops dir__pane-ops">
-        {/* 手机端把运行状态概览收进计划板顶部，不挤占聊天对话区高度 */}
-        {st && <div className="dir__mstatus only-mobile">
-          <div className="dir__mstatus-row">
-            <span className="pill" data-tone={st.enabled ? 'run' : 'bad'}>{st.enabled ? '总控在线' : '已关闭'}</span>
-            <span className="mono meta">{st.model || '—'}</span>
-            <a className="btn small" href="#/settings/director">设置</a>
-          </div>
-          <div className="dir__mstatus-meta">
-            <span>今日 {money(st.todayUsd || 0)}{st.dailyUsd > 0 ? ` / ${money(st.dailyUsd)}` : ''}</span>
-            <span>工单 {openTickets.length}</span>
-            <span>计划 {activeMissionsCount}</span>
-          </div>
-        </div>}
-        <div className="dir__sidehead">
-          <b>DAG 任务计划（{missions.length}）</b>
-          <button type="button" className="ghost small" onClick={missionsPoll.reload}>刷新</button>
-        </div>
-        {missions.length === 0
-          ? <Empty>暂无多步骤 DAG 计划。复杂需求发给总控后，会自动拆解为可审批的并行依赖图显示在这里。</Empty>
-          : <div className="dir__missions">
-            {missions.map(m => {
-              const done = m.nodes.filter(n => n.status === 'completed' || n.status === 'skipped').length
-              const pct = m.nodes.length > 0 ? Math.round((done / m.nodes.length) * 100) : 0
-              return <div key={m.id} className="dir__mcard">
-                <div className="dir__mhead">
-                  <b>{m.title}</b>
-                  <span className="pill" data-tone={MISSION_TONE[m.status]}>v{m.planVersion} · {MISSION_STATUS[m.status]}</span>
-                </div>
-                <div className="dir__mprog">
-                  <div className="dir__mbar"><span style={{ width: `${pct}%` }} /></div>
-                  <span className="meta">{done}/{m.nodes.length} ({pct}%)</span>
-                </div>
-                <div className="dir__mops">
-                  {m.status === 'draft' && <button type="button" className="primary small" disabled={busy} onClick={() => missionOp(m, 'start')}>开工</button>}
-                  {m.status === 'running' && <button type="button" className="ghost small" disabled={busy} onClick={() => missionOp(m, 'pause')}>暂停</button>}
-                  {(m.status === 'paused' || m.status === 'failed') && <button type="button" className="primary small" disabled={busy} onClick={() => missionOp(m, 'resume')}>恢复</button>}
-                  {(m.status === 'draft' || m.status === 'running' || m.status === 'paused') && <button type="button" className="ghost small danger" disabled={busy} onClick={() => missionOp(m, 'cancel')}>取消</button>}
-                </div>
-                <div className="dir__nodes">
-                  {m.nodes.map(n => <div key={n.id} className={n.status === 'waiting_approval' ? 'dir__node is-wait' : 'dir__node'}>
-                    <div className="dir__nodehead">
-                      <span><code className="mono">{n.key}</code> {n.title}</span>
-                      <span className="pill" data-tone={NODE_TONE[n.status]}>{NODE_STATUS[n.status]}</span>
-                    </div>
-                    {n.dependsOn.length > 0 && <div className="meta">依赖：{n.dependsOn.join(', ')}</div>}
-                    {n.ticketId && <div className="meta"><a href={`#/tickets/${encodeURIComponent(n.ticketId)}`}>工单 {n.ticketId.slice(0, 10)} →</a></div>}
-                    {n.commitSha && <div className="meta">提交：<code className="mono">{n.commitSha.slice(0, 8)}</code></div>}
-                    {n.artifacts.length > 0 && <div className="meta">产物：{n.artifacts.slice(0, 2).join('、')}</div>}
-                    {n.status === 'waiting_approval' && (
-                      <button type="button" className="primary small wide" style={{ marginTop: 6 }} disabled={busy} onClick={() => approveMissionNode(m, n)}>
-                        批准继续 (v{m.planVersion})
-                      </button>
-                    )}
-                    {n.status === 'failed' && (
-                      <button type="button" className="ghost small" style={{ marginTop: 4 }} disabled={busy} onClick={() => retryMissionNode(m, n)}>
-                        局部重试
-                      </button>
-                    )}
-                  </div>)}
-                </div>
+            <div className="dir-box__bar">
+              <div className="dir-box__chips">
+                <button
+                  type="button"
+                  className={ctxOpen || activeContextTags.length > 0 ? 'dir-chip is-on' : 'dir-chip'}
+                  onClick={() => setCtxOpen(v => !v)}
+                >
+                  <Icon name="settings" size={13} />
+                  <span>约束{activeContextTags.length > 0 ? ` (${activeContextTags.length})` : ''}</span>
+                </button>
+                {activeContextTags.map(tag => <span key={tag} className="dir-ctxtag">{tag}</span>)}
+                {QUICK_CHIPS.map(ch => (
+                  <button
+                    key={ch.label}
+                    type="button"
+                    className="dir-chip"
+                    disabled={sending}
+                    onClick={() => ch.cmd ? void sendMessage(ch.cmd) : fillInput(ch.fill || '')}
+                  >
+                    {ch.label}
+                  </button>
+                ))}
               </div>
-            })}
-          </div>}
+              {sending ? (
+                <button type="button" className="dir-send is-stop" onClick={stopSending} aria-label="停止推理">
+                  <Icon name="x" size={16} />
+                </button>
+              ) : (
+                <button type="button" className="dir-send" disabled={!input.trim()} onClick={() => void sendMessage()} aria-label="发送消息">
+                  <Icon name="arrowUp" size={17} stroke={2.1} />
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
 
-        {openTickets.length > 0 && <div className="dir__activetks">
-          <div className="dir__sidehead">
-            <b>活跃工单（{openTickets.length}）</b>
-            <a className="ghost small" href="#/tickets">全部 →</a>
-          </div>
-          <div className="dir__tklist">
-            {openTickets.slice(0, 6).map(t => <a key={t.id} className="dir__tkitem" href={`#/tickets/${encodeURIComponent(t.id)}`}>
-              <b>{t.title}</b>
-              <span className="pill" data-tone={t.needsPerson ? 'human' : 'run'}>{t.needsPerson ? '等你回答' : (t.stageLabel || '运行中')}</span>
-            </a>)}
-          </div>
-        </div>}
+    {/* PC 端右侧实时任务执行与进度面板 */}
+    {showProgress && (
+      <aside className="dir-progress only-desktop" aria-label="任务执行与实时进度">
+        <LiveProgressPanel
+          missions={missions}
+          onReloadMissions={missionsPoll.reload}
+          onMissionOp={missionOp}
+          onApproveMissionNode={approveMissionNode}
+          onRetryMissionNode={retryMissionNode}
+          onIntervene={fillInput}
+          busy={busy}
+        />
       </aside>
-    </div>
+    )}
+
+    {/* 历史会话抽屉 Sheet */}
+    {sessionsOpen && (
+      <Sheet title={`对话列表 (${items.length})`} onClose={() => { setSessionsOpen(false); setManageSessions(false); setPickedSessions([]) }}>
+        <div className="dir-sheethead">
+          <button type="button" className="primary small" onClick={() => { setSessionsOpen(false); openNewChatModal() }}>
+            <Icon name="new" size={14} />新开对话（网页 / 飞书）
+          </button>
+          {items.length > 0 && (
+            <button
+              type="button"
+              className={manageSessions ? 'ghost small is-active' : 'ghost small'}
+              disabled={busy}
+              onClick={() => {
+                setManageSessions(v => { if (v) setPickedSessions([]); return !v })
+              }}
+            >
+              {manageSessions ? '完成' : '批量删除'}
+            </button>
+          )}
+        </div>
+        {manageSessions && items.length > 0 && (
+          <div className="dir__bulkbar">
+            <label className="dir__checkall">
+              <input type="checkbox" checked={pickedSessions.length === items.length && items.length > 0} onChange={toggleAllSessions} />
+              <span>{pickedSessions.length === items.length ? '取消全选' : '全选'} ({pickedSessions.length}/{items.length})</span>
+            </label>
+            <button type="button" className="danger small" disabled={busy || pickedSessions.length === 0} onClick={() => void deletePickedSessions()}>
+              删除 ({pickedSessions.length})
+            </button>
+          </div>
+        )}
+        {items.length === 0 ? (
+          <Empty>还没有历史会话，点击上方「新开对话」即可开始。</Empty>
+        ) : (
+          <div className="dir-sesslist">
+            {items.map(s => {
+              const picked = pickedSessions.includes(s.id)
+              const active = !manageSessions && s.id === selectedId
+              return <button
+                key={s.id}
+                type="button"
+                className={['dir-sessrow', active ? 'is-on' : '', manageSessions && picked ? 'is-picked' : ''].filter(Boolean).join(' ')}
+                onClick={() => manageSessions ? toggleSessionPick(s.id) : pickSession(s.id)}
+              >
+                <div className="dir-sessrow__top">
+                  {manageSessions && (
+                    <input
+                      type="checkbox"
+                      className="dir__chk"
+                      checked={picked}
+                      onChange={() => toggleSessionPick(s.id)}
+                      onClick={e => e.stopPropagation()}
+                      aria-label={`选择会话 ${s.title || s.userId}`}
+                    />
+                  )}
+                  <span className="dir-chan">{CHANNEL_LABEL[s.channel] || s.channel}</span>
+                  <b>{s.title || s.userId}</b>
+                  {s.pendingActions > 0 && <span className="nb need">{s.pendingActions}</span>}
+                </div>
+                <span className="meta dir-sessrow__preview">{s.lastMessage || '（空会话）'}</span>
+                <span className="meta">{s.messageCount} 条消息 · {ago(s.updatedAt)}</span>
+              </button>
+            })}
+          </div>
+        )}
+      </Sheet>
+    )}
+
+    {/* 新开对话通道选择弹窗（网页对话 / 飞书对话） */}
+    {newChatOpen && (
+      <Sheet title="新开总控对话" onClose={() => setNewChatOpen(false)}>
+        <div className="dir-newmodal">
+          <div className="dir-chanpick" role="radiogroup" aria-label="选择对话通道">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={newChatChannel === 'web'}
+              className={newChatChannel === 'web' ? 'dir-chancard is-on' : 'dir-chancard'}
+              onClick={() => setNewChatChannel('web')}
+            >
+              <Icon name="globe" size={18} />
+              <div className="dir-chancard__body">
+                <div className="dir-chancard__top">
+                  <b>网页对话</b>
+                  <span className="dir-chancard__dot" aria-hidden="true">{newChatChannel === 'web' && <Icon name="check" size={11} stroke={2.8} />}</span>
+                </div>
+                <span className="meta">独立控制台上下文，适合深度交互与拆解复杂任务</span>
+              </div>
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={newChatChannel === 'feishu'}
+              className={newChatChannel === 'feishu' ? 'dir-chancard is-on' : 'dir-chancard'}
+              onClick={() => setNewChatChannel('feishu')}
+            >
+              <Icon name="feishu" size={18} />
+              <div className="dir-chancard__body">
+                <div className="dir-chancard__top">
+                  <b>飞书对话</b>
+                  <span className="dir-chancard__dot" aria-hidden="true">{newChatChannel === 'feishu' && <Icon name="check" size={11} stroke={2.8} />}</span>
+                </div>
+                <span className="meta">绑定飞书会话，总控回复与任务战报实时同步推送至飞书</span>
+              </div>
+            </button>
+          </div>
+
+          <label className="field">
+            <span>对话标题（可选）</span>
+            <input
+              value={newChatTitle}
+              onChange={e => setNewChatTitle(e.target.value)}
+              placeholder={newChatChannel === 'feishu' ? '例如：飞书日常调度' : '例如：前端重设计与测试'}
+            />
+          </label>
+
+          {newChatChannel === 'feishu' && (
+            <>
+              {feishuSessions.length > 0 && (
+                <div className="field">
+                  <span>选择已有飞书接收对象</span>
+                  <div className="dir-fspicks">
+                    {feishuSessions.map(fs => (
+                      <button
+                        key={fs.id}
+                        type="button"
+                        className={feishuTarget === fs.userId ? 'dir-chip is-on' : 'dir-chip'}
+                        onClick={() => setFeishuTarget(fs.userId)}
+                      >
+                        {fs.title || fs.userId}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <label className="field">
+                <span>飞书接收 ID（open_id 或 chat_id）</span>
+                <input
+                  value={feishuTarget}
+                  onChange={e => setFeishuTarget(e.target.value)}
+                  placeholder="例如：ou_xxxxxxxx 或 oc_xxxxxxxx"
+                />
+                <small className="hint">如尚未在飞书发过消息，可先在飞书给机器人发一条「/状态」，系统会自动登记你的飞书 ID。</small>
+              </label>
+              <label className="check">
+                <input type="checkbox" checked={feishuReset} onChange={e => setFeishuReset(e.target.checked)} />
+                <span><b>清空该飞书会话短期上下文</b><small className="hint">若该飞书 ID 已有对话，开启后从全新话题开始</small></span>
+              </label>
+            </>
+          )}
+
+          <div className="actions dialog__actions">
+            <button type="button" onClick={() => setNewChatOpen(false)}>取消</button>
+            <button type="button" className="primary" disabled={busy} onClick={() => void createNewConversation()}>
+              {busy ? '创建中…' : (newChatChannel === 'feishu' ? '开启飞书对话' : '开启网页对话')}
+            </button>
+          </div>
+        </div>
+      </Sheet>
+    )}
   </div>
 }

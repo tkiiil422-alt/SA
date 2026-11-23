@@ -4,7 +4,7 @@ import { API, get, post, put, del } from './api'
 import { usePoll, ago, money } from './hooks'
 import { useSteps, type Step } from './useSteps'
 import { LiveContext, useLive, useLiveSource, useTick, clock, secondsSince, type RunningStep } from './useLive'
-import { ToastHost, toast, useAction, Sheet, Empty, Tabs, bytes, DialogHost, ErrorBoundary, Markdown, confirmAction, promptAction, safeDecode, useTheme } from './ui'
+import { ToastHost, toast, useAction, Sheet, Empty, Tabs, bytes, DialogHost, ErrorBoundary, Markdown, confirmAction, promptAction, safeDecode, useTheme, type ThemeMode } from './ui'
 import * as P from './pages'
 import { Icon, Logo } from './icons'
 import { GoalCard, GoalSheet } from './goal'
@@ -22,9 +22,9 @@ const MemoryPage = lazy(() => import('./memory').then(m => ({ default: m.MemoryP
 const SchedulerPage = lazy(() => import('./scheduler').then(m => ({ default: m.SchedulerPage })))
 
 const useHash = () => {
-  const [h, set] = useState(location.hash || '#/today')
+  const [h, set] = useState(location.hash || '#/director')
   useEffect(() => {
-    const f = () => set(location.hash || '#/today')
+    const f = () => set(location.hash || '#/director')
     addEventListener('hashchange', f)
     return () => removeEventListener('hashchange', f)
   }, [])
@@ -109,12 +109,63 @@ function Lane({ n, t, step, skew, modelName }: { n: number; t: any; step?: Runni
   </a>
 }
 
+function QuickCommand() {
+  const [text, setText] = useState('')
+  const { busy, run } = useAction()
+  const askDirector = () => {
+    const q = text.trim()
+    if (!q) { location.hash = '#/director'; return }
+    try { sessionStorage.setItem('sa-director-handoff', q) } catch { /* ignore */ }
+    setText('')
+    location.hash = '#/director'
+  }
+  const dispatchNow = () => {
+    const q = text.trim()
+    if (!q) return
+    run(async () => {
+      const r = await post<any>('api/tickets', { text: q })
+      setText('')
+      if (r?.ticketId) location.hash = `#/tickets/${encodeURIComponent(r.ticketId)}`
+    }, '任务已派发')
+  }
+  return <section className="cmdbar" aria-label="快捷指令">
+    <div className="cmdbar__box">
+      <Icon name="director" size={18} />
+      <input
+        value={text}
+        onChange={e => setText(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && text.trim()) { e.preventDefault(); dispatchNow() }
+          else if (e.key === 'Enter' && text.trim()) { e.preventDefault(); askDirector() }
+        }}
+        placeholder="向总控交代目标，或直接派发工单…"
+      />
+    </div>
+    <div className="cmdbar__acts">
+      <button type="button" className="primary" disabled={busy} onClick={askDirector}>
+        <Icon name="director" size={15} />交给总控
+      </button>
+      <button type="button" disabled={busy || !text.trim()} onClick={dispatchNow}>
+        <Icon name="new" size={15} />直接派单
+      </button>
+    </div>
+  </section>
+}
+
 function Today() {
   const { board: b, err, skew } = useLive()
   const fq = usePoll<any>('api/fanqie/status', 30000)
   useTick()
   const modelName = useModelNames()
-  const head = <header className="phead"><div><h1>今日</h1><p className="phead__sub">{dateLine()}</p></div><LiveBadge /></header>
+  const head = <header className="phead">
+    <div>
+      <h1>今日调度台</h1>
+      <p className="phead__sub">{dateLine()}</p>
+    </div>
+    <div className="phead__right">
+      <a className="btn small only-desktop" href="#/director"><Icon name="director" size={14} />进入总控工作台</a>
+    </div>
+  </header>
   if (!b) return <div className="today">{head}{err ? <p className="warn">连不上后台：{err}</p> : <p className="meta">加载中…</p>}</div>
   const steps = new Map<string, RunningStep>(b.runningSteps.map(s => [s.id, s]))
   const need = b.open.filter(t => t.needsPerson)
@@ -129,6 +180,32 @@ function Today() {
     {b.paused && <a className="alert" data-lv="warn" href="#/system">接单已暂停，新任务不会被受理。</a>}
     {b.alerts.filter(a => a.text && !(b.paused && /暂停/.test(a.text))).map((a, i) => <a key={i} className="alert" data-lv={a.level} href={a.link || '#/today'}>{a.text}</a>)}
     {fq.d?.expired && <a className="alert" data-lv="warn" href="#/secrets">番茄登录已失效，请重新抓取 Cookie 并更新密钥 FANQIE_COOKIE</a>}
+
+    <QuickCommand />
+
+    <div className="kpi-strip today__kpis" aria-label="今日关键指标">
+      <div className="kpi-cell">
+        <span>活跃工位</span>
+        <b>{running.length}<small className="kpi-den"> / {b.slots.max}</small></b>
+        <small>{queued.length > 0 ? `${queued.length} 个排队中` : idleSlots > 0 ? `${idleSlots} 个空闲可用` : '工位已满载'}</small>
+      </div>
+      <div className={need.length > 0 ? 'kpi-cell is-warn' : 'kpi-cell'}>
+        <span>待我拍板</span>
+        <b>{need.length}</b>
+        <small>{need.length > 0 ? '需要你回答或审批' : '全部顺畅推进'}</small>
+      </div>
+      <div className="kpi-cell">
+        <span>今日花费</span>
+        <b>{money(b.usage.todayUsd)}</b>
+        <small>{budget > 0 ? `预算上限 ${money(budget)} (${Math.round(pct * 100)}%)` : `${b.usage.todayCalls ?? 0} 次模型调用`}</small>
+      </div>
+      <div className="kpi-cell">
+        <span>今日交付</span>
+        <b>{b.tickets.endedToday}</b>
+        <small>模型：{b.upstream?.model || '未配置'}</small>
+      </div>
+    </div>
+
     <div className="today__grid">
       <div className="today__main">
         {need.length > 0 && <section className="need" aria-label="等你回答">
@@ -141,20 +218,20 @@ function Today() {
         </section>}
 
         <section className="board" aria-label="工位">
-          <div className="sechead"><h2>工位</h2><span className="sechead__note">{running.length ? `${running.length} / ${b.slots.max} 在干活` : `${b.slots.max} 个都空着`}</span></div>
+          <div className="sechead"><h2>执行工位</h2><span className="sechead__note">{running.length ? `${running.length} / ${b.slots.max} 运行中` : `${b.slots.max} 个工位待命`}</span></div>
           <div className="lanes">
             {running.map((t, i) => <Lane key={t.id} n={i + 1} t={t} step={steps.get(t.id)} skew={skew} modelName={modelName} />)}
             {Array.from({ length: idleSlots }, (_, i) => <div key={'idle' + i} className="lane" data-st="idle">
               <span className="lane__no">{running.length + i + 1}</span>
-              <span className="lane__main"><span className="lane__title">空闲</span>
-                {i === 0 && <span className="lane__step"><span className="sum"><a href="#/new">发一个任务</a>，它会在这里开工</span></span>}</span>
+              <span className="lane__main"><span className="lane__title">空闲工位</span>
+                {i === 0 && <span className="lane__step"><span className="sum"><a href="#/new">发一个任务</a> 或使用上方快捷指令启动</span></span>}</span>
             </div>)}
           </div>
           {queued.length > 0 && <p className="queued">排队中 {queued.length} 个：{queued.slice(0, 3).map((t, i) => <a key={t.id} href={link(t.id)}>{i ? '、' : ''}{t.title}</a>)}{queued.length > 3 ? ' 等' : ''}</p>}
         </section>
 
         <section className="ended" aria-label="最近结束">
-          <div className="sechead"><h2>最近结束</h2><a className="sechead__note" href="#/tickets">全部任务</a></div>
+          <div className="sechead"><h2>最近交付</h2><a className="sechead__note" href="#/tickets">查看全部任务</a></div>
           {b.ended.length ? <ul className="endlist">{b.ended.map(t => <li key={t.id}>
             <a href={link(t.id)}><Mark tone={toneOf(t)} /><span className="t">{t.title}</span>
               <span className="w" data-tone={toneOf(t)}>{STATUS_WORD[t.outcome ?? ''] || '已结束'}</span><span className="a">{ago(t.updatedAt)}</span></a>
@@ -164,22 +241,26 @@ function Today() {
 
       <aside className="today__side" aria-label="今天概况">
         <div className="panel">
-          <h3>今天花费</h3>
+          <h3>预算与调用</h3>
           <p className="bignum">{money(b.usage.todayUsd)}</p>
           {budget > 0 ? <><div className="meter"><span style={{ width: `${Math.max(2, pct * 100)}%` }} data-lv={pct > 0.9 ? 'error' : pct > 0.7 ? 'warn' : ''} /></div>
-            <p className="meta">每天上限 {money(budget)}，用了 {Math.round(pct * 100)}%</p></> : <p className="meta">没有设每天上限</p>}
+            <p className="meta">日上限 {money(budget)} · 已用 {Math.round(pct * 100)}%</p></> : <p className="meta">未设置每日预算上限</p>}
           <dl className="mini">
             <dt>模型调用</dt><dd>{b.usage.todayCalls ?? 0}</dd>
-            <dt>结束的任务</dt><dd>{b.tickets.endedToday}</dd>
+            <dt>今日结束</dt><dd>{b.tickets.endedToday}</dd>
             <dt>等你回答</dt><dd>{b.tickets.needsPerson}</dd>
           </dl>
         </div>
         <div className="panel">
-          <h3>运行</h3>
+          <h3>系统脉搏</h3>
           <p className="statline"><i data-ok={!b.paused} /><span>{b.paused ? '已暂停接单' : '正常接单'}</span></p>
-          <p className="statline"><i data-ok={b.upstream?.ok !== false} /><span>{b.upstream?.model || '没有配置模型'}</span><span className="meta">{b.upstream?.ok === false ? '最近失败' : b.upstream?.provider}</span></p>
-          <p className="statline"><i data-ok="true" /><span>工位 {b.slots.used} / {b.slots.max}</span>{b.slots.reservedForPerson ? <span className="meta">给人留 {b.slots.reservedForPerson}</span> : null}</p>
-          <a className="panel__link" href="#/system">系统详情<Icon name="chev" size={14} /></a>
+          <p className="statline"><i data-ok={b.upstream?.ok !== false} /><span>{b.upstream?.model || '未配置模型'}</span><span className="meta">{b.upstream?.ok === false ? '最近失败' : b.upstream?.provider}</span></p>
+          <p className="statline"><i data-ok="true" /><span>工位 {b.slots.used} / {b.slots.max}</span>{b.slots.reservedForPerson ? <span className="meta">为人留 {b.slots.reservedForPerson}</span> : null}</p>
+          <div className="panel__links">
+            <a className="panel__link" href="#/memory">记忆与进化<Icon name="chev" size={14} /></a>
+            <a className="panel__link" href="#/devenv">共享环境<Icon name="chev" size={14} /></a>
+            <a className="panel__link" href="#/system">系统详情<Icon name="chev" size={14} /></a>
+          </div>
         </div>
       </aside>
     </div>
@@ -524,54 +605,103 @@ function Login({ onDone }: { onDone: () => void }) {
 }
 
 const PAGES: Record<string, React.ComponentType> = {
-  new: P.NewTask, director: Director, projects: P.Projects, usage: P.Usage, events: P.Events, decisions: P.Decisions, system: P.System, pi: PiVersions, devenv: DevEnv,
+  new: P.NewTask, director: Director, today: Today, projects: P.Projects, usage: P.Usage, events: P.Events, decisions: P.Decisions, system: P.System, pi: PiVersions, devenv: DevEnv,
   connections: P.Connections, secrets: P.Secrets, novels: P.Novels, settings: P.Settings, councils: P.Councils, fanqie: Fanqie, defense: Defense, pentest: Pentest,
   memory: MemoryPage, schedules: SchedulerPage,
 }
-const SIDE_GROUPS: [string, [string, string][]][] = [
-  ['工作', [['today', '今日'], ['director', '总控助手'], ['tickets', '任务'], ['projects', '项目'], ['councils', '会商'], ['schedules', '定时巡检'], ['memory', '记忆技能']]],
-  ['安全', [['defense', '防御工作台'], ['pentest', '渗透工作台']]],
-  ['写作', [['novels', '书库'], ['fanqie', '番茄发布']]],
-  ['管理', [['usage', '花费'], ['secrets', '密钥'], ['connections', '连接'], ['pi', 'Pi 版本'], ['devenv', '开发环境'], ['settings', '设置']]],
-  ['记录', [['system', '系统'], ['events', '事件'], ['decisions', '判断记录']]],
+
+const TOOL_GROUPS: [string, [string, string][]][] = [
+  ['任务与调度', [['director', '总控助手'], ['tickets', '全部任务'], ['new', '直接发任务'], ['today', '今日总览'], ['projects', '项目库'], ['councils', '多角色会商'], ['schedules', '定时与巡检']]],
+  ['记忆与统计', [['memory', '记忆与进化'], ['usage', '花费统计']]],
+  ['环境与配置', [['devenv', '共享开发环境'], ['connections', '连接中心'], ['secrets', '密钥库'], ['pi', 'Pi 版本'], ['settings', '系统设置']]],
+  ['安全与创作', [['defense', '防御工作台'], ['pentest', '渗透工作台'], ['novels', '书库'], ['fanqie', '番茄发布']]],
+  ['系统记录', [['system', '系统与备份'], ['events', '事件流'], ['decisions', '判断记录']]],
+]
+
+const DOMAIN_TABS: { id: string; keys: string[]; tabs: [string, string][] }[] = [
+  { id: 'tasks', keys: ['tickets', 'new', 'today', 'projects', 'councils', 'schedules'], tabs: [['tickets', '全部任务'], ['new', '发任务'], ['today', '今日总览'], ['projects', '项目库'], ['councils', '会商'], ['schedules', '定时巡检']] },
+  { id: 'memory', keys: ['memory', 'usage'], tabs: [['memory', '记忆与进化'], ['usage', '花费统计']] },
+  { id: 'env', keys: ['devenv', 'connections', 'secrets', 'pi', 'settings', 'system', 'events', 'decisions'], tabs: [['devenv', '共享环境'], ['connections', '连接中心'], ['secrets', '密钥库'], ['pi', 'Pi'], ['settings', '设置'], ['system', '系统']] },
+  { id: 'sec', keys: ['defense', 'pentest'], tabs: [['defense', '防御工作台'], ['pentest', '渗透工作台']] },
+  { id: 'write', keys: ['novels', 'fanqie'], tabs: [['novels', '书库'], ['fanqie', '番茄发布']] },
+]
+
+const THEME_OPTIONS: { id: ThemeMode; label: string; desc: string; swatch: string }[] = [
+  { id: 'carbon', label: '暖炭绒黑', desc: '温润低反光 · 默认', swatch: '#1C1B1A' },
+  { id: 'obsidian', label: '纯粹曜黑', desc: '深邃高对比 OLED', swatch: '#09090B' },
+  { id: 'light', label: '瓷白工作室', desc: '清透柔和纸感', swatch: '#F5F5F7' },
 ]
 
 const CMD_LINKS: { label: string; hint: string; href: string; keywords: string }[] = [
-  { label: '总控助手', hint: '微信与网页共用的平台总控 AI 对话、工具审计与审批', href: '#/director', keywords: 'director ai assistant 总控 助手 微信 对话' },
-  { label: '记忆与技能库', hint: '三层长期记忆（偏好/项目/复盘）、技能 SOP 与已加载插件', href: '#/memory', keywords: 'memory skill sop plugin 记忆 技能 插件 复盘' },
+  { label: '总控助手', hint: '对话主舞台 + 实时任务执行与进度', href: '#/director', keywords: 'director ai assistant 总控 助手 飞书 微信 对话' },
+  { label: '全部任务', hint: '查看、筛选、批量管理工单与详情', href: '#/tickets', keywords: 'tickets list 工单 任务' },
+  { label: '发任务', hint: '新建一条 AI 执行任务', href: '#/new', keywords: 'new task ask 新建 派单' },
+  { label: '今日总览', hint: '传统工位总览、待处理、今日花费', href: '#/today', keywords: 'today home 首页 今日' },
+  { label: '记忆与进化', hint: '主人画像、三层长期记忆、技能 SOP 与自进化复盘', href: '#/memory', keywords: 'memory skill sop plugin evolution 记忆 技能 插件 复盘 进化' },
+  { label: '花费统计', hint: '今日 / 7 天 / 30 天 模型调用成本', href: '#/usage', keywords: 'usage cost 花费 账单 统计' },
+  { label: '共享开发环境', hint: '共享缓存目录、一键瘦身与容器镜像', href: '#/devenv', keywords: 'devenv cache docker 环境 缓存 开发' },
+  { label: '系统设置', hint: '总控、模型、飞书、微信、邮箱与预算配置', href: '#/settings', keywords: 'settings config 设置 配置' },
+  { label: '总控设置', hint: '总控模型、失败重试、主动汇报与高危审批', href: '#/settings/director', keywords: 'director settings retry 总控 设置 重试' },
+  { label: '连接中心', hint: '飞书、微信、邮箱、GitHub、SSH', href: '#/connections', keywords: 'connections wechat email feishu 微信 邮箱 飞书' },
+  { label: '项目库', hint: '上传和管理源码压缩包', href: '#/projects', keywords: 'projects repo 代码 项目' },
   { label: '定时与巡检', hint: 'Cron 定时派单、总控巡检、零 Token HTTP 监控', href: '#/schedules', keywords: 'schedule cron watch 定时 巡检 监控 调度' },
-  { label: '总控设置', hint: '总控模型、失败重试次数、主动汇报范围、高危二次确认与预算', href: '#/settings/director', keywords: 'director settings retry 总控 设置 重试' },
-  { label: '发任务', hint: '新建一条 AI 执行任务', href: '#/new', keywords: 'new task ask 新建' },
-  { label: '今日总览', hint: '工位、待处理、今日花费', href: '#/today', keywords: 'today home 首页' },
-  { label: '全部任务', hint: '查看与筛选任务票', href: '#/tickets', keywords: 'tickets list 工单' },
-  { label: '防御工作台', hint: '应用安全代码审查、配置基线核查、直接加固与自动快照', href: '#/defense', keywords: 'defense hardening appsec code review security 防御 加固 代码审查 安全审计 基线' },
-  { label: '渗透工作台', hint: '内部红队测试、源码快扫、OWASP 剧本与漏洞库', href: '#/pentest', keywords: 'pentest redteam security 漏洞 渗透 红队 扫描' },
-  { label: '项目库', hint: '上传和管理源码压缩包', href: '#/projects', keywords: 'projects repo 代码' },
-  { label: '会商', hint: '多角色 AI 讨论与任务书', href: '#/councils', keywords: 'councils 讨论' },
-  { label: '连接中心', hint: '微信、邮箱、飞书、GitHub、SSH', href: '#/connections', keywords: 'connections wechat email feishu 微信 邮箱' },
-  { label: '邮箱设置', hint: 'Gmail / QQ / 163 / Outlook / 自定义 IMAP', href: '#/settings/email', keywords: 'email imap smtp 邮箱 qq 163 gmail' },
-  { label: '微信设置', hint: '企业微信插件、公众号、Webhook / 桥接', href: '#/settings/wechat', keywords: 'wechat wecom 微信 企业微信' },
-  { label: '模型与路由', hint: '服务商、默认模型、自动挑选', href: '#/settings/models', keywords: 'models provider 模型' },
+  { label: '多角色会商', hint: '多角色 AI 讨论与任务书', href: '#/councils', keywords: 'councils 讨论 会商' },
   { label: '密钥库', hint: '加密保存、按任务授权', href: '#/secrets', keywords: 'secrets vault 密钥' },
-  { label: '花费统计', hint: '今日 / 7 天 / 30 天', href: '#/usage', keywords: 'usage cost 花费 账单' },
-  { label: '书库', hint: '小说写作引擎', href: '#/novels', keywords: 'novels book 小说' },
-  { label: '系统与备份', hint: '健康、清理、立即备份', href: '#/system', keywords: 'system backup 系统 备份' },
+  { label: '模型与路由', hint: '服务商、默认模型、自动挑选', href: '#/settings/models', keywords: 'models provider 模型' },
+  { label: '防御工作台', hint: '应用安全代码审查、配置基线核查与直接加固', href: '#/defense', keywords: 'defense hardening appsec code review security 防御 加固 安全' },
+  { label: '渗透工作台', hint: '内部红队测试、源码快扫、OWASP 剧本与漏洞库', href: '#/pentest', keywords: 'pentest redteam security 漏洞 渗透 红队 扫描' },
+  { label: '书库与写作', hint: '小说写作引擎', href: '#/novels', keywords: 'novels book 小说 书库' },
+  { label: '番茄发布', hint: '番茄小说章节发布同步', href: '#/fanqie', keywords: 'fanqie 番茄 发布' },
+  { label: 'Pi 版本', hint: '执行引擎版本与切换', href: '#/pi', keywords: 'pi version 版本' },
+  { label: '系统与备份', hint: '健康检查、清理与立即备份', href: '#/system', keywords: 'system backup 系统 备份' },
+  { label: '事件流', hint: '全局运行事件审计', href: '#/events', keywords: 'events 事件' },
+  { label: '判断记录', hint: '策略与审批历史判断', href: '#/decisions', keywords: 'decisions 判断' },
 ]
 
-function CommandPalette({ open, onClose, toggleTheme, dark }: { open: boolean; onClose: () => void; toggleTheme: () => void; dark: boolean }) {
+function CommandPalette({
+  open,
+  onClose,
+  themeMode,
+  setTheme,
+  onNewChat,
+}: {
+  open: boolean
+  onClose: () => void
+  themeMode: ThemeMode
+  setTheme: (m: ThemeMode) => void
+  onNewChat: () => void
+}) {
   const [q, setQ] = useState('')
   useEffect(() => { if (!open) setQ('') }, [open])
   if (!open) return null
   const needle = q.trim().toLowerCase()
   const list = CMD_LINKS.filter(c => !needle || c.label.toLowerCase().includes(needle) || c.hint.toLowerCase().includes(needle) || c.keywords.toLowerCase().includes(needle))
   const pick = (href: string) => { onClose(); location.hash = href }
-  return <Sheet title="快速跳转（Ctrl+K）" onClose={onClose}>
-    <input className="search" value={q} autoFocus placeholder="输入页面名、功能或关键词（如 防御、渗透、微信、邮箱）…"
+  return <Sheet title="快速跳转（⌘K / Ctrl+K）" onClose={onClose}>
+    <input className="search" value={q} autoFocus placeholder="输入页面名、功能或关键词（如 总控、记忆、环境、飞书、防御）…"
       onChange={e => setQ(e.target.value)}
       onKeyDown={e => { if (e.key === 'Enter' && list[0]) pick(list[0].href) }} />
+    <div className="cmd-themes" role="group" aria-label="界面主题">
+      {THEME_OPTIONS.map(t => (
+        <button
+          key={t.id}
+          type="button"
+          className={themeMode === t.id ? 'cmd-theme is-on' : 'cmd-theme'}
+          onClick={() => { setTheme(t.id); toast(`已切换至「${t.label}」`) }}
+        >
+          <i className="theme-dot" style={{ background: t.swatch }} />
+          <span>{t.label}</span>
+        </button>
+      ))}
+    </div>
     <div className="cmdlist">
+      {!needle && (
+        <button type="button" className="row" onClick={() => { onClose(); onNewChat() }}>
+          <b>+ 新开总控对话（网页 / 飞书）</b>
+          <span className="meta">选择网页独立会话或绑定飞书同步会话</span>
+        </button>
+      )}
       {list.map(c => <button key={c.href} type="button" className="row" onClick={() => pick(c.href)}><b>{c.label}</b><span className="meta">{c.hint}</span></button>)}
-      <button type="button" className="row" onClick={() => { toggleTheme(); onClose() }}><b>{dark ? '切换为浅色主题' : '切换为深色主题'}</b><span className="meta">立即切换控制台配色</span></button>
     </div>
   </Sheet>
 }
@@ -589,7 +719,7 @@ function App() {
   if (auth === 'out') return <><Login onDone={() => setAuth('in')} /><ToastHost /><DialogHost /></>
   const logout = () => { post('api/logout', {}).catch(() => {}).finally(() => setAuth('out')) }
   const m = /^#\/tickets\/([^/?]+)/.exec(h)
-  const key = /^#\/([a-z0-9-]+)/.exec(h)?.[1] || 'today'
+  const key = /^#\/([a-z0-9-]+)/.exec(h)?.[1] || 'director'
   return <Shell h={h} m={m} k={key} logout={logout} top={top} />
 }
 
@@ -614,86 +744,369 @@ function Shell({ h, m, k: key, logout, top }: { h: string; m: RegExpExecArray | 
     }
     return set
   }, [pluginsPoll.d])
+
   const [cmdOpen, setCmdOpen] = useState(false)
-  const [collapsed, setCollapsed] = useState(() => {
-    try { return localStorage.getItem('sa-side-collapsed') === '1' } catch { return false }
-  })
+  const [toolsOpen, setToolsOpen] = useState(false)
+  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [themePopOpen, setThemePopOpen] = useState(false)
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault()
         setCmdOpen(v => !v)
+      } else if (e.key === 'Escape') {
+        setThemePopOpen(false)
+        setDrawerOpen(false)
       }
     }
     addEventListener('keydown', onKey)
     return () => removeEventListener('keydown', onKey)
   }, [])
-  const toggleCollapsed = () => setCollapsed(v => {
-    const next = !v
-    try { localStorage.setItem('sa-side-collapsed', next ? '1' : '0') } catch { /* ignore */ }
-    return next
-  })
+
+  // 路由变化时关闭抽屉与弹出层
+  useEffect(() => {
+    setDrawerOpen(false)
+    setToolsOpen(false)
+    setThemePopOpen(false)
+  }, [h])
 
   const b = live.board
   const need = b?.tickets.needsPerson ?? 0
   const running = b?.tickets.running ?? 0
   const Page = PAGES[key]
-  const cur = (k: string) => (m ? k === 'tickets' : key === k)
-  const inMore = !m && !['today', 'director', 'tickets', 'new'].includes(key)
-  const badge = (k: string) => k === 'today' && running > 0 ? <span className="nb run">{running}</span>
-    : k === 'tickets' && need > 0 ? <span className="nb need">{need}</span> : null
-  const liveWord = live.live ? '实时连接' : b ? '轮询中' : live.err ? '连不上后台' : '连接中'
-  const shellClass = [
-    'shell',
-    collapsed ? 'is-collapsed' : '',
-    !m && key === 'director' ? 'is-director' : '',
-  ].filter(Boolean).join(' ')
+  const isDirector = !m && key === 'director'
+  const isTaskDomain = !!m || ['tickets', 'new', 'today', 'projects', 'councils', 'schedules'].includes(key)
+  const isMemoryDomain = !m && ['memory', 'usage'].includes(key)
+  const isEnvDomain = !m && ['devenv', 'settings', 'connections', 'secrets', 'pi', 'system', 'events', 'decisions'].includes(key)
+  const isExtraDomain = !m && ['defense', 'pentest', 'novels', 'fanqie', 'more'].includes(key)
+
+  const pageLabel = m
+    ? '任务详情'
+    : (TOOL_GROUPS.flatMap(([, items]) => items).find(([k]) => k === key)?.[1] || (key === 'more' ? '全部工具' : '总控助手'))
+  const activeDomain = DOMAIN_TABS.find(d => (m && d.id === 'tasks') || d.keys.includes(key))
+  const liveWord = live.live ? '实时' : b ? '轮询' : live.err ? '断开' : '连接中'
+
+  const triggerNewChat = () => {
+    setDrawerOpen(false)
+    setToolsOpen(false)
+    if (isDirector) {
+      window.dispatchEvent(new CustomEvent('sa-director-new-chat'))
+    } else {
+      location.hash = '#/director'
+      setTimeout(() => window.dispatchEvent(new CustomEvent('sa-director-new-chat')), 80)
+    }
+  }
+
+  const pickTheme = (mode: ThemeMode) => {
+    theme.setMode(mode)
+    setThemePopOpen(false)
+    const found = THEME_OPTIONS.find(x => x.id === mode)
+    if (found) toast(`已切换至「${found.label}」`)
+  }
+
+  const cycleThemeWithToast = () => {
+    const order: ThemeMode[] = ['carbon', 'obsidian', 'light']
+    const next = order[(order.indexOf(theme.mode) + 1) % order.length]!
+    pickTheme(next)
+  }
+
+  const shellClass = ['shell', isDirector ? 'is-director' : 'is-subpage'].join(' ')
+
   return <LiveContext.Provider value={live}>
     <div className={shellClass}>
-      <header className="mbar">
-        <a className="mbar__brand" href="#/today"><Logo size={26} /><span>superagent</span></a>
+      {/* 移动端极简顶栏（48px，无底部 5 格遮挡栏） */}
+      <header className="mbar only-mobile">
+        <button type="button" className="mbar__btn" aria-label="打开导航菜单" onClick={() => setDrawerOpen(true)}>
+          <Icon name="menu" size={19} />
+        </button>
+        <a className="mbar__title" href={isDirector ? '#/director' : `#/${key}`}>
+          <i className="mbar__dot" data-on={live.live} />
+          <span>{pageLabel}</span>
+        </a>
         <div className="mbar__tools">
-          <span className="mbar__live" data-on={live.live}><i />{liveWord}</span>
-          <button type="button" className="mbar__btn" aria-label="快速跳转" onClick={() => setCmdOpen(true)}><Icon name="search" size={18} /></button>
-          <button type="button" className="mbar__btn" aria-label={theme.dark ? '切到浅色' : '切到深色'} onClick={theme.cycle}><Icon name={theme.dark ? 'sun' : 'moon'} size={18} /></button>
+          <button type="button" className="mbar__btn" aria-label="快速跳转" onClick={() => setCmdOpen(true)}>
+            <Icon name="search" size={17} />
+          </button>
+          <button type="button" className="mbar__btn" aria-label={`切换主题（当前：${theme.label}）`} onClick={cycleThemeWithToast}>
+            <Icon name={theme.dark ? 'moon' : 'sun'} size={17} />
+          </button>
         </div>
       </header>
-      <main ref={top} key={m ? 'd' + m[1] : h}>
-        <Suspense fallback={<p className="meta">加载页面模块…</p>}>
-          {m ? <Detail id={safeDecode(m[1]!)} /> : key === 'tickets' ? <Tickets /> : key === 'more' ? <P.More onLogout={logout} /> : Page ? <Page /> : <Today />}
-        </Suspense>
-      </main>
-      <nav className="tabs" aria-label="主导航">
-        {TABS.map(([k, n]) => <a key={k} href={`#/${k}`} aria-current={k === 'more' ? inMore : cur(k)}><span className="tabs__ic"><Icon name={k} size={22} />{badge(k)}</span>{n}</a>)}
-      </nav>
-      <nav className="side" aria-label="侧栏">
-        <div className="side__top">
-          <a className="brand" href="#/today"><Logo size={32} /><span className="brand__name">superagent<small>AI 工位调度</small></span></a>
-          <button type="button" className="side__iconbtn" title={collapsed ? '展开侧栏' : '收起侧栏'} aria-label={collapsed ? '展开侧栏' : '收起侧栏'} onClick={toggleCollapsed}><Icon name="sidebar" size={17} /></button>
+
+      {/* PC 端极简 56px 左侧图标轨道（苹果工业风） */}
+      <aside className="srail only-desktop" aria-label="主导航">
+        <div className="srail__top">
+          <a className="srail__logo" href="#/director" title="SuperAgent 总控台">
+            <Logo size={26} />
+          </a>
+          <button
+            type="button"
+            className="srail__btn srail__new"
+            title="新开对话（网页 / 飞书）"
+            aria-label="新开对话"
+            onClick={triggerNewChat}
+          >
+            <Icon name="new" size={17} stroke={2} />
+          </button>
         </div>
-        <a className="newtask" href="#/new" title="发任务"><Icon name="new" size={18} stroke={2.2} /><span>发任务</span></a>
-        <button type="button" className="cmdbtn" onClick={() => setCmdOpen(true)} title="快速跳转 (Ctrl+K)"><Icon name="search" size={15} /><span>快速跳转</span><kbd>Ctrl K</kbd></button>
-        {SIDE_GROUPS.map(([g, items]) => {
-          const visible = items.filter(([k]) => !NAV_PLUGIN_GUARD[k] || !disabledPlugins.has(NAV_PLUGIN_GUARD[k]!))
-          if (visible.length === 0) return null
-          return <div className="navgroup" key={g}><span className="navgroup__h">{g}</span>
-            {visible.map(([k, n]) => <a key={k} href={`#/${k}`} aria-current={cur(k)} title={n}><Icon name={k} /><span>{n}</span>{badge(k)}</a>)}</div>
-        })}
-        <div className="side__foot">
-          <span className="side__live" data-on={live.live}><i /><span>{liveWord}</span></span>
-          <div className="side__footbtns">
-            <button type="button" title={theme.dark ? '切到浅色' : '切到深色'} aria-label={theme.dark ? '切到浅色' : '切到深色'} onClick={theme.cycle}><Icon name={theme.dark ? 'sun' : 'moon'} size={16} /></button>
-            <button type="button" onClick={logout} title="退出登录"><Icon name="logout" size={16} /><span>退出登录</span></button>
+
+        <nav className="srail__nav" aria-label="核心域">
+          <a
+            href="#/director"
+            className="srail__item"
+            aria-current={isDirector ? 'page' : undefined}
+            title="总控与进度"
+            aria-label="总控与进度"
+          >
+            <Icon name="director" size={19} />
+            {need > 0 && <span className="srail__badge is-warn">{need}</span>}
+          </a>
+          <a
+            href="#/tickets"
+            className="srail__item"
+            aria-current={isTaskDomain ? 'page' : undefined}
+            title="任务与项目"
+            aria-label="任务与项目"
+          >
+            <Icon name="tickets" size={19} />
+            {running > 0 && <span className="srail__badge is-run">{running}</span>}
+          </a>
+          <a
+            href={disabledPlugins.has('memory-skills') ? '#/usage' : '#/memory'}
+            className="srail__item"
+            aria-current={isMemoryDomain ? 'page' : undefined}
+            title="主人记忆与统计"
+            aria-label="主人记忆与统计"
+          >
+            <Icon name="memory" size={19} />
+          </a>
+          <a
+            href="#/devenv"
+            className="srail__item"
+            aria-current={isEnvDomain ? 'page' : undefined}
+            title="环境与配置"
+            aria-label="环境与配置"
+          >
+            <Icon name="settings" size={19} />
+          </a>
+          <button
+            type="button"
+            className={isExtraDomain || toolsOpen ? 'srail__item is-active' : 'srail__item'}
+            title="全部功能与工具"
+            aria-label="全部功能与工具"
+            onClick={() => setToolsOpen(true)}
+          >
+            <Icon name="grid" size={18} />
+          </button>
+        </nav>
+
+        <div className="srail__foot">
+          <button
+            type="button"
+            className="srail__btn"
+            title="快速跳转（⌘K / Ctrl+K）"
+            aria-label="快速跳转"
+            onClick={() => setCmdOpen(true)}
+          >
+            <Icon name="search" size={17} />
+          </button>
+          <div className="srail__themewrap">
+            <button
+              type="button"
+              className={themePopOpen ? 'srail__btn is-active' : 'srail__btn'}
+              title={`切换外观（当前：${theme.label}）`}
+              aria-label={`切换外观（当前：${theme.label}）`}
+              aria-expanded={themePopOpen}
+              onClick={() => setThemePopOpen(v => !v)}
+            >
+              <Icon name={theme.dark ? 'moon' : 'sun'} size={17} />
+            </button>
+            {themePopOpen && (
+              <div className="theme-pop" role="menu" aria-label="选择界面主题">
+                <span className="theme-pop__label">界面外观</span>
+                {THEME_OPTIONS.map(t => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={theme.mode === t.id}
+                    className={theme.mode === t.id ? 'theme-pop__opt is-on' : 'theme-pop__opt'}
+                    onClick={() => pickTheme(t.id)}
+                  >
+                    <i className="theme-dot" style={{ background: t.swatch }} />
+                    <span>
+                      <b>{t.label}</b>
+                      <small>{t.desc}</small>
+                    </span>
+                    {theme.mode === t.id && <Icon name="check" size={14} />}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            className="srail__btn"
+            title="退出登录"
+            aria-label="退出登录"
+            onClick={logout}
+          >
+            <Icon name="logout" size={17} />
+          </button>
+        </div>
+      </aside>
+
+      {/* 非总控子页面上下文顶栏（PC 端） */}
+      {!isDirector && (
+        <div className="subbar only-desktop" role="banner">
+          <div className="subbar__left">
+            <a className="subbar__back" href="#/director">
+              <Icon name="back" size={15} />
+              <span>总控</span>
+            </a>
+            <span className="subbar__sep" aria-hidden="true">/</span>
+            {activeDomain ? (
+              <nav className="subbar__tabs" aria-label="域内导航">
+                {activeDomain.tabs
+                  .filter(([k]) => !NAV_PLUGIN_GUARD[k] || !disabledPlugins.has(NAV_PLUGIN_GUARD[k]!))
+                  .map(([k, label]) => (
+                    <a key={k} href={`#/${k}`} aria-current={key === k || (m && k === 'tickets') ? 'page' : undefined}>
+                      {label}
+                    </a>
+                  ))}
+              </nav>
+            ) : (
+              <b className="subbar__title">{pageLabel}</b>
+            )}
+          </div>
+          <div className="subbar__right">
+            <span className="subbar__live" data-on={live.live}><i />{liveWord}</span>
+            <button type="button" className="subbar__search" onClick={() => setCmdOpen(true)}>
+              <Icon name="search" size={14} />
+              <span>跳转…</span>
+              <kbd>⌘K</kbd>
+            </button>
           </div>
         </div>
-      </nav>
-      <CommandPalette open={cmdOpen} onClose={() => setCmdOpen(false)} toggleTheme={theme.cycle} dark={theme.dark} />
+      )}
+
+      {/* 主内容视口 */}
+      <main ref={top} key={m ? 'd' + m[1] : isDirector ? 'director' : h}>
+        <Suspense fallback={<p className="meta">加载中…</p>}>
+          {m ? <Detail id={safeDecode(m[1]!)} /> : key === 'tickets' ? <Tickets /> : key === 'more' ? <P.More onLogout={logout} /> : Page ? <Page /> : <Director />}
+        </Suspense>
+      </main>
+
+      {/* PC 端全部工具弹窗 */}
+      {toolsOpen && (
+        <Sheet title="全部功能与工作台" onClose={() => setToolsOpen(false)}>
+          <div className="tools-groups">
+            {TOOL_GROUPS.map(([groupName, items]) => {
+              const visible = items.filter(([k]) => !NAV_PLUGIN_GUARD[k] || !disabledPlugins.has(NAV_PLUGIN_GUARD[k]!))
+              if (visible.length === 0) return null
+              return <div key={groupName} className="tools-group">
+                <h4>{groupName}</h4>
+                <div className="tools-grid">
+                  {visible.map(([k, label]) => (
+                    <a
+                      key={k}
+                      href={`#/${k}`}
+                      className={key === k ? 'tools-item is-on' : 'tools-item'}
+                      onClick={() => setToolsOpen(false)}
+                    >
+                      <Icon name={k} size={17} />
+                      <span>{label}</span>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            })}
+          </div>
+        </Sheet>
+      )}
+
+      {/* 手机端轻盈侧滑导航抽屉 */}
+      {drawerOpen && (
+        <div className="sdrawer-mask" onClick={e => { if (e.target === e.currentTarget) setDrawerOpen(false) }}>
+          <aside className="sdrawer" role="dialog" aria-label="导航菜单">
+            <div className="sdrawer__head">
+              <div className="sdrawer__brand">
+                <Logo size={24} />
+                <div>
+                  <b>SuperAgent</b>
+                  <span className="meta">{live.live ? '实时在线' : liveWord}</span>
+                </div>
+              </div>
+              <button type="button" className="ghost small" aria-label="关闭菜单" onClick={() => setDrawerOpen(false)}>
+                <Icon name="x" size={18} />
+              </button>
+            </div>
+
+            <button type="button" className="primary wide sdrawer__new" onClick={triggerNewChat}>
+              <Icon name="new" size={15} />新开对话（网页 / 飞书）
+            </button>
+
+            <div className="sdrawer__body">
+              {TOOL_GROUPS.map(([groupName, items]) => {
+                const visible = items.filter(([k]) => !NAV_PLUGIN_GUARD[k] || !disabledPlugins.has(NAV_PLUGIN_GUARD[k]!))
+                if (visible.length === 0) return null
+                return <div key={groupName} className="sdrawer__group">
+                  <span className="sdrawer__glabel">{groupName}</span>
+                  {visible.map(([k, label]) => (
+                    <a
+                      key={k}
+                      href={`#/${k}`}
+                      className={key === k ? 'sdrawer__link is-on' : 'sdrawer__link'}
+                      onClick={() => setDrawerOpen(false)}
+                    >
+                      <Icon name={k} size={17} />
+                      <span>{label}</span>
+                      {k === 'tickets' && need > 0 && <span className="nb need">{need}</span>}
+                      {k === 'today' && running > 0 && <span className="nb run">{running}</span>}
+                    </a>
+                  ))}
+                </div>
+              })}
+            </div>
+
+            <div className="sdrawer__foot">
+              <span className="sdrawer__glabel">界面主题</span>
+              <div className="sdrawer__themes">
+                {THEME_OPTIONS.map(t => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className={theme.mode === t.id ? 'cmd-theme is-on' : 'cmd-theme'}
+                    onClick={() => pickTheme(t.id)}
+                  >
+                    <i className="theme-dot" style={{ background: t.swatch }} />
+                    <span>{t.label}</span>
+                  </button>
+                ))}
+              </div>
+              <button type="button" className="ghost danger sdrawer__logout" onClick={() => { setDrawerOpen(false); logout() }}>
+                <Icon name="logout" size={16} />退出登录
+              </button>
+            </div>
+          </aside>
+        </div>
+      )}
+
+      {/* 点击空白处收起主题浮层 */}
+      {themePopOpen && <div className="pop-backdrop" onClick={() => setThemePopOpen(false)} aria-hidden="true" />}
+
+      <CommandPalette
+        open={cmdOpen}
+        onClose={() => setCmdOpen(false)}
+        themeMode={theme.mode}
+        setTheme={pickTheme}
+        onNewChat={triggerNewChat}
+      />
       <ToastHost />
       <DialogHost />
     </div>
   </LiveContext.Provider>
 }
-
-const TABS: [string, string][] = [['today', '今日'], ['director', '总控'], ['tickets', '任务'], ['new', '发任务'], ['more', '更多']]
 
 createRoot(document.getElementById('root')!).render(<ErrorBoundary><App /></ErrorBoundary>)
