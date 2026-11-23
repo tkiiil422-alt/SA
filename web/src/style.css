@@ -662,12 +662,21 @@ a.pt-card:hover{border-color:var(--run);box-shadow:var(--lift)}
 .dir__msgpick .dir__chk{margin-top:10px}
 .dir__msgpick .dir__msg,.dir__msgpick .dir__event{flex:1;min-width:0}
 
+/* 桌面与手机端显隐辅助类（各自断点单向隐藏，绝不破坏组件原有 flex/grid 布局） */
+@media(min-width:900px){.only-mobile{display:none!important}}
+@media(max-width:899px){.only-desktop{display:none!important}}
+
 /* 中央对话区 */
 .dir__chat{background:var(--surface);border:1px solid var(--line);border-radius:var(--r2);padding:14px 16px;display:flex;flex-direction:column;gap:10px;min-width:0;height:calc(100vh - 210px);min-height:520px;box-shadow:var(--lift)}
 .dir__chathead{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding-bottom:10px;border-bottom:1px solid var(--line);flex:none}
-.dir__chatinfo{min-width:0;display:flex;flex-direction:column;gap:2px}
-.dir__chatinfo b{font-size:.96rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dir__chattools{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.dir__chatinfo{min-width:0;flex:1;display:flex;flex-direction:column;gap:2px}
+.dir__chattitle{display:flex;align-items:center;gap:6px;min-width:0}
+.dir__chattitle b{font-size:.96rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dir__dot{width:8px;height:8px;border-radius:50%;background:var(--bad);flex:none}
+.dir__dot.is-on{background:var(--run)}
+.dir__chattools{display:flex;align-items:center;gap:6px;flex-wrap:wrap;flex:none}
+.dir__morebtn{min-width:32px;padding:0 8px!important;font-size:1rem!important;line-height:1}
+.dir__mactions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 10px;background:var(--sunk);border-bottom:1px solid var(--line);flex:none}
 .dir__synclabel{display:inline-flex;align-items:center;gap:5px;font-size:.8rem;color:var(--ink2);cursor:pointer;padding:2px 6px;border-radius:6px;background:var(--sunk)}
 .dir__synclabel input{accent-color:var(--run)}
 
@@ -676,7 +685,10 @@ a.pt-card:hover{border-color:var(--run);box-shadow:var(--lift)}
 .dir__summary p{margin:6px 0 0;white-space:pre-wrap}
 .dir__fwrow{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:6px;padding-top:6px;border-top:1px dashed var(--line);font-size:.82rem}
 
-.dir__feed{flex:1;display:flex;flex-direction:column;gap:14px;overflow-y:auto;padding:6px 4px;min-height:0;scroll-behavior:smooth}
+.dir__feedwrap{position:relative;flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.dir__feed{flex:1;display:flex;flex-direction:column;gap:14px;overflow-y:auto;overscroll-behavior-y:contain;-webkit-overflow-scrolling:touch;padding:6px 4px;min-height:0}
+.dir__jump{position:absolute;right:12px;bottom:10px;z-index:5;display:inline-flex!important;align-items:center;gap:4px;min-height:32px!important;padding:0 12px!important;border-radius:99px!important;border:1px solid var(--line2)!important;background:color-mix(in srgb,var(--surface) 92%,transparent)!important;color:var(--run)!important;font-size:.78rem!important;font-weight:600!important;box-shadow:0 4px 14px rgba(0,0,0,.14);backdrop-filter:blur(8px);cursor:pointer}
+.dir__jump:hover{border-color:var(--run)!important}
 
 /* 欢迎引导卡片 */
 .dir__welcome{margin:auto 0;padding:12px 4px;display:flex;flex-direction:column;gap:16px}
@@ -739,10 +751,19 @@ a.pt-card:hover{border-color:var(--run);box-shadow:var(--lift)}
 .dir__ctxcheck input{width:17px;height:17px;accent-color:var(--run)}
 
 .dir__composer{display:flex;gap:8px;align-items:flex-end}
-.dir__composer textarea{flex:1;resize:none;min-height:46px;max-height:140px;padding:10px 12px;border:1px solid var(--line2);border-radius:12px;background:var(--paper);color:var(--ink);font:inherit;font-size:16px;line-height:1.45;transition:border-color .15s,box-shadow .15s}
+.dir__composer textarea{flex:1;resize:none;min-height:42px;max-height:140px;padding:9px 12px;border:1px solid var(--line2);border-radius:12px;background:var(--paper);color:var(--ink);font:inherit;font-size:16px;line-height:1.45;transition:border-color .15s,box-shadow .15s;overflow-y:auto}
 .dir__composer textarea:focus{outline:none;border-color:var(--run);box-shadow:0 0 0 3px color-mix(in srgb,var(--run) 18%,transparent);background:var(--surface)}
-.dir__sendbtn{flex:none;min-height:46px!important;padding:0 16px!important;border-radius:12px!important;display:inline-flex!important;align-items:center;gap:6px}
+.dir__plusbtn{position:relative;flex:none;width:38px;min-height:38px!important;height:38px;padding:0!important;border-radius:50%!important;border:1px solid var(--line2)!important;background:var(--paper)!important;color:var(--ink2)!important;font-size:1.15rem;line-height:1;display:inline-flex;align-items:center;justify-content:center;cursor:pointer}
+.dir__plusbtn.is-active{border-color:var(--run)!important;background:var(--run-bg)!important;color:var(--run)!important}
+.dir__plusdot{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:var(--run)}
+.dir__sendbtn{flex:none;min-height:42px!important;padding:0 16px!important;border-radius:12px!important;display:inline-flex!important;align-items:center;gap:6px}
 .dir__sendbtn.is-stop{background:var(--bad)!important;border-color:var(--bad)!important;color:#fff!important}
+
+/* 手机端计划板内紧凑运行概览卡 */
+.dir__mstatus{padding:10px 12px;margin-bottom:10px;border-radius:var(--r1);background:var(--paper);border:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
+.dir__mstatus-row{display:flex;align-items:center;gap:8px;min-width:0}
+.dir__mstatus-row .mono{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.76rem}
+.dir__mstatus-meta{display:flex;gap:12px;flex-wrap:wrap;font-size:.78rem;color:var(--ink2)}
 
 /* 右栏 DAG 任务计划板与活跃工单 */
 .dir__missions{display:flex;flex-direction:column;gap:10px}
@@ -776,41 +797,45 @@ a.pt-card:hover{border-color:var(--run);box-shadow:var(--lift)}
   .dir__layout.has-ops .dir__ops{grid-column:1 / -1;max-height:420px}
 }
 
-/* 手机端深度适配（< 900px）：全屏原生对话体验，纯 Flex 精准锁定 100dvh，输入框永驻首屏 */
+/* 手机端深度适配（< 900px）：全屏原生聊天框体验，最大化对话内容可视高度，默认直达最新消息 */
 @media(max-width:899px){
-  .shell.is-director{height:100dvh;overflow:hidden;display:flex;flex-direction:column}
-  .shell.is-director .mbar{flex:none}
-  .shell.is-director main{flex:1;min-height:0;max-width:none;width:100%;display:flex;flex-direction:column;overflow:hidden;padding:8px 10px calc(var(--tabs) + 8px + env(safe-area-inset-bottom))}
-  .dir{flex:1;min-height:0;gap:6px;overflow:hidden}
-  .dir__head{margin:0!important;flex:none;flex-direction:row!important;align-items:center!important;justify-content:space-between!important;gap:8px!important}
-  .dir__head h1{font-size:1.15rem}
-  .dir__stats{flex:none;display:flex;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;gap:6px;padding-bottom:1px}
-  .dir__stats::-webkit-scrollbar{display:none}
-  .dir__stat{flex:none;padding:5px 10px;border-radius:10px;min-width:92px;box-shadow:none;gap:1px}
-  .dir__stat span{font-size:.68rem}
-  .dir__stat b{font-size:.8rem}
-  .dir__pending{flex:none;max-height:130px;overflow-y:auto}
+  .shell.is-director{height:100dvh;overflow:hidden;display:flex;flex-direction:column;background:var(--surface)}
+  .shell.is-director .mbar{flex:none;height:44px;min-height:44px;padding:0 10px}
+  .shell.is-director main{flex:1;min-height:0;max-width:none;width:100%;display:flex;flex-direction:column;overflow:hidden;padding:0 0 calc(var(--tabs) + env(safe-area-inset-bottom))}
+  .dir{flex:1;min-height:0;gap:0;overflow:hidden}
+  /* 手机端隐藏顶部大标题与指标条，释放 ~110px 垂直空间给聊天记录（状态信息归入计划板顶卡） */
+  .dir__head,.dir__stats{display:none}
+  .dir__pending{flex:none;max-height:110px;overflow-y:auto;padding:6px 10px;border-bottom:1px solid var(--line)}
 
-  .dir__mnav{flex:none;display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:3px;background:var(--sunk);border:1px solid var(--line);border-radius:11px}
-  .dir__mnav button{display:inline-flex!important;align-items:center;justify-content:center;gap:5px;min-height:34px!important;padding:0 6px!important;border:0!important;border-radius:8px!important;background:transparent!important;color:var(--ink2)!important;font-size:.82rem;font-weight:600;cursor:pointer}
-  .dir__mnav button.is-on{background:var(--surface)!important;color:var(--run)!important;box-shadow:var(--lift)}
+  .dir__mnav{flex:none;display:grid;grid-template-columns:repeat(3,1fr);gap:4px;padding:4px 8px;background:var(--sunk);border-bottom:1px solid var(--line);border-radius:0}
+  .dir__mnav button{display:inline-flex!important;align-items:center;justify-content:center;gap:5px;min-height:30px!important;padding:0 6px!important;border:0!important;border-radius:8px!important;background:transparent!important;color:var(--ink2)!important;font-size:.82rem;font-weight:600;cursor:pointer}
+  .dir__mnav button.is-on{background:var(--surface)!important;color:var(--run)!important;box-shadow:0 1px 2px rgba(0,0,0,.08)}
 
   .dir__layout,.dir__layout.has-ops{flex:1;min-height:0;display:flex;flex-direction:column;gap:0;overflow:hidden}
   .dir[data-mpane=chat] .dir__pane-sessions,.dir[data-mpane=chat] .dir__pane-ops{display:none}
   .dir[data-mpane=sessions] .dir__pane-chat,.dir[data-mpane=sessions] .dir__pane-ops{display:none}
   .dir[data-mpane=ops] .dir__pane-chat,.dir[data-mpane=ops] .dir__pane-sessions{display:none}
 
-  .dir__chat{flex:1;height:100%;min-height:0;padding:8px 10px;gap:8px;border-radius:14px}
-  .dir__chathead{padding-bottom:7px}
-  .dir__side{flex:1;height:100%;max-height:none;min-height:0;overflow-y:auto}
+  .dir__chat{flex:1;height:100%;min-height:0;padding:0;gap:0;border:0;border-radius:0;box-shadow:none}
+  .dir__chathead{padding:5px 10px;min-height:36px;flex-wrap:nowrap;gap:6px;background:var(--surface)}
+  .dir__chattitle b{font-size:.9rem}
+  .dir__chat .dir__bulkbar{margin:6px 10px 0}
+  .dir__chat .dir__summary{margin:6px 10px 0;padding:6px 10px;font-size:.8rem}
+  .dir__feed{padding:10px 10px 12px;gap:10px}
+  .dir__side{flex:1;height:100%;max-height:none;min-height:0;overflow-y:auto;border:0;border-radius:0;box-shadow:none;padding:10px}
   .dir__starters{grid-template-columns:1fr;gap:8px}
   .dir__starter{padding:10px 12px!important}
-  .dir__msg{max-width:95%}
-  .dir__bubble{padding:10px 12px;font-size:.93rem}
-  .dir__dock{padding-top:7px;gap:6px}
-  .dir__composer textarea{min-height:42px;max-height:110px;padding:8px 11px}
+  .dir__msg{max-width:96%}
+  .dir__msg.is-ai{width:100%}
+  .dir__bubble{padding:10px 12px;font-size:.94rem;line-height:1.6}
+  .dir__dock{padding:6px 8px 8px;gap:6px;background:var(--surface)}
+  .dir__chipbar{display:none}
+  .dir__chipbar.is-open{display:flex}
+  .dir__composer{gap:6px}
+  .dir__composer textarea{min-height:38px;max-height:104px;padding:7px 12px;border-radius:19px}
   .dir__sendbtn span{display:none}
-  .dir__sendbtn{width:44px;min-height:42px!important;padding:0!important;justify-content:center}
+  .dir__sendbtn{width:40px;min-height:38px!important;height:38px;padding:0!important;border-radius:50%!important;justify-content:center}
+  .dir__ctxpanel{margin:0 2px;padding:8px 10px}
   .dir__ctxcheck{padding-top:4px}
   .dir__actbtns{width:100%}
   .dir__actbtns button{flex:1}

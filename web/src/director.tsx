@@ -5,7 +5,7 @@
  * - 流式 SSE 思考与工具调用实时进度（`POST /api/director/chat/stream`）+ 支持中途停止（AbortController）
  * - 实时 DAG 任务计划编排与幂等审批、高危操作二次确认与自动续接管理
  */
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { API, del, get, post } from './api'
 import { usePoll, ago, money } from './hooks'
 import { useLive } from './useLive'
@@ -178,11 +178,40 @@ export function Director() {
   const [removedSessionIds, setRemovedSessionIds] = useState<string[]>([])
   const [manageMsgs, setManageMsgs] = useState(false)
   const [pickedMsgIds, setPickedMsgIds] = useState<number[]>([])
+  // 手机端沉浸聊天控制：快捷工具抽屉、会话更多操作菜单、回到底部悬浮提示
+  const [toolsOpen, setToolsOpen] = useState(false)
+  const [chatMenuOpen, setChatMenuOpen] = useState(false)
+  const [showJumpBottom, setShowJumpBottom] = useState(false)
 
   const { busy, run } = useAction()
+  const feedRef = useRef<HTMLDivElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const stickToBottomRef = useRef(true)
+  const lastSessionScrolledRef = useRef('')
+  const lastMsgIdRef = useRef(0)
+
+  const scrollToBottom = (behavior: 'auto' | 'smooth' = 'auto') => {
+    const el = feedRef.current
+    if (!el) return
+    stickToBottomRef.current = true
+    setShowJumpBottom(false)
+    if (behavior === 'smooth' && typeof el.scrollTo === 'function') {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+    } else {
+      el.scrollTop = el.scrollHeight
+    }
+  }
+
+  const onFeedScroll = () => {
+    const el = feedRef.current
+    if (!el) return
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+    const nearBottom = dist <= 88
+    stickToBottomRef.current = nearBottom
+    setShowJumpBottom(!nearBottom && el.scrollHeight > el.clientHeight + 120)
+  }
 
   const rawItems = sessionsPoll.d?.items ?? []
   const items = removedSessionIds.length > 0
@@ -265,6 +294,64 @@ export function Director() {
   const activeSession = detail?.session ?? items.find(s => s.id === selectedId)
   const messages = detail?.messages ?? []
   const visibleMessages = messages.filter(m => m.role !== 'tool')
+  const lastMsgId = visibleMessages.length > 0 ? visibleMessages[visibleMessages.length - 1]!.id : 0
+  const detailSessionId = detail?.session?.id ?? ''
+
+  // 切换会话时重置滚底标记与更多菜单
+  useEffect(() => {
+    setChatMenuOpen(false)
+    lastSessionScrolledRef.current = ''
+    lastMsgIdRef.current = 0
+    stickToBottomRef.current = true
+    setShowJumpBottom(false)
+  }, [selectedId])
+
+  // 打开总控页 / 首次加载历史消息 / 切回手机端「对话」分栏 / 收到新消息或流式进度时自动定位到最新内容
+  useLayoutEffect(() => {
+    if (mobilePane !== 'chat') return
+    if (!detailSessionId && !sending) return
+    const sessionKey = `${detailSessionId}:${mobilePane}`
+    const isInitialForSession = lastSessionScrolledRef.current !== sessionKey && visibleMessages.length > 0
+    const hasNewMessage = lastMsgId > lastMsgIdRef.current
+
+    if (isInitialForSession) {
+      lastSessionScrolledRef.current = sessionKey
+      lastMsgIdRef.current = lastMsgId
+      scrollToBottom('auto')
+      const raf = requestAnimationFrame(() => scrollToBottom('auto'))
+      return () => cancelAnimationFrame(raf)
+    }
+
+    if (hasNewMessage || sending) {
+      lastMsgIdRef.current = lastMsgId
+      if (stickToBottomRef.current || sending) {
+        const raf = requestAnimationFrame(() => scrollToBottom(sending ? 'auto' : 'smooth'))
+        return () => cancelAnimationFrame(raf)
+      }
+    }
+  }, [detailSessionId, visibleMessages.length, lastMsgId, sending, streamEvents.length, mobilePane])
+
+  // 手机端软键盘弹出导致可视高度变化时，若原本停留在最新位置则继续紧贴底部
+  useEffect(() => {
+    const vv = window.visualViewport
+    if (!vv) return
+    const onResize = () => {
+      if (mobilePane === 'chat' && stickToBottomRef.current) {
+        scrollToBottom('auto')
+      }
+    }
+    vv.addEventListener('resize', onResize)
+    return () => vv.removeEventListener('resize', onResize)
+  }, [mobilePane])
+
+  // 聊天输入框单行起跳、随内容自动增高（最多 ~4 行），把首屏高度留给聊天记录
+  useLayoutEffect(() => {
+    const ta = textareaRef.current
+    if (!ta) return
+    ta.style.height = 'auto'
+    const maxH = window.innerWidth < 900 ? 104 : 140
+    ta.style.height = `${Math.min(maxH, Math.max(40, ta.scrollHeight))}px`
+  }, [input])
 
   const toolResultMap = new Map<string, DirMessage>()
   for (const m of messages) {
@@ -311,7 +398,11 @@ export function Director() {
     setSending(true)
     setStreamEvents([])
     setMobilePane('chat')
+    setToolsOpen(false)
+    setChatMenuOpen(false)
+    stickToBottomRef.current = true
     if (!overrideText) setInput('')
+    requestAnimationFrame(() => scrollToBottom('auto'))
 
     const targetChannel = activeSession?.channel ?? 'web'
     const targetUserId = activeSession?.userId ?? 'console'
@@ -379,7 +470,7 @@ export function Director() {
       }
       sessionsPoll.reload()
       missionsPoll.reload()
-      setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }), 80)
+      requestAnimationFrame(() => scrollToBottom('smooth'))
     } catch (e: any) {
       if (e?.name !== 'AbortError') {
         toast(e?.message || '发送失败', true)
@@ -683,20 +774,24 @@ export function Director() {
       <section className="dir__chat dir__pane-chat">
         <div className="dir__chathead">
           <div className="dir__chatinfo">
-            <b>{activeSession ? (activeSession.title || activeSession.userId) : '新网页对话'}</b>
-            <span className="meta">
+            <div className="dir__chattitle">
+              {st && <i className={st.enabled ? 'dir__dot is-on' : 'dir__dot'} aria-hidden="true" />}
+              <b>{activeSession ? (activeSession.title || activeSession.userId) : '新网页对话'}</b>
+            </div>
+            <span className="meta only-desktop">
               {activeSession ? `通道：${CHANNEL_LABEL[activeSession.channel] || activeSession.channel}` : '直接交代目标，总控自动建立会话'}
               {activeSession?.focusTicketId && <> · 聚焦：<a href={`#/tickets/${encodeURIComponent(activeSession.focusTicketId)}`}>{activeSession.focusTicketId.slice(0, 10)}</a></>}
             </span>
           </div>
-          <div className="dir__chattools">
+          {/* 桌面端平铺操作按钮 */}
+          <div className="dir__chattools only-desktop">
             {activeSession && (activeSession.channel === 'wechat' || activeSession.channel === 'feishu') && (
               <label className="dir__synclabel">
                 <input type="checkbox" checked={syncWechat} onChange={e => setSyncWechat(e.target.checked)} />
                 同步{CHANNEL_LABEL[activeSession.channel]}
               </label>
             )}
-            <button type="button" className="ghost small only-desktop" disabled={sending} onClick={() => void sendMessage('/状态')}>/状态</button>
+            <button type="button" className="ghost small" disabled={sending} onClick={() => void sendMessage('/状态')}>/状态</button>
             {activeSession && visibleMessages.length > 0 && (
               <button
                 type="button"
@@ -715,7 +810,59 @@ export function Director() {
             {activeSession && <button type="button" className="ghost small" disabled={busy || sending} onClick={resetCurrent}>新对话</button>}
             {activeSession && <button type="button" className="ghost small danger" disabled={busy || sending} onClick={() => void deleteCurrentSession()}>删除会话</button>}
           </div>
+          {/* 手机端极简单行操作（把垂直空间留给对话消息） */}
+          <div className="dir__chattools only-mobile">
+            {activeSession && (
+              <button type="button" className="ghost small" disabled={busy || sending} onClick={resetCurrent}>新对话</button>
+            )}
+            <button
+              type="button"
+              className={chatMenuOpen ? 'ghost small is-active dir__morebtn' : 'ghost small dir__morebtn'}
+              aria-label="更多会话操作"
+              aria-expanded={chatMenuOpen}
+              onClick={() => setChatMenuOpen(v => !v)}
+            >
+              ⋯
+            </button>
+          </div>
         </div>
+
+        {/* 手机端展开的会话操作条 */}
+        {chatMenuOpen && <div className="dir__mactions only-mobile">
+          {activeSession && (activeSession.channel === 'wechat' || activeSession.channel === 'feishu') && (
+            <label className="dir__synclabel">
+              <input type="checkbox" checked={syncWechat} onChange={e => setSyncWechat(e.target.checked)} />
+              同步{CHANNEL_LABEL[activeSession.channel]}
+            </label>
+          )}
+          {activeSession && visibleMessages.length > 0 && (
+            <button
+              type="button"
+              className={manageMsgs ? 'ghost small is-active' : 'ghost small'}
+              disabled={busy || sending}
+              onClick={() => {
+                setManageMsgs(v => {
+                  if (v) setPickedMsgIds([])
+                  return !v
+                })
+                setChatMenuOpen(false)
+              }}
+            >
+              {manageMsgs ? '退出删消息' : '批量删消息'}
+            </button>
+          )}
+          {activeSession && (
+            <button
+              type="button"
+              className="ghost small danger"
+              disabled={busy || sending}
+              onClick={() => { setChatMenuOpen(false); void deleteCurrentSession() }}
+            >
+              删除会话
+            </button>
+          )}
+          <a className="btn small" href="#/settings/director" onClick={() => setChatMenuOpen(false)}>总控设置</a>
+        </div>}
 
         {manageMsgs && visibleMessages.length > 0 && <div className="dir__bulkbar" role="region" aria-label="消息批量删除">
           <label className="dir__checkall">
@@ -757,8 +904,9 @@ export function Director() {
 
         {detailErr && <p className="warn" style={{ margin: '4px 0' }}>{detailErr}</p>}
 
-        {/* 消息流 */}
-        <div className="dir__feed">
+        {/* 消息流（默认贴底展示最新内容，上翻查看历史时浮现回底胶囊） */}
+        <div className="dir__feedwrap">
+        <div className="dir__feed" ref={feedRef} onScroll={onFeedScroll}>
           {visibleMessages.length === 0 && !sending && <div className="dir__welcome">
             <div className="dir__welcome-head">
               <div className="dir__avatar is-lg"><Icon name="director" size={22} /></div>
@@ -885,10 +1033,16 @@ export function Director() {
           </div>}
           <div ref={bottomRef} />
         </div>
+        {showJumpBottom && (
+          <button type="button" className="dir__jump" onClick={() => scrollToBottom('smooth')} aria-label="回到底部最新消息">
+            ↓ 回到最新
+          </button>
+        )}
+        </div>
 
-        {/* 底部输入控制区（紧凑快捷芯片 + 可折叠上下文约束抽屉 + 触控输入栏） */}
+        {/* 底部输入控制区（桌面常驻快捷芯片；手机默认单行极简输入，点 ＋ 展开快捷指令与约束） */}
         <div className="dir__dock">
-          <div className="dir__chipbar">
+          <div className={toolsOpen || activeContextTags.length > 0 ? 'dir__chipbar is-open' : 'dir__chipbar'}>
             <button
               type="button"
               className={ctxOpen || activeContextTags.length > 0 ? 'dir__chip is-active' : 'dir__chip'}
@@ -903,7 +1057,14 @@ export function Director() {
               type="button"
               className="dir__chip"
               disabled={sending}
-              onClick={() => ch.cmd ? void sendMessage(ch.cmd) : fillInput(ch.fill || '')}
+              onClick={() => {
+                if (ch.cmd) {
+                  void sendMessage(ch.cmd)
+                } else {
+                  setToolsOpen(false)
+                  fillInput(ch.fill || '')
+                }
+              }}
             >
               {ch.label}
             </button>)}
@@ -940,13 +1101,28 @@ export function Director() {
           </div>}
 
           <div className="dir__composer">
+            <button
+              type="button"
+              className={toolsOpen || ctxOpen || activeContextTags.length > 0 ? 'dir__plusbtn is-active only-mobile' : 'dir__plusbtn only-mobile'}
+              aria-label={toolsOpen ? '收起快捷工具' : '展开快捷指令与约束'}
+              aria-expanded={toolsOpen}
+              onClick={() => {
+                setToolsOpen(v => {
+                  if (v) setCtxOpen(false)
+                  return !v
+                })
+              }}
+            >
+              {toolsOpen ? '×' : '＋'}
+              {activeContextTags.length > 0 && <span className="dir__plusdot" aria-hidden="true" />}
+            </button>
             <textarea
               ref={textareaRef}
-              rows={2}
+              rows={1}
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && input.trim()) { e.preventDefault(); void sendMessage() } }}
-              placeholder="直接告诉总控你想办的事…（桌面端 Ctrl+Enter 发送）"
+              placeholder="发消息给总控助手…"
             />
             {sending
               ? <button type="button" className="dir__sendbtn is-stop" onClick={stopSending} aria-label="停止推理">
@@ -963,6 +1139,19 @@ export function Director() {
 
       {/* 右栏：实时 DAG 任务计划板 + 活跃工单 */}
       <aside className="dir__side dir__ops dir__pane-ops">
+        {/* 手机端把运行状态概览收进计划板顶部，不挤占聊天对话区高度 */}
+        {st && <div className="dir__mstatus only-mobile">
+          <div className="dir__mstatus-row">
+            <span className="pill" data-tone={st.enabled ? 'run' : 'bad'}>{st.enabled ? '总控在线' : '已关闭'}</span>
+            <span className="mono meta">{st.model || '—'}</span>
+            <a className="btn small" href="#/settings/director">设置</a>
+          </div>
+          <div className="dir__mstatus-meta">
+            <span>今日 {money(st.todayUsd || 0)}{st.dailyUsd > 0 ? ` / ${money(st.dailyUsd)}` : ''}</span>
+            <span>工单 {openTickets.length}</span>
+            <span>计划 {activeMissionsCount}</span>
+          </div>
+        </div>}
         <div className="dir__sidehead">
           <b>DAG 任务计划（{missions.length}）</b>
           <button type="button" className="ghost small" onClick={missionsPoll.reload}>刷新</button>
