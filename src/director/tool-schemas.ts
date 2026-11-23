@@ -10,7 +10,7 @@ import type { PluginRegistry } from '../plugins/registry.ts'
 const BASE_QUERY_ACTIONS = [
   'platform_overview', 'system_status', 'orphans_list', 'plugins_list',
   'pi_status', 'devenv_status',
-  'tickets_list', 'ticket_detail', 'ticket_receipt', 'ticket_activity', 'ticket_files', 'ticket_read_file',
+  'tickets_list', 'ticket_detail', 'ticket_receipt', 'ticket_diagnose', 'ticket_activity', 'ticket_files', 'ticket_read_file',
   'usage_summary', 'usage_calls', 'events_list', 'decisions_list',
   'projects_list', 'project_detail', 'project_files', 'project_read_file', 'project_snapshots', 'project_snapshot_diff',
   'novels_list', 'novel_detail', 'novel_chapter', 'novel_canon_get', 'fanqie_status',

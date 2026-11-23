@@ -11,6 +11,11 @@ import type { FeishuOptions } from '../admin/options.ts'
 import { key } from '../core/ids.ts'
 import type { Trigger } from '../core/model.ts'
 import type { OutboundMessage, ScopeResult, SourceScope } from '../core/ports.ts'
+import {
+  parseFeishuCardActionEvent,
+  type FeishuCardActionEvent,
+  type FeishuCardCallbackResponse,
+} from './feishu-cards.ts'
 
 export const FEISHU_SOURCE = 'feishu'
 const MAX_BODY = 1_048_576
@@ -235,6 +240,8 @@ export interface FeishuSourceOptions {
   config: () => FeishuOptions
   /** Receives each accepted message; called after the HTTP answer has been sent. */
   onTrigger: (trigger: Trigger) => void
+  /** 飞书交互卡片按钮点击回调（须在 3 秒内返回 toast/card 响应）。 */
+  onCardAction?: (event: FeishuCardActionEvent) => Promise<FeishuCardCallbackResponse | void>
   /** Receives rejections and delivery failures; text and data never carry secrets. */
   onEvent?: (event: FeishuEvent) => void
   fetch?: typeof fetch
@@ -362,6 +369,26 @@ export class FeishuSource implements SourceScope {
       return
     }
 
+    // 卡片按钮回传交互（Webhook 模式下的 `card.action.trigger` 或旧版卡片动作请求）
+    const payloadHeader = isObject(decoded.payload.header) ? decoded.payload.header : undefined
+    const isCardAction = payloadHeader?.event_type === 'card.action.trigger' || isObject(decoded.payload.action)
+    if (isCardAction) {
+      const cardEvt = parseFeishuCardActionEvent(decoded.payload)
+      if (!cardEvt || !this.options.onCardAction) {
+        sendJson(res, 200, {})
+        return
+      }
+      try {
+        const reply = await this.options.onCardAction(cardEvt)
+        sendJson(res, 200, reply ?? {})
+      } catch (error) {
+        sendJson(res, 200, {
+          toast: { type: 'error', content: `处理失败：${describe(error).slice(0, 80)}` },
+        })
+      }
+      return
+    }
+
     const botOpenId = await this.botOpenId()
     const result = parseEvent(body, {
       verificationToken: cfg.verificationToken,
@@ -446,26 +473,76 @@ export class FeishuSource implements SourceScope {
     }
   }
 
+  /**
+   * 发送 JSON 2.0 交互式按钮卡片，返回消息 ID 供异步执行完毕后原位更新状态。
+   * 卡片被拒时自动退回 `fallbackText` 纯文本不丢通知。
+   */
+  async sendCard(input: {
+    openId?: string
+    chatId?: string
+    replyTo?: string
+    card: Record<string, unknown>
+    fallbackText?: string
+  }): Promise<{ messageId?: string }> {
+    const cfg = this.options.config()
+    if (!cfg.enabled) throw new Error('飞书未启用')
+    if (!input.replyTo && !input.openId && !input.chatId) throw new Error('飞书发送缺少目标（openId / chatId / replyTo）')
+    try {
+      const token = await this.tenantToken(cfg)
+      try {
+        const messageId = await this.postMessage(cfg, token, input, 'interactive', JSON.stringify(input.card))
+        return messageId ? { messageId } : {}
+      } catch (cardErr) {
+        if (input.fallbackText?.trim()) {
+          const messageId = await this.postMessage(cfg, token, input, 'text', JSON.stringify({ text: input.fallbackText.trim().slice(0, 3800) }))
+          return messageId ? { messageId } : {}
+        }
+        throw cardErr
+      }
+    } catch (error) {
+      this.token = undefined
+      this.emit({ kind: 'feishu.send_failed', level: 'warn', text: '飞书交互卡片发送失败', data: { error: describe(error) } })
+      throw error
+    }
+  }
+
+  /** 原位更新已发出的交互卡片内容（例如将「处理中」更新为最终执行结果）。 */
+  async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
+    const cfg = this.options.config()
+    if (!cfg.enabled || !messageId.trim()) return
+    try {
+      const token = await this.tenantToken(cfg)
+      await this.request(cfg, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, 'PATCH', {
+        content: JSON.stringify(card),
+      }, token)
+    } catch (error) {
+      this.emit({ kind: 'feishu.send_failed', level: 'warn', text: '飞书交互卡片原位更新失败', data: { error: describe(error), messageId } })
+    }
+  }
+
   private async postMessage(
     cfg: FeishuOptions,
     token: string,
     target: { openId?: string; chatId?: string; replyTo?: string },
     msgType: 'interactive' | 'text',
     content: string,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
+    let res: Record<string, unknown>
     if (target.replyTo) {
-      await this.request(cfg, `/open-apis/im/v1/messages/${encodeURIComponent(target.replyTo)}/reply`, 'POST', {
+      res = await this.request(cfg, `/open-apis/im/v1/messages/${encodeURIComponent(target.replyTo)}/reply`, 'POST', {
         msg_type: msgType,
         content,
       }, token)
-      return
+    } else {
+      const byOpenId = Boolean(target.openId)
+      res = await this.request(cfg, `/open-apis/im/v1/messages?receive_id_type=${byOpenId ? 'open_id' : 'chat_id'}`, 'POST', {
+        receive_id: byOpenId ? target.openId : target.chatId,
+        msg_type: msgType,
+        content,
+      }, token)
     }
-    const byOpenId = Boolean(target.openId)
-    await this.request(cfg, `/open-apis/im/v1/messages?receive_id_type=${byOpenId ? 'open_id' : 'chat_id'}`, 'POST', {
-      receive_id: byOpenId ? target.openId : target.chatId,
-      msg_type: msgType,
-      content,
-    }, token)
+    const data = isObject(res.data) ? res.data : undefined
+    return typeof data?.message_id === 'string' ? data.message_id : undefined
   }
 
   /** Check the credentials by fetching the bot identity. Never throws; the message says what failed. */
@@ -535,7 +612,7 @@ export class FeishuSource implements SourceScope {
   private async request(
     cfg: FeishuOptions,
     path: string,
-    method: 'GET' | 'POST',
+    method: 'GET' | 'POST' | 'PATCH',
     payload: unknown,
     token?: string,
   ): Promise<Record<string, unknown>> {

@@ -19,6 +19,12 @@ import { redactPendingAction, redactToolCallArgs } from './settings-patch.ts'
 import { DirectorStore, type DirectorChannel, type DirectorFollowup, type DirectorMessage, type DirectorSession, type FollowupTriggerKind, type PendingAction, type SessionListItem } from './store.ts'
 import { DirectorToolExecutor, type DirectorToolsDeps } from './tools.ts'
 import type { DirectorProgressEvent } from '../shared/api-types.ts'
+import {
+  buildPendingActionCard,
+  buildSettledCard,
+  type FeishuCardActionEvent,
+  type FeishuCardCallbackResponse,
+} from '../sources/feishu-cards.ts'
 
 export interface DirectorServiceDeps extends Omit<DirectorToolsDeps, 'store' | 'onAudit'> {
   store: DirectorStore
@@ -26,6 +32,28 @@ export interface DirectorServiceDeps extends Omit<DirectorToolsDeps, 'store' | '
   sendWechatTyping?: (to?: string, status?: 1 | 2) => Promise<void>
   /** 飞书私聊发送：`to` 为用户 open_id；`replyTo` 为要回复的原消息 ID（对话回复时使用）。 */
   sendFeishu?: (input: { to: string; text: string; replyTo?: string }) => Promise<void>
+  /** 飞书交互式按钮卡片发送（支持确认/拒绝/审批/重试一键点击）。 */
+  sendFeishuCard?: (input: {
+    to: string
+    replyTo?: string
+    card: Record<string, unknown>
+    fallbackText?: string
+  }) => Promise<{ messageId?: string }>
+  /** 飞书交互卡片原位更新（异步执行完成后将「处理中」更新为最终结果）。 */
+  updateFeishuCard?: (messageId: string, card: Record<string, unknown>) => Promise<void>
+  /** 飞书卡片按钮点击鉴权：检查点击人是否在飞书允许操作员白名单中。 */
+  feishuAllowCheck?: (openId: string) => boolean
+  /** 审批密钥申请（供飞书卡片按钮直接调用）。 */
+  decideSecretRequest?: (requestId: string, decision: 'approve' | 'reject') => Promise<{ ok: boolean; message: string }>
+  /** 批准 DAG 人工审批节点（供飞书卡片按钮直接调用）。 */
+  approveMissionNode?: (missionId: string, nodeKey: string, opts: {
+    actorId: string
+    planVersion: number
+    idempotencyKey: string
+    note?: string
+  }) => Promise<{ ok: boolean; message: string }>
+  /** 取消 DAG 计划（供飞书卡片按钮直接调用）。 */
+  cancelMission?: (missionId: string) => Promise<{ ok: boolean; message: string }>
   /** 当用户在微信使用 `/直通 <内容>` 时，回调走原有直接建单链路（可选）。 */
   directWechatFallback?: (input: { from: string; chatId: string; messageId: string; text: string }) => void
   callTool?: typeof callToolModel
@@ -42,8 +70,8 @@ export interface DirectorChatInput {
   wechatMeta?: { chatId: string; messageId: string }
   /** 从控制台向微信/飞书会话发消息时，是否同步把总控回复推送到该通道。 */
   deliverToWechat?: boolean
-  /** 内部使用：由任务/会商完成事件自动唤醒总控推进后续步骤。 */
-  autoTrigger?: { eventKind: FollowupTriggerKind; targetId: string; followupIds?: string[] }
+  /** 内部使用：由任务/会商完成、故障自愈或闭环汇报事件自动唤醒总控。 */
+  autoTrigger?: { eventKind: FollowupTriggerKind | 'auto_heal' | 'heal_resolved' | 'turn_resume'; targetId: string; followupIds?: string[]; resumeDepth?: number }
   /** 实时流式思考与工具调用进度回调（供 SSE `/api/director/chat/stream` 消费）。 */
   onProgress?: (ev: DirectorProgressEvent) => void
   /** 客户端断开或点击停止时触发中止。 */
@@ -67,6 +95,8 @@ export interface DirectorChatResult {
   model?: string
   shortcut?: string
   modelFailed?: boolean
+  /** 本轮因超时或模型故障中断，已自动排队续跑。 */
+  resumeScheduled?: boolean
   wechatDelivered?: boolean
   wechatError?: string
 }
@@ -94,7 +124,9 @@ const MAX_TOOL_OUTPUT_IN_HISTORY = 2400
 const ACTIVE_WINDOW_MESSAGES = 36
 const COMPACT_TRIGGER_MESSAGES = 44
 const COMPACT_KEEP_TAIL = 16
-const TURN_TIMEOUT_MS = 150_000
+const TURN_TIMEOUT_MS = 240_000
+/** 单次用户请求因超时/模型故障中断后最多自动续跑次数。 */
+const MAX_TURN_RESUMES = 3
 const STEP_TIMEOUT_MS = 60_000
 const TYPING_PULSE_MS = 8_000
 
@@ -206,6 +238,8 @@ export class DirectorService {
   private readonly debounceMap = new Map<string, PendingInboundBatch>()
   private readonly userQueues = new Map<string, Promise<void>>()
   private readonly compacting = new Set<string>()
+  private readonly cardActionLocks = new Set<string>()
+  private readonly resumeTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private closed = false
 
   constructor(private readonly deps: DirectorServiceDeps) {
@@ -226,6 +260,8 @@ export class DirectorService {
       if (batch.timer) clearTimeout(batch.timer)
     }
     this.debounceMap.clear()
+    for (const t of this.resumeTimers.values()) clearTimeout(t)
+    this.resumeTimers.clear()
   }
 
   /**
@@ -292,15 +328,57 @@ export class DirectorService {
     return (channel === 'wechat' && Boolean(this.deps.sendWechat)) || (channel === 'feishu' && Boolean(this.deps.sendFeishu))
   }
 
-  /** 把一段文字发到指定通道的用户；飞书带 `replyTo` 时回复到原消息下。 */
-  private async deliverTo(channel: InboundChannel, userId: string, text: string, replyTo?: string): Promise<void> {
+  /** 把一段文字（或在飞书端对新产生的高危待确认操作升级为可点击按钮卡片）发到指定通道的用户。 */
+  private async deliverTo(
+    channel: InboundChannel,
+    userId: string,
+    text: string,
+    replyTo?: string,
+    newPendingActions: readonly PendingAction[] = [],
+  ): Promise<void> {
     if (channel === 'wechat') {
       if (!this.deps.sendWechat) throw new Error('微信发送未配置')
       await this.deps.sendWechat({ to: userId, text })
       return
     }
+    const cfg = this.deps.options.get().director
+    if (cfg.feishuInteractiveCards !== false && this.deps.sendFeishuCard && newPendingActions.length > 0) {
+      const first = newPendingActions[0]!
+      await this.deps.sendFeishuCard({
+        to: userId,
+        ...(replyTo ? { replyTo } : {}),
+        card: buildPendingActionCard({
+          actionId: first.id,
+          toolName: first.toolName,
+          summary: first.summary,
+          expiresAt: first.expiresAt,
+          replyBody: text,
+        }),
+        fallbackText: text,
+      })
+      for (const extra of newPendingActions.slice(1, 4)) {
+        await this.deps.sendFeishuCard({
+          to: userId,
+          card: buildPendingActionCard({
+            actionId: extra.id,
+            toolName: extra.toolName,
+            summary: extra.summary,
+            expiresAt: extra.expiresAt,
+          }),
+          fallbackText: `待确认高危操作 #${extra.id}（${extra.toolName}）：${extra.summary}。回复「/确认 ${extra.id}」执行。`,
+        })
+      }
+      return
+    }
     if (!this.deps.sendFeishu) throw new Error('飞书发送未配置')
     await this.deps.sendFeishu({ to: userId, text, ...(replyTo ? { replyTo } : {}) })
+  }
+
+  /** 从本轮工具审计中提取新生成的待确认高危操作列表，用于在飞书附带一键点击确认卡片。 */
+  private createdActionsOf(res: DirectorChatResult): PendingAction[] {
+    const ids = new Set(res.toolsUsed.map(t => t.pendingActionId).filter((v): v is string => Boolean(v)))
+    if (ids.size === 0) return []
+    return res.pendingActions.filter(a => ids.has(a.id) && a.status === 'pending')
   }
 
   private enqueueTurn(channel: InboundChannel, userId: string, chatId: string, messageId: string, combinedText: string): void {
@@ -327,7 +405,7 @@ export class DirectorService {
         })
         if (res.reply && this.canDeliver(channel)) {
           try {
-            await this.deliverTo(channel, userId, res.reply, channel === 'feishu' ? messageId : undefined)
+            await this.deliverTo(channel, userId, res.reply, channel === 'feishu' ? messageId : undefined, this.createdActionsOf(res))
           } catch (sendErr) {
             const msg = this.deps.redact(sendErr instanceof Error ? sendErr.message : String(sendErr))
             this.logEvent(`director.${channel}_send_failed`, 'warn', `总控回复${label}发送失败：${msg.slice(0, 80)}`, { userId, sessionId: res.sessionId })
@@ -362,6 +440,12 @@ export class DirectorService {
     const session = this.store.getOrCreateSession(input.channel, input.userId)
     const cfg = this.deps.options.get().director
 
+    // 用户发来新消息时取消该会话尚未执行的自动续跑，避免与新指令冲突
+    if (!input.autoTrigger) {
+      const pendingResume = this.resumeTimers.get(session.id)
+      if (pendingResume) { clearTimeout(pendingResume); this.resumeTimers.delete(session.id) }
+    }
+
     // 拉取此前推送失败的离线积压通知，附在回复顶部确保不漏重要动态
     const missed = this.store.takeUndelivered(session.id)
     const missedPrefix = missed.length > 0
@@ -376,7 +460,7 @@ export class DirectorService {
       if (input.deliverToWechat === true && res.reply && this.canDeliver(input.channel)) {
         const channel = input.channel
         try {
-          await this.deliverTo(channel, input.userId, res.reply)
+          await this.deliverTo(channel, input.userId, res.reply, undefined, this.createdActionsOf(res))
           return { ...res, wechatDelivered: true }
         } catch (err) {
           const msg = this.deps.redact(err instanceof Error ? err.message : String(err))
@@ -545,14 +629,18 @@ export class DirectorService {
     const maxRetries = Math.max(0, Math.min(20, cfg.maxRetries ?? 5))
     // 重试次数调高时，按每次额外重试增加 12 秒单步预算（上限 4 分钟），避免高重试配置被旧固定超时提前截断
     const stepTimeoutMs = Math.min(240_000, STEP_TIMEOUT_MS + Math.max(0, maxRetries - 3) * 12_000)
-    const turnTimeoutMs = Math.max(TURN_TIMEOUT_MS, stepTimeoutMs + 90_000)
-    const deadline = Date.now() + turnTimeoutMs
+    const turnTimeoutMs = Math.max(TURN_TIMEOUT_MS, stepTimeoutMs + 150_000)
+    let deadline = Date.now() + turnTimeoutMs
     const maxSteps = Math.max(1, Math.min(15, cfg.maxToolSteps))
     const sessionKey = `director-${input.channel}-${input.userId}`
     let activeModel = resolved
     let fallbackUsed = false
     let finalReply = ''
     let modelFailed = false
+    /** 本轮提前中断原因：超时 / 模型失败，用于决定是否自动续跑。 */
+    let interruptedBy: 'deadline' | 'model_failed' | undefined
+    let lastModelError = ''
+    let toolsUnsupportedHit = false
 
     for (let step = 0; step <= maxSteps; step += 1) {
       if (input.signal?.aborted) {
@@ -561,7 +649,8 @@ export class DirectorService {
       }
       const remainingMs = deadline - Date.now()
       if (remainingMs < 3_000) {
-        finalReply = '本次排查调用耗时较长已达上限，以上已获取部分信息，你可以继续追问具体某一项。'
+        interruptedBy = 'deadline'
+        finalReply = '本次排查调用耗时较长已达上限，以上已获取部分信息。'
         break
       }
 
@@ -608,6 +697,8 @@ export class DirectorService {
             step: step + 1,
             message: `主模型 ${prevRef} 响应异常，已自动切换至备选模型 ${alt.ref} 继续处理…`,
           })
+          // 备选模型拥有独立的完整重试额度与单步时间预算（不再被主模型重试耗尽的时间挤占，也不再硬限 2 次）
+          deadline = Math.max(deadline, Date.now() + stepTimeoutMs + 30_000)
           result = await this.doCallTool(activeModel.target, {
             model: activeModel.model,
             system: systemPrompt,
@@ -615,11 +706,11 @@ export class DirectorService {
             tools: allowTools ? this.tools.definitions() : [],
             maxTokens: Math.min(4096, activeModel.maxTokens),
           }, {
-            timeoutMs: Math.min(stepTimeoutMs, Math.max(10_000, deadline - Date.now())),
+            timeoutMs: stepTimeoutMs,
             sessionId: `${sessionKey}-fb`,
             stream: true,
             cacheTtl: '5m',
-            maxRetries: Math.min(2, maxRetries),
+            maxRetries,
           })
           this.recordUsage(activeModel.provider, activeModel.model, result.status ?? 0, result.usage, result.latencyMs)
         }
@@ -627,6 +718,8 @@ export class DirectorService {
 
       if (!result.ok) {
         modelFailed = true
+        lastModelError = result.error ?? ''
+        toolsUnsupportedHit = Boolean(result.toolsUnsupported)
         this.logEvent('director.model_failed', 'warn', `总控模型调用失败（${activeModel.ref}）：${(result.error ?? '未知错误').slice(0, 120)}`, {
           sessionId: session.id,
           model: activeModel.ref,
@@ -637,7 +730,8 @@ export class DirectorService {
         if (result.toolsUnsupported) {
           finalReply = `当前总控模型（${activeModel.ref}）的上游接口不支持原生工具调用（Function Calling）。请在后台「设置 → 总控助手」切换一个支持工具调用的模型（如 Claude、Gemini 或 DeepSeek 官方/兼容接口）。`
         } else {
-          finalReply = `调用总控模型（${activeModel.ref}）失败：${result.error ?? '未知错误'}。你可以稍后重试，或发 /状态 查看实时面板。`
+          interruptedBy = 'model_failed'
+          finalReply = `调用总控模型（${activeModel.ref}）失败：${result.error ?? '未知错误'}。`
         }
         break
       }
@@ -734,6 +828,38 @@ export class DirectorService {
       }
     }
 
+    // 本轮因超时或模型上游故障中断时，自动排队续跑（用户无需重发），避免「派发的任务没有后续」
+    const resumeDepth = input.autoTrigger?.resumeDepth ?? 0
+    const resumable = interruptedBy !== undefined
+      && !toolsUnsupportedHit
+      && !input.signal?.aborted
+      && cfg.enabled
+      && !this.closed
+      && (!input.autoTrigger || input.autoTrigger.eventKind === 'turn_resume')
+    let resumeScheduled = false
+    if (resumable && interruptedBy) {
+      if (resumeDepth < MAX_TURN_RESUMES) {
+        const nextDepth = resumeDepth + 1
+        const delayMs = interruptedBy === 'model_failed' ? Math.min(120_000, 30_000 * nextDepth) : 2_000
+        this.scheduleTurnResume({
+          sessionId: session.id,
+          reason: interruptedBy,
+          depth: nextDepth,
+          delayMs,
+          errorText: lastModelError,
+          doneTools: toolsUsed.map(t => `${t.name}${typeof t.args.action === 'string' ? `(${t.args.action})` : ''}:${t.ok ? 'ok' : 'err'}`),
+        })
+        resumeScheduled = true
+        finalReply += interruptedBy === 'model_failed'
+          ? `已安排 ${Math.round(delayMs / 1000)} 秒后自动重试（第 ${nextDepth}/${MAX_TURN_RESUMES} 次），无需你重发，成功后会直接汇报。`
+          : `我已自动在后台续跑剩余步骤（第 ${nextDepth}/${MAX_TURN_RESUMES} 次），完成后会直接向你汇报，无需重发。`
+      } else {
+        finalReply += interruptedBy === 'model_failed'
+          ? `已自动重试 ${MAX_TURN_RESUMES} 轮仍未恢复。你可以稍后重试，或发 /状态 查看实时面板。`
+          : '已多轮自动续跑仍未收敛，请告诉我优先要完成的那一项，我会聚焦推进。'
+      }
+    }
+
     const safeReply = `${missedPrefix}${this.deps.redact(finalReply)}`
     this.store.addMessage({
       sessionId: session.id,
@@ -756,7 +882,79 @@ export class DirectorService {
       pendingActions: this.store.listPendingActions(session.id, true),
       model: activeModel.ref,
       ...(modelFailed ? { modelFailed: true } : {}),
+      ...(resumeScheduled ? { resumeScheduled: true } : {}),
     })
+  }
+
+  /** 排队一次延迟续跑：同一会话仅保留最新一个待执行续跑，用户发新消息时自动取消。 */
+  private scheduleTurnResume(input: {
+    sessionId: string
+    reason: 'deadline' | 'model_failed'
+    depth: number
+    delayMs: number
+    errorText: string
+    doneTools: string[]
+  }): void {
+    const prev = this.resumeTimers.get(input.sessionId)
+    if (prev) clearTimeout(prev)
+    const timer = setTimeout(() => {
+      this.resumeTimers.delete(input.sessionId)
+      void this.runTurnResume(input)
+    }, input.delayMs)
+    timer.unref?.()
+    this.resumeTimers.set(input.sessionId, timer)
+    this.logEvent('director.turn_resume_scheduled', 'info', `总控本轮中断（${input.reason === 'deadline' ? '耗时上限' : '模型故障'}），${Math.round(input.delayMs / 1000)} 秒后自动续跑（第 ${input.depth} 次）`, {
+      sessionId: input.sessionId,
+      reason: input.reason,
+      depth: input.depth,
+    })
+  }
+
+  private async runTurnResume(input: {
+    sessionId: string
+    reason: 'deadline' | 'model_failed'
+    depth: number
+    errorText: string
+    doneTools: string[]
+  }): Promise<void> {
+    if (this.closed) return
+    const session = this.store.getSession(input.sessionId)
+    if (!session) return
+    const text = [
+      `[系统自动续跑 · 第 ${input.depth}/${MAX_TURN_RESUMES} 次] 上一轮处理因${input.reason === 'deadline' ? '单轮耗时达到上限' : `模型上游连接故障（${input.errorText.slice(0, 80) || '连接中断'}）`}被中断。`,
+      '请回看上方对话中主人最近的原始需求和已有的工具结果，继续完成尚未做完的部分。',
+      '注意：已经成功执行的步骤（尤其是已派发的工单、已创建的计划）不要重复执行，先用只读查询确认现状再往下推进。',
+      `上一轮已执行的工具：${input.doneTools.length > 0 ? input.doneTools.slice(-10).join('、') : '（无）'}`,
+      '做完后用简短中文汇报：完成了什么、工单/计划编号与交付物位置、是否需要主人拍板。',
+    ].join('\n')
+    const queueKey = `${session.channel}:${session.userId}`
+    const prev = this.userQueues.get(queueKey) ?? Promise.resolve()
+    const task = prev.catch(() => undefined).then(async () => {
+      if (this.closed) return
+      try {
+        const res = await this.chat({
+          channel: session.channel,
+          userId: session.userId,
+          text,
+          autoTrigger: { eventKind: 'turn_resume', targetId: session.id, resumeDepth: input.depth },
+        })
+        // 仍会继续自动重试且尚无任何成果时保持静默，避免刷屏；有结果或已彻底放弃则推送给主人
+        if (res.resumeScheduled && res.modelFailed) return
+        if (res.reply && this.canDeliver(session.channel)) {
+          await this.deliverTo(session.channel, session.userId, res.reply, undefined, this.createdActionsOf(res)).catch(err => {
+            this.store.addUndelivered(session, res.reply)
+            this.deps.onError?.(err)
+          })
+        }
+      } catch (error) {
+        this.deps.onError?.(error)
+      }
+    })
+    this.userQueues.set(queueKey, task)
+    void task.finally(() => {
+      if (this.userQueues.get(queueKey) === task) this.userQueues.delete(queueKey)
+    })
+    await task
   }
 
   /** 批准或拒绝一条待确认的高危操作（供微信口令与后台按钮共用）。 */
@@ -879,7 +1077,7 @@ export class DirectorService {
         }
         if (input.pushReply && res.reply && this.canDeliver(session.channel)) {
           try {
-            await this.deliverTo(session.channel, session.userId, res.reply)
+            await this.deliverTo(session.channel, session.userId, res.reply, undefined, this.createdActionsOf(res))
           } catch (sendErr) {
             const msg = this.deps.redact(sendErr instanceof Error ? sendErr.message : String(sendErr))
             this.logEvent(`director.${session.channel}_send_failed`, 'warn', `总控自动续接回复推送失败：${msg.slice(0, 80)}`, {
@@ -907,6 +1105,403 @@ export class DirectorService {
     })
     await task
     return succeeded
+  }
+
+  /**
+   * 处理飞书交互式按钮卡片回传（长连接 WS 与 HTTP Webhook 共用）。
+   * 3 秒内即时返回 `{ toast, card }` 锁定卡片防连点，耗时操作在后台异步执行并原位刷新卡片与汇报。
+   */
+  async handleFeishuCardAction(event: FeishuCardActionEvent): Promise<FeishuCardCallbackResponse> {
+    if (this.deps.feishuAllowCheck && !this.deps.feishuAllowCheck(event.operatorOpenId)) {
+      return { toast: { type: 'error', content: '你不在飞书授权操作员名单中，无权执行此操作' } }
+    }
+    const val = event.actionValue
+    const lockKey = val.kind === 'director_action'
+      ? `act:${val.actionId}`
+      : val.kind === 'mission_approval'
+        ? `mis:${val.missionId}:${val.nodeKey}:v${val.planVersion}`
+        : val.kind === 'vault_request'
+          ? `sec:${val.requestId}`
+          : `tk:${val.ticketId}:${val.op}`
+    if (this.cardActionLocks.has(lockKey)) {
+      return { toast: { type: 'info', content: '操作正在处理中，请勿重复点击' } }
+    }
+
+    if (val.kind === 'director_action') {
+      const action = this.store.getPendingAction(val.actionId)
+      if (!action) {
+        return { toast: { type: 'warning', content: `找不到待确认操作 #${val.actionId}` } }
+      }
+      if (action.status !== 'pending') {
+        const stWord = action.status === 'approved' ? '已批准执行' : action.status === 'rejected' ? '已拒绝' : '已过期'
+        return {
+          toast: { type: 'warning', content: `操作 #${action.id} ${stWord}` },
+          card: {
+            type: 'raw',
+            data: buildSettledCard({
+              title: `高危指令 #${action.id}（${stWord}）`,
+              template: action.status === 'approved' ? 'green' : 'grey',
+              markdown: `**工具**：\`${action.toolName}\`\n**摘要**：${action.summary}`,
+              statusLine: `状态：${stWord}`,
+            }),
+          },
+        }
+      }
+
+      if (val.decision === 'reject') {
+        const res = await this.decidePendingAction(action.id, 'reject')
+        return {
+          toast: { type: res.ok ? 'info' : 'error', content: res.message.slice(0, 80) },
+          card: {
+            type: 'raw',
+            data: buildSettledCard({
+              title: `已拒绝高危指令 #${action.id}`,
+              template: 'grey',
+              markdown: `**工具**：\`${action.toolName}\`\n**摘要**：${action.summary}`,
+              statusLine: '🚫 已由你在飞书点击拒绝',
+            }),
+          },
+        }
+      }
+
+      // 批准执行可能耗时超过飞书 3 秒回调窗口：立即锁定卡片并返回 Toast，后台异步执行完毕后原位更新卡片并汇报
+      this.cardActionLocks.add(lockKey)
+      const session = this.store.getSession(action.sessionId)
+      const bgTask = (async () => {
+        try {
+          const decided = await this.decidePendingAction(action.id, 'approve')
+          const finalCard = buildSettledCard({
+            title: decided.ok ? `已执行高危指令 #${action.id}` : `执行失败 #${action.id}`,
+            template: decided.ok ? 'green' : 'red',
+            markdown: `**工具**：\`${action.toolName}\`\n**摘要**：${action.summary}\n\n**结果**：${decided.message.slice(0, 1200)}`,
+            statusLine: decided.ok ? '✅ 已在后台执行完成' : '❌ 执行失败，总控将自动排查原因',
+          })
+          if (event.openMessageId && this.deps.updateFeishuCard) {
+            await this.deps.updateFeishuCard(event.openMessageId, finalCard)
+          }
+          if (session) {
+            this.recordEventInSession(session.id, `[飞书点击批准 #${action.id}] ${decided.message}`, { actionId: action.id, ok: decided.ok })
+          }
+          // 高危指令执行失败时，若开启主动自愈，自动唤醒总控诊断并提供补救方案
+          const cfg = this.deps.options.get().director
+          if (!decided.ok && cfg.autoHeal && session) {
+            const heal = await this.triggerAutoHeal({
+              sessionId: session.id,
+              targetKey: `action:${action.id}`,
+              incidentKind: 'command_failed',
+              targetId: action.id,
+              title: `${action.toolName} (${action.summary.slice(0, 40)})`,
+              summary: decided.message,
+              pushReply: true,
+            })
+            if (heal.handled) return
+          }
+          if (this.deps.sendFeishu) {
+            await this.deps.sendFeishu({
+              to: event.operatorOpenId,
+              ...(event.openMessageId ? { replyTo: event.openMessageId } : {}),
+              text: decided.message,
+            }).catch(() => undefined)
+          }
+        } catch (err) {
+          this.deps.onError?.(err)
+        } finally {
+          this.cardActionLocks.delete(lockKey)
+        }
+      })()
+      void bgTask
+      return {
+        toast: { type: 'info', content: `已批准 #${action.id}，正在后台执行…` },
+        card: {
+          type: 'raw',
+          data: buildSettledCard({
+            title: `正在执行 #${action.id}`,
+            template: 'blue',
+            markdown: `**工具**：\`${action.toolName}\`\n**摘要**：${action.summary}`,
+            statusLine: '⏳ 已由你在飞书批准，正在后台执行中，完成后会自动更新结果…',
+          }),
+        },
+      }
+    }
+
+    if (val.kind === 'mission_approval') {
+      this.cardActionLocks.add(lockKey)
+      try {
+        const res = val.decision === 'approve'
+          ? (this.deps.approveMissionNode
+              ? await this.deps.approveMissionNode(val.missionId, val.nodeKey, {
+                  actorId: `feishu:${event.operatorOpenId}`,
+                  planVersion: val.planVersion,
+                  idempotencyKey: `feishu:${val.missionId}:${val.nodeKey}:v${val.planVersion}`,
+                  note: '飞书卡片一键批准继续',
+                })
+              : { ok: false, message: '未启用 DAG 计划插件' })
+          : (this.deps.cancelMission
+              ? await this.deps.cancelMission(val.missionId)
+              : { ok: false, message: '未启用 DAG 计划插件' })
+        const label = val.decision === 'approve' ? '已批准继续' : '已取消计划'
+        return {
+          toast: { type: res.ok ? 'success' : 'error', content: res.message.slice(0, 80) },
+          card: {
+            type: 'raw',
+            data: buildSettledCard({
+              title: `${val.title || val.missionId}（${res.ok ? label : '处理失败'}）`,
+              template: res.ok ? (val.decision === 'approve' ? 'green' : 'grey') : 'red',
+              markdown: `**计划**：\`${val.missionId}\` · v${val.planVersion}\n**节点**：\`${val.nodeKey}\`\n\n${res.message}`,
+              statusLine: res.ok ? `✅ ${label}` : '❌ 操作未成功',
+            }),
+          },
+        }
+      } finally {
+        this.cardActionLocks.delete(lockKey)
+      }
+    }
+
+    if (val.kind === 'vault_request') {
+      this.cardActionLocks.add(lockKey)
+      try {
+        const res = this.deps.decideSecretRequest
+          ? await this.deps.decideSecretRequest(val.requestId, val.decision)
+          : { ok: false, message: '当前运行时未接入密钥审批回调' }
+        const label = val.decision === 'approve' ? '已批准密钥授权' : '已拒绝密钥申请'
+        return {
+          toast: { type: res.ok ? 'success' : 'error', content: res.message.slice(0, 80) },
+          card: {
+            type: 'raw',
+            data: buildSettledCard({
+              title: `密钥申请：${val.secretName || val.requestId}`,
+              template: res.ok ? (val.decision === 'approve' ? 'green' : 'grey') : 'red',
+              markdown: `**工单**：\`${val.ticketId}\`\n**密钥**：\`${val.secretName}\`\n\n${res.message}`,
+              statusLine: res.ok ? `✅ ${label}` : '❌ 审批失败',
+            }),
+          },
+        }
+      } finally {
+        this.cardActionLocks.delete(lockKey)
+      }
+    }
+
+    // kind === 'ticket_op'
+    this.cardActionLocks.add(lockKey)
+    try {
+      let ok = true
+      let msg = ''
+      try {
+        if (val.op === 'retry') {
+          await this.deps.host.retryTicket(val.ticketId)
+          msg = `已重新启动工单 ${val.ticketId}，总控会继续跟踪直至解决并汇报。`
+        } else {
+          await this.deps.host.stopTicket(val.ticketId, '主人在飞书卡片点击停止')
+          msg = `已停止工单 ${val.ticketId}。`
+        }
+      } catch (err) {
+        ok = false
+        msg = this.deps.redact(err instanceof Error ? err.message : String(err))
+      }
+      return {
+        toast: { type: ok ? 'success' : 'error', content: msg.slice(0, 80) },
+        card: {
+          type: 'raw',
+          data: buildSettledCard({
+            title: `${val.title || val.ticketId}（${ok ? (val.op === 'retry' ? '已重试' : '已停止') : '操作失败'}）`,
+            template: ok ? (val.op === 'retry' ? 'blue' : 'grey') : 'red',
+            markdown: `**工单**：\`${val.ticketId}\`\n\n${msg}`,
+            statusLine: ok ? '✅ 已按你的飞书指令处理' : '❌ 执行失败',
+          }),
+        },
+      }
+    } finally {
+      this.cardActionLocks.delete(lockKey)
+    }
+  }
+
+  /**
+   * 主动排障与自愈闭环入口：当工单失败、卡死、阻塞、DAG 节点失败或高危指令执行失败时自动唤醒总控大脑。
+   * 遵守 `autoHeal` 开关、`maxAutoHealRounds` 防死循环上限与总控每日预算。
+   */
+  async triggerAutoHeal(input: {
+    sessionId: string
+    targetKey: string
+    incidentKind: 'ticket_failed' | 'ticket_attention' | 'ticket_stalled' | 'mission_failed' | 'command_failed'
+    targetId: string
+    title: string
+    summary: string
+    question?: string
+    pushReply: boolean
+  }): Promise<{ handled: boolean; exhausted?: boolean; attempts: number; reply?: string }> {
+    if (this.closed) return { handled: false, attempts: 0 }
+    const session = this.store.getSession(input.sessionId)
+    if (!session) return { handled: false, attempts: 0 }
+    const cfg = this.deps.options.get().director
+    const existing = this.store.getHealState(input.targetKey)
+    const maxRounds = cfg.maxAutoHealRounds ?? 2
+    if (!cfg.enabled || !cfg.autoHeal || maxRounds <= 0) {
+      return { handled: false, attempts: existing?.attempts ?? 0 }
+    }
+    if ((existing?.attempts ?? 0) >= maxRounds) {
+      this.store.markHealEscalated(input.targetKey, input.summary)
+      return { handled: false, exhausted: true, attempts: existing!.attempts }
+    }
+    if (!this.checkBudget().ok || !this.resolveModel()) {
+      return { handled: false, attempts: existing?.attempts ?? 0 }
+    }
+
+    const state = this.store.recordHealAttempt(input.targetKey, input.summary)
+    this.logEvent('director.auto_heal_start', 'info', `总控启动主动排障自愈（第 ${state.attempts}/${maxRounds} 轮）：${input.title.slice(0, 60)}`, {
+      targetKey: input.targetKey,
+      incidentKind: input.incidentKind,
+      targetId: input.targetId,
+      attempt: state.attempts,
+    })
+
+    const kindDesc: Record<typeof input.incidentKind, string> = {
+      ticket_failed: '工单执行失败',
+      ticket_attention: '工单报错或阻塞停住',
+      ticket_stalled: '工单长时间无进展疑似卡死',
+      mission_failed: 'DAG 任务计划节点失败',
+      command_failed: '宿主机/高危命令执行失败',
+    }
+    const promptLines = [
+      `[系统主动排障自愈唤醒 · 第 ${state.attempts}/${maxRounds} 轮]`,
+      `异常类型：${kindDesc[input.incidentKind]}`,
+      `目标编号：${input.targetId}`,
+      `目标标题：${input.title}`,
+      ...(input.question ? [`现场提问/阻塞点：${input.question}`] : []),
+      `异常摘要：${input.summary.slice(0, 900)}`,
+      '',
+      '### 请严格按以下四步自主排查并解决：',
+      '1. **查清现场**：优先调用 `platform_query(ticket_diagnose)`（工单类）或 `host_ops(host_logs/podman_logs)` / `platform_query(missions_list)` 拿到真实报错堆栈与最后活动步骤，不要盲目猜测。',
+      '2. **能自主解决就直接出手**：',
+      '   - 若是疑似卡死：先看活动流确认是否仍在合法耗时构建；若确认挂死，立即 `ticket_manage(ticket_stop)` 并换更稳妥方式或补充非交互参数后重派/重试；',
+      '   - 若是环境/依赖/参数/语法/偶发网络/推理受阻错误：直接修复环境、回复澄清指导、重试工单（`ticket_manage(ticket_retry)` / `ticket_reply`）或切换更合适模型/执行器重新派发，并用 `followup_set` 盯紧结果；',
+      '   - 若是 DAG 失败节点：修复前置问题后调用 `subsystem_action(mission_retry_node)` 局部重试；',
+      '   - 若修复需要执行宿主机命令或修改配置（L3 高危动作），直接调用对应工具生成确认卡片给主人一键点击批准。',
+      '3. **真正无法自主解决**（缺少外部密钥、产品取舍或已尝试无解）：停止盲试，用 3~5 行讲清已查出的真实根因和给主人的 1~2 个可执行选项。',
+      '4. **简洁汇报现状**：用简短中文说明「排查出的问题 + 我刚采取的解决动作 + 下一步跟踪计划（解决验证完成后再正式交付）」。',
+    ]
+
+    const queueKey = `${session.channel}:${session.userId}`
+    const prev = this.userQueues.get(queueKey) ?? Promise.resolve()
+    let outcome: { handled: boolean; attempts: number; reply?: string } = { handled: false, attempts: state.attempts }
+    const task = prev.catch(() => undefined).then(async () => {
+      if (this.closed) return
+      try {
+        const res = await this.chat({
+          channel: session.channel,
+          userId: session.userId,
+          text: promptLines.join('\n'),
+          autoTrigger: { eventKind: 'auto_heal', targetId: input.targetId },
+        })
+        if (res.modelFailed) {
+          outcome = { handled: false, attempts: state.attempts }
+          return
+        }
+        const actionsSummary = res.toolsUsed.map(t => `${t.name}(${t.ok ? 'ok' : 'err'})`).join(', ')
+        this.store.updateHealAction(input.targetKey, actionsSummary ? `${actionsSummary} | ${res.reply.slice(0, 320)}` : res.reply.slice(0, 420))
+        const newPending = this.createdActionsOf(res)
+        if (input.pushReply && res.reply && this.canDeliver(session.channel)) {
+          try {
+            await this.deliverTo(session.channel, session.userId, res.reply, undefined, newPending)
+          } catch (sendErr) {
+            this.store.addUndelivered(session, res.reply)
+            this.deps.onError?.(sendErr)
+          }
+        }
+        outcome = { handled: true, attempts: state.attempts, reply: res.reply }
+      } catch (err) {
+        this.deps.onError?.(err)
+        outcome = { handled: false, attempts: state.attempts }
+      }
+    })
+    this.userQueues.set(queueKey, task)
+    void task.finally(() => {
+      if (this.userQueues.get(queueKey) === task) this.userQueues.delete(queueKey)
+    })
+    await task
+    return outcome
+  }
+
+  /**
+   * 故障自愈成功后触发的闭环战报 + 避坑经验自动沉淀到长期记忆（P2）。
+   */
+  async triggerHealResolvedReport(input: {
+    sessionId: string
+    targetKey: string
+    ticketId: string
+    title: string
+    priorReason: string
+    priorAction: string
+    noticeText: string
+    pushReply: boolean
+  }): Promise<boolean> {
+    if (this.closed) return false
+    const session = this.store.getSession(input.sessionId)
+    if (!session) return false
+    this.store.markHealResolved(input.targetKey, `已解决并验收通过：${input.title}`)
+
+    const cfg = this.deps.options.get().director
+    const canCallModel = cfg.enabled && this.checkBudget().ok && Boolean(this.resolveModel())
+    let handled = false
+
+    if (canCallModel) {
+      const prompt = [
+        `[自愈闭环完成汇报] 此前出现异常并经你主动排查处理的工单 ${input.ticketId}（「${input.title}」）现已成功完成！`,
+        `此前异常原因：${input.priorReason || '执行异常'}`,
+        `此前自愈动作：${input.priorAction || '自动排查修复'}`,
+        '',
+        input.noticeText,
+        '',
+        '### 请完成两件事：',
+        '1. 先调用 `platform_query(ticket_receipt)` 核实交付物与验收证据；',
+        '2. 若本次排障形成了有长期价值的避坑经验，调用 `subsystem_action(memory_save)` 记下一条 `kind:"pitfall"` 的经验记忆；',
+        '3. 最后向主人发一份干练的**自愈闭环战报**（3 段式：① 此前遇到什么问题 → ② 我是如何排查解决的 → ③ 最终验证依据与交付物）。',
+      ].join('\n')
+
+      const queueKey = `${session.channel}:${session.userId}`
+      const prev = this.userQueues.get(queueKey) ?? Promise.resolve()
+      const task = prev.catch(() => undefined).then(async () => {
+        if (this.closed) return
+        try {
+          const res = await this.chat({
+            channel: session.channel,
+            userId: session.userId,
+            text: prompt,
+            autoTrigger: { eventKind: 'heal_resolved', targetId: input.ticketId },
+          })
+          if (res.modelFailed) return
+          // 兜底经验反哺：如果总控本轮没有显式调用 memory_save，自动写入一条带工单来源的避坑记忆
+          const savedMemory = res.toolsUsed.some(t => t.name === 'subsystem_action' && t.args?.action === 'memory_save' && t.ok)
+          if (!savedMemory && this.deps.plugins && input.priorReason) {
+            await this.deps.plugins.dispatchDirectorAction(
+              'memory_save',
+              {
+                scope: 'user',
+                kind: 'pitfall',
+                title: `自愈经验：${input.title.slice(0, 48)}`,
+                content: `异常现象：${input.priorReason.slice(0, 220)}；解决过程：${(input.priorAction || res.reply).slice(0, 320)}（来源工单 ${input.ticketId}）`,
+                tags: ['auto_heal'],
+              },
+              { sessionId: session.id, channel: session.channel, userId: session.userId },
+            ).catch(() => undefined)
+          }
+          if (input.pushReply && res.reply && this.canDeliver(session.channel)) {
+            await this.deliverTo(session.channel, session.userId, res.reply, undefined, this.createdActionsOf(res)).catch(err => {
+              this.store.addUndelivered(session, res.reply)
+              this.deps.onError?.(err)
+            })
+          }
+          handled = true
+        } catch (err) {
+          this.deps.onError?.(err)
+        }
+      })
+      this.userQueues.set(queueKey, task)
+      void task.finally(() => {
+        if (this.userQueues.get(queueKey) === task) this.userQueues.delete(queueKey)
+      })
+      await task
+    }
+    return handled
   }
 
   // --- 控制台查询与状态 ---

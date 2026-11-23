@@ -9,6 +9,11 @@
 import { EventDispatcher, LoggerLevel, WSClient } from '@larksuiteoapi/node-sdk'
 import type { Trigger } from '../core/model.ts'
 import { triggerFromMessageEvent, type MessageEventLike } from './feishu.ts'
+import {
+  parseFeishuCardActionEvent,
+  type FeishuCardActionEvent,
+  type FeishuCardCallbackResponse,
+} from './feishu-cards.ts'
 
 export { triggerFromMessageEvent }
 export type { MessageEventLike }
@@ -60,6 +65,8 @@ export interface FeishuWsOptions {
   config: () => FeishuWsConfig
   /** Receives each accepted message, exactly like the HTTP callback's `onTrigger`. */
   onTrigger: (trigger: Trigger) => void
+  /** 长连接模式下接收交互卡片按钮点击回传（返回 `{ toast, card }` 将即时回写给飞书客户端）。 */
+  onCardAction?: (event: FeishuCardActionEvent) => Promise<FeishuCardCallbackResponse | void>
   /** Connection state and failures; text and data never carry secrets. */
   onEvent?: (event: FeishuWsEvent) => void
   onError?: (error: Error) => void
@@ -163,7 +170,8 @@ export class FeishuWs {
     })
     dispatcher.register({
       'im.message.receive_v1': (data: MessageEventLike) => this.handleEvent(data),
-    })
+      'card.action.trigger': (data: unknown) => this.handleCardAction(data),
+    } as Record<string, (data: any) => any>)
 
     const factory = this.deps.clientFactory ?? ((params: WsClientParams) => new WSClient(params))
     let client: WsClientLike
@@ -237,6 +245,23 @@ export class FeishuWs {
       this.deps.onTrigger(result)
     } catch (error) {
       this.fail(error, cfg)
+    }
+  }
+
+  /** 处理长连接推送的交互卡片点击回调，并将 toast/card 响应原样回传给飞书客户端。 */
+  private async handleCardAction(raw: unknown): Promise<FeishuCardCallbackResponse | undefined> {
+    const cfg = this.deps.config()
+    this.state = { ...this.state, lastEventAt: new Date().toISOString() }
+    try {
+      const parsed = parseFeishuCardActionEvent(raw)
+      if (!parsed || !this.deps.onCardAction) return undefined
+      const res = await this.deps.onCardAction(parsed)
+      return res ?? undefined
+    } catch (error) {
+      this.fail(error, cfg)
+      return {
+        toast: { type: 'error', content: `处理按钮操作失败：${scrub(describe(error), cfg).slice(0, 80)}` },
+      }
     }
   }
 

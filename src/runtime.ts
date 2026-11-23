@@ -76,6 +76,7 @@ import { PentestService } from './pentest/service.ts'
 import { DirectorStore } from './director/store.ts'
 import { DirectorService } from './director/service.ts'
 import { DirectorBridge } from './director/bridge.ts'
+import { DirectorWatchdog } from './director/watchdog.ts'
 import { HostOpsService } from './director/host-ops.ts'
 import { continuationIntent, pickContinuation, FEISHU_CONTINUE_WINDOW_MS, type ContinuationCandidate } from './sources/feishu-continue.ts'
 import { FeishuWs } from './sources/feishu-ws.ts'
@@ -487,9 +488,14 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         kind: 'notice',
       })
     }
+    const feishuCardAction = async (event: import('./sources/feishu-cards.ts').FeishuCardActionEvent) => {
+      if (!director) return { toast: { type: 'warning' as const, content: '总控助手尚未就绪，请稍后再试' } }
+      return director.handleFeishuCardAction(event)
+    }
     const feishu = new FeishuSource({
       config: () => optionsStore.get().feishu,
       onTrigger: feishuIntake,
+      onCardAction: feishuCardAction,
       onEvent: event => recordFeishu(event),
     })
     // The long connection is the alternative transport for apps whose event subscription is not an HTTP callback.
@@ -506,6 +512,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       },
       botOpenId: () => feishu.botOpenId(),
       onTrigger: feishuIntake,
+      onCardAction: feishuCardAction,
       onEvent: event => recordFeishu(event),
       onError: error => console.error(`superagentd: feishu ws: ${error.message}`),
     })
@@ -936,7 +943,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
           const fromFeishu = ticket.channels.some(c => c.source === FEISHU_SOURCE)
           const wcDirector = wc.enabled && wc.routingMode === 'director'
           const fsDirector = opts.feishu.enabled && opts.feishu.routingMode === 'director'
-          const directorActive = Boolean(directorBridge && opts.director.enabled && (wcDirector || fsDirector))
+          const directorActive = Boolean(directorBridge && opts.director.enabled)
           const notifyEnded = (changeNote?: string): void => {
             const fullSummary = changeNote ? `${summary}\n\n${changeNote}` : summary
             if (directorActive) {
@@ -952,7 +959,8 @@ export async function createRuntime(config: Config): Promise<Runtime> {
                 // 来自微信/飞书直接建单的工单已由原通道回复结果，不再重复推送
                 fromDirectWechat: fromWechat || fromFeishu,
               }).catch(() => undefined)
-            } else if (wc.enabled && wc.notifyOnComplete && !fromWechat && ticket.ended!.outcome !== 'stopped') {
+            }
+            if (!wcDirector && !fsDirector && wc.enabled && wc.notifyOnComplete && !fromWechat && ticket.ended!.outcome !== 'stopped') {
               const label = ticket.ended!.outcome === 'completed' || ticket.ended!.outcome === 'merged' ? '完成' : '结束'
               void wechat.sendNew({
                 title: `任务${label}：${ticket.title}`,
@@ -2124,6 +2132,33 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       sendWechat: input => wechat.sendNew(input),
       sendWechatTyping: (to, status) => wechat.sendTyping(to, status),
       sendFeishu: input => feishu.sendMarkdown({ openId: input.to, text: input.text, ...(input.replyTo ? { replyTo: input.replyTo } : {}) }),
+      sendFeishuCard: input => feishu.sendCard({ openId: input.to, ...(input.replyTo ? { replyTo: input.replyTo } : {}), card: input.card, ...(input.fallbackText ? { fallbackText: input.fallbackText } : {}) }),
+      updateFeishuCard: (messageId, card) => feishu.updateCard(messageId, card),
+      feishuAllowCheck: openId => Boolean(allowedSender(settings, { source: FEISHU_SOURCE, id: openId })),
+      decideSecretRequest: async (requestId, decision) => {
+        try {
+          adminHost.decideSecretRequest(requestId, decision === 'approve' ? 'grant' : 'deny')
+          return { ok: true, message: decision === 'approve' ? '已批准该工单使用密钥，任务会自动继续推进。' : '已拒绝该密钥申请。' }
+        } catch (err) {
+          return { ok: false, message: vault.redactSecrets(err instanceof Error ? err.message : String(err)) }
+        }
+      },
+      approveMissionNode: async (missionId, nodeKey, opts) => {
+        try {
+          await missions.approveNode(missionId, nodeKey, opts)
+          return { ok: true, message: `已批准 DAG 节点「${nodeKey}」（v${opts.planVersion}），后续节点已自动启动。` }
+        } catch (err) {
+          return { ok: false, message: vault.redactSecrets(err instanceof Error ? err.message : String(err)) }
+        }
+      },
+      cancelMission: async missionId => {
+        try {
+          missions.cancelMission(missionId)
+          return { ok: true, message: `已取消 DAG 任务计划 ${missionId}。` }
+        } catch (err) {
+          return { ok: false, message: vault.redactSecrets(err instanceof Error ? err.message : String(err)) }
+        }
+      },
       directWechatFallback: ({ from, chatId, messageId, text }) => {
         const cfg = optionsStore.get().wechat
         const threadId = `${cfg.mode}:${chatId}`
@@ -2154,9 +2189,21 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       events,
       sendWechat: input => wechat.sendNew(input),
       sendFeishu: input => feishu.sendMarkdown({ openId: input.to, text: input.text }),
+      sendFeishuCard: input => feishu.sendCard({ openId: input.to, card: input.card, ...(input.fallbackText ? { fallbackText: input.fallbackText } : {}) }),
       feishuRecipients: () => (settings.policy.sources[FEISHU_SOURCE]?.allowed ?? []).map(entry => entry.id),
       onError: error => console.error(`superagentd: director bridge failed: ${error instanceof Error ? error.message : String(error)}`),
     })
+    const directorWatchdog = new DirectorWatchdog({
+      bridge: directorBridge,
+      host: adminHost,
+      options: optionsStore,
+      events,
+      activity,
+      plugins,
+      onError: error => console.error(`superagentd: director watchdog failed: ${error instanceof Error ? error.message : String(error)}`),
+    })
+    directorWatchdog.start()
+    cleanup.push(() => directorWatchdog.stop())
     syncWechat()
     const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity, novels, fanqie, piVersions, goals, contracts, createTicketPr, devEnv, pentest, director, plugins })
     const adminServer = createConsoleServer({

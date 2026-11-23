@@ -224,7 +224,7 @@ function FeishuForm({ f, set }: FormProps) {
   return <>
     <Group title="飞书机器人" hint="在飞书开放平台创建应用后填写。">
       <Check label="启用飞书" v={f.enabled} set={v => set({ enabled: v })} />
-      <Select label="接收方式" v={f.mode} set={v => set({ mode: v })} options={[['ws', '长连接（推荐，不需要公网回调地址）'], ['webhook', 'HTTP 回调']]} />
+      <Select label="接收方式" hint="使用长连接时，请在飞书开放平台「事件与回调 → 回调配置」中也选择「使用长连接接收回调」并勾选「卡片回传交互（card.action.trigger）」，即可在飞书里直接点击按钮一键确认高危操作、DAG 审批与密钥授权。" v={f.mode} set={v => set({ mode: v })} options={[['ws', '长连接（推荐，不需要公网回调地址）'], ['webhook', 'HTTP 回调']]} />
       <Select label="群聊里" v={f.groupMode} set={v => set({ groupMode: v })} options={[['mention', '@ 它才响应'], ['all', '所有消息都看']]} />
       <Select label="私聊消息处理方式" hint="选「总控 AI 助手」后，允许名单里的人私聊机器人即可自由对话、查进度/花费、智能派单并接收任务主动汇报；群聊仍按原方式直接建单。" v={f.routingMode || 'direct'} set={v => set({ routingMode: v })} options={[['director', '总控 AI 助手（对话、查数据、派单、主动汇报）'], ['direct', '直接建工单（原方式）']]} />
       <Text label="App ID" mono v={f.appId} set={v => set({ appId: v })} />
@@ -622,12 +622,21 @@ function NovelForm({ f, set }: FormProps) {
 function DirectorForm({ f, set }: FormProps) {
   const opts = useModelOptions()
   return <>
-    <Group title="总控 AI 助手（Director）" hint="接管微信多轮对话与控制台总控对话：读取全平台运行数据、理解需求后自动派发任务并主动汇报结果。">
-      <Check label="启用总控助手" hint="关闭后微信消息将自动退回旧版直通工单模式" v={f.enabled ?? true} set={v => set({ enabled: v })} />
+    <Group title="总控 AI 助手（Director）" hint="接管微信、飞书与控制台多轮对话：读取全平台运行数据、理解需求后自动派发任务、主动盯盘自愈并闭环汇报。">
+      <Check label="启用总控助手" hint="关闭后微信与飞书私聊消息将自动退回旧版直通工单模式" v={f.enabled ?? true} set={v => set({ enabled: v })} />
       <RefSelect label="总控专用模型" hint="建议选择工具调用（Function Calling）稳定且响应快的模型；留空则跟随默认执行模型" nullLabel="跟随默认执行模型" v={f.model ?? null} options={opts} set={v => set({ model: v })} />
-      <Select label="微信主动汇报范围" v={f.notifyScope || 'all'} set={v => set({ notifyScope: v })} options={DIRECTOR_NOTIFY_OPTS} />
-      <Check label="复杂完工报告由总控 AI 润色提炼" hint="开启后超过 400 字的工单报告会自动整理成手机微信易读的 3–5 条要点" v={f.summarizeReports ?? true} set={v => set({ summarizeReports: v })} />
-      <Check label="高危操作代码级二次确认（强烈建议开启）" hint="执行宿主机命令/服务启停/容器清理、修改控制台设置、切换/删除 Pi 或开发镜像、删除工单/项目/书籍、清理工作区或审批密钥前，必须经你明确回复「确认」" v={f.confirmHighRisk ?? true} set={v => set({ confirmHighRisk: v })} />
+      <Select label="主动汇报范围（微信 / 飞书）" v={f.notifyScope || 'all'} set={v => set({ notifyScope: v })} options={DIRECTOR_NOTIFY_OPTS} />
+      <Check label="复杂完工报告由总控 AI 润色提炼" hint="开启后超过 400 字的工单报告会自动整理成手机端易读的 3–5 条要点" v={f.summarizeReports ?? true} set={v => set({ summarizeReports: v })} />
+      <Check label="高危操作代码级二次确认（强烈建议开启）" hint="执行宿主机命令/服务启停/容器清理、修改控制台设置、切换/删除 Pi 或开发镜像、删除工单/项目/书籍、清理工作区或审批密钥前，必须经你明确确认" v={f.confirmHighRisk ?? true} set={v => set({ confirmHighRisk: v })} />
+      <Check label="飞书交互式按钮卡片一键确认" hint="开启后，高危操作确认、DAG 节点审批、密钥申请与故障升级在飞书端均以可点击按钮卡片发出，点一下即可直接执行（仍保留 /确认 短码兜底）" v={f.feishuInteractiveCards ?? true} set={v => set({ feishuInteractiveCards: v })} />
+    </Group>
+    <Group title="主动盯盘与故障自愈闭环" hint="后台看门狗平时 0 Token 低开销巡检；发现工单失败、卡死、阻塞或高危命令出错时，自动唤醒总控排查解决并在验证完成后汇报，同时沉淀避坑经验到长期记忆。">
+      <Check label="启用故障/卡死主动发现并自愈" hint="发现任务失败、阻塞或长时间无进展时，先由总控诊断现场并自主修复重试；超出轮次上限或需你拍板时再发卡片通知" v={f.autoHeal ?? true} set={v => set({ autoHeal: v })} />
+      <div className="cols">
+        <Num label="单任务最多自动自愈轮次" hint="0–5 轮，默认 2（防死循环与失控扣费，超限后转人工卡片决策）" step={1} min={0} max={5} v={f.maxAutoHealRounds ?? 2} set={v => set({ maxAutoHealRounds: v })} />
+        <Num label="任务静默卡死判定（分钟）" hint="2–120 分钟，默认 8（运行中工单超过此时长无新步骤活动则唤醒总控排查）" step={1} min={2} max={120} v={f.stallMinutes ?? 8} set={v => set({ stallMinutes: v })} />
+        <Num label="长耗时里程碑播报（分钟）" hint="0–120 分钟，默认 5（0 表示关闭；运行超此时长自动汇报阶段进度，每单最多 2 次）" step={1} min={0} max={120} v={f.milestoneMinutes ?? 5} set={v => set({ milestoneMinutes: v })} />
+      </div>
     </Group>
     <Group title="对话与成本护栏">
       <div className="cols">

@@ -10,6 +10,11 @@ import type { OptionsStore } from '../admin/options.ts'
 import type { EventLog } from '../ledger/events.ts'
 import type { DirectorService } from './service.ts'
 import type { DirectorFollowup, DirectorSession, FollowupTriggerKind } from './store.ts'
+import {
+  buildMissionApprovalCard,
+  buildTicketDecisionCard,
+  buildVaultRequestCard,
+} from '../sources/feishu-cards.ts'
 
 export type PlatformNoticeEvent =
   | {
@@ -31,6 +36,46 @@ export type PlatformNoticeEvent =
     state: 'blocked' | 'failed' | 'waiting' | 'progress'
     summary: string
     question?: string
+  }
+  | {
+    kind: 'ticket.stalled'
+    ticketId: string
+    title: string
+    idleMinutes: number
+    stage: string
+    lastStep?: string
+  }
+  | {
+    kind: 'mission.waiting_approval'
+    missionId: string
+    missionTitle: string
+    nodeKey: string
+    nodeTitle: string
+    planVersion: number
+    prompt?: string
+    artifacts?: string[]
+  }
+  | {
+    kind: 'mission.failed'
+    missionId: string
+    missionTitle: string
+    failedNodes: { key: string; title: string; error?: string }[]
+    summary: string
+  }
+  | {
+    kind: 'milestone.progress'
+    ticketId: string
+    title: string
+    elapsedMinutes: number
+    stage: string
+    lastStep?: string
+    round?: number
+  }
+  | {
+    kind: 'host.alert'
+    alertKey: string
+    title: string
+    summary: string
   }
   | {
     kind: 'budget.blocked'
@@ -63,6 +108,8 @@ export interface DirectorBridgeDeps {
   sendWechat: (input: { to?: string; title?: string; text: string }) => Promise<void>
   /** 飞书主动汇报：`to` 为用户 open_id。 */
   sendFeishu?: (input: { to: string; text: string }) => Promise<void>
+  /** 飞书交互卡片主动推送（用于 DAG 审批、密钥授权与故障升级决策）。 */
+  sendFeishuCard?: (input: { to: string; card: Record<string, unknown>; fallbackText?: string }) => Promise<{ messageId?: string }>
   /** 飞书默认汇报对象（通常为飞书允许名单里的 open_id）。 */
   feishuRecipients?: () => string[]
   now?: () => Date
@@ -137,12 +184,57 @@ export class DirectorBridge {
         ? (event.outcome === 'completed' || event.outcome === 'merged')
         : false
 
+    // 1. 若该工单此前经历过总控主动自愈，如今成功结束，立即走「故障已解决并验证完成」闭环战报 + 避坑记忆反哺
+    const healKeyForTicket = ticketId ? `ticket:${ticketId}` : undefined
+    const priorHeal = healKeyForTicket ? store.getHealState(healKeyForTicket) : undefined
+    const shouldReportHealResolved = event.kind === 'ticket.ended'
+      && outcomeOk
+      && Boolean(priorHeal && priorHeal.attempts > 0 && priorHeal.status !== 'resolved')
+
+    // 2. 判断是否属于「需要总控主动诊断并解决」的异常事件
+    const healIncident = this.toHealIncident(event)
+    let autoHealAttempted = false
+    let healExhaustedAttempts = 0
+
     for (const target of targets) {
       if (ticketId) {
         store.updateSession(target.session.id, { focusTicketId: ticketId })
       }
 
-      // 若该会话命中显式自动续接计划，或为总控派单会话且近期对话明确承诺过「完成后继续下一步」，则直接唤醒总控执行
+      // A. 自愈成功闭环汇报（仅主目标执行一次，防止多通道重复写记忆和调用模型）
+      if (shouldReportHealResolved && !autoHealAttempted && healKeyForTicket && priorHeal && ticketId) {
+        autoHealAttempted = true
+        const handled = await this.deps.director.triggerHealResolvedReport({
+          sessionId: target.session.id,
+          targetKey: healKeyForTicket,
+          ticketId,
+          title: event.kind === 'ticket.ended' ? event.title : ticketId,
+          priorReason: priorHeal.lastReason,
+          priorAction: priorHeal.lastAction,
+          noticeText: message,
+          pushReply: target.push,
+        })
+        if (handled) continue
+      }
+
+      // B. 故障/卡死/阻塞主动自愈（仅主目标执行一次修复动作）
+      if (healIncident && opts.director.autoHeal && !autoHealAttempted) {
+        autoHealAttempted = true
+        const healRes = await this.deps.director.triggerAutoHeal({
+          sessionId: target.session.id,
+          targetKey: healIncident.targetKey,
+          incidentKind: healIncident.incidentKind,
+          targetId: healIncident.targetId,
+          title: healIncident.title,
+          summary: healIncident.summary,
+          ...(healIncident.question ? { question: healIncident.question } : {}),
+          pushReply: target.push,
+        })
+        if (healRes.handled) continue
+        if (healRes.exhausted) healExhaustedAttempts = healRes.attempts
+      }
+
+      // C. 正常完工后的显式/口头承诺自动续接
       const explicitFollowups = followupsBySession.get(target.session.id) ?? []
       const inferredFromChat = isFollowupEvent
         && explicitFollowups.length === 0
@@ -164,7 +256,7 @@ export class DirectorBridge {
         if (handled) continue
       }
 
-      // 普通通知或自动续接失败兜底：写入会话记忆并按策略推送静态通知
+      // D. 常规通知或自愈超限升级：写入会话记忆并按通道能力推送（飞书优先交互按钮卡片）
       this.deps.director.recordEventInSession(target.session.id, message, {
         eventKind: event.kind,
         ...(ticketId ? { ticketId } : {}),
@@ -173,14 +265,21 @@ export class DirectorBridge {
       if (target.session.channel !== 'wechat' && target.session.channel !== 'feishu') continue
       const channel = target.session.channel as PushChannel
       try {
-        await this.send(channel, target.session.userId, message)
+        const card = channel === 'feishu' && opts.director.feishuInteractiveCards !== false
+          ? this.buildInteractiveCardForEvent(event, message, healExhaustedAttempts)
+          : undefined
+        if (card && this.deps.sendFeishuCard) {
+          await this.deps.sendFeishuCard({ to: target.session.userId, card, fallbackText: message })
+        } else {
+          await this.send(channel, target.session.userId, message)
+        }
         try {
           this.deps.events.add({
             kind: 'director.proactive',
             level: 'info',
             ...(ticketId ? { ticketId } : {}),
             text: `总控主动向${PUSH_LABEL[channel]}汇报（${event.kind}）`,
-            data: { userId: target.session.userId, kind: event.kind, channel },
+            data: { userId: target.session.userId, kind: event.kind, channel, interactiveCard: Boolean(card) },
           })
         } catch { /* best effort */ }
       } catch (error) {
@@ -188,6 +287,100 @@ export class DirectorBridge {
         this.deps.onError?.(error)
       }
     }
+  }
+
+  /** 将需要总控主动诊断解决的异常事件转换为统一自愈入参。 */
+  private toHealIncident(event: PlatformNoticeEvent): {
+    targetKey: string
+    incidentKind: 'ticket_failed' | 'ticket_attention' | 'ticket_stalled' | 'mission_failed'
+    targetId: string
+    title: string
+    summary: string
+    question?: string
+  } | undefined {
+    if (event.kind === 'ticket.ended' && (event.outcome === 'failed' || event.outcome === 'dropped')) {
+      return {
+        targetKey: `ticket:${event.ticketId}`,
+        incidentKind: 'ticket_failed',
+        targetId: event.ticketId,
+        title: event.title,
+        summary: event.summary || `工单以 ${event.outcome} 结束`,
+      }
+    }
+    if (event.kind === 'ticket.attention' && (event.state === 'failed' || event.state === 'blocked')) {
+      return {
+        targetKey: `ticket:${event.ticketId}`,
+        incidentKind: 'ticket_attention',
+        targetId: event.ticketId,
+        title: event.title,
+        summary: event.summary || `工单进入 ${event.state} 状态`,
+        ...(event.question ? { question: event.question } : {}),
+      }
+    }
+    if (event.kind === 'ticket.stalled') {
+      return {
+        targetKey: `ticket:${event.ticketId}`,
+        incidentKind: 'ticket_stalled',
+        targetId: event.ticketId,
+        title: event.title,
+        summary: `已持续 ${event.idleMinutes} 分钟无新进展（阶段：${event.stage}${event.lastStep ? `，最后步骤：${event.lastStep}` : ''}）`,
+      }
+    }
+    if (event.kind === 'mission.failed') {
+      return {
+        targetKey: `mission:${event.missionId}`,
+        incidentKind: 'mission_failed',
+        targetId: event.missionId,
+        title: event.missionTitle,
+        summary: `${event.summary}\n失败节点：${event.failedNodes.map(n => `${n.key}(${n.title}): ${n.error || '失败'}`).join('；')}`,
+      }
+    }
+    return undefined
+  }
+
+  /** 为适合飞书一键点击确认/决策的事件构造 JSON 2.0 交互卡片。 */
+  private buildInteractiveCardForEvent(
+    event: PlatformNoticeEvent,
+    fallbackBody: string,
+    exhaustedAttempts: number,
+  ): Record<string, unknown> | undefined {
+    if (event.kind === 'mission.waiting_approval') {
+      return buildMissionApprovalCard({
+        missionId: event.missionId,
+        missionTitle: event.missionTitle,
+        nodeKey: event.nodeKey,
+        nodeTitle: event.nodeTitle,
+        planVersion: event.planVersion,
+        ...(event.prompt ? { prompt: event.prompt } : {}),
+        ...(event.artifacts ? { artifacts: event.artifacts } : {}),
+      })
+    }
+    if (event.kind === 'vault.request' && event.requestId) {
+      return buildVaultRequestCard({
+        requestId: event.requestId,
+        ticketId: event.ticketId,
+        ticketTitle: event.ticketTitle,
+        secretName: event.name,
+        why: event.why,
+      })
+    }
+    if (
+      (event.kind === 'ticket.ended' && (event.outcome === 'failed' || event.outcome === 'dropped'))
+      || (event.kind === 'ticket.attention' && (event.state === 'failed' || event.state === 'blocked'))
+      || event.kind === 'ticket.stalled'
+    ) {
+      const reason = event.kind === 'ticket.stalled'
+        ? `工单已停滞 ${event.idleMinutes} 分钟`
+        : event.kind === 'ticket.ended' ? `执行${OUTCOME_LABEL[event.outcome] ?? event.outcome}` : '执行报错/阻塞'
+      return buildTicketDecisionCard({
+        ticketId: event.ticketId,
+        title: event.title,
+        reason,
+        diagnosis: fallbackBody,
+        ...(exhaustedAttempts > 0 ? { attempts: exhaustedAttempts } : {}),
+      })
+    }
+    return undefined
   }
 
   /** 检查该会话最近 6 条活跃对话是否包含明确的「任务完成后继续执行下一步」承诺。 */
@@ -244,12 +437,22 @@ export class DirectorBridge {
       }
     }
 
-    // 控制台 web 会话派发的工单若在近期对话有自动续接承诺，也要纳入目标（不走 IM 推送，结果写入控制台会话）
-    if (event.kind === 'ticket.ended') {
+    // 控制台 web 会话派发的工单：遇到自动续接承诺、故障自愈或自愈完工汇报时，同样纳入目标（结果写入控制台会话）
+    const isWebEligible = event.kind === 'ticket.ended'
+      || event.kind === 'ticket.attention'
+      || event.kind === 'ticket.stalled'
+      || event.kind === 'milestone.progress'
+    if (isWebEligible) {
       for (const link of allLinks) {
         if (link.channel !== 'web' || map.has(link.sessionId)) continue
         const session = store.getSession(link.sessionId)
-        if (session && this.sessionHasPendingPromise(session.id)) {
+        if (!session) continue
+        const needForEnded = event.kind !== 'ticket.ended'
+          || event.outcome === 'failed'
+          || event.outcome === 'dropped'
+          || Boolean(ticketId && store.getHealState(`ticket:${ticketId}`)?.attempts)
+          || this.sessionHasPendingPromise(session.id)
+        if (needForEnded) {
           map.set(session.id, { session, push: false })
         }
       }
@@ -263,6 +466,12 @@ export class DirectorBridge {
           const session = store.getOrCreateSession(channel, userId)
           map.set(session.id, { session, push: true })
         }
+      }
+      // 即使未开启微信/飞书，若存在控制台会话，异常/审批事件仍写入并唤醒控制台总控
+      if (map.size === 0) {
+        const webSessions = store.listSessions('web')
+        const primaryWeb = webSessions[0] ?? store.getOrCreateSession('web', 'console')
+        map.set(primaryWeb.id, { session: primaryWeb, push: false })
       }
     }
 
@@ -350,6 +559,52 @@ export class DirectorBridge {
       return lines.join('\n')
     }
 
+    if (event.kind === 'ticket.stalled') {
+      return [
+        `⏱️ 任务长时间无进展（疑似卡死）：${event.title}`,
+        `编号：${event.ticketId}｜停滞 ${event.idleMinutes} 分钟｜阶段：${event.stage}`,
+        ...(event.lastStep ? [`最后活动：${event.lastStep.slice(0, 200)}`] : []),
+        '',
+        '回复「重试」或「停掉它」，或在飞书直接点卡片按钮处理。',
+      ].join('\n')
+    }
+
+    if (event.kind === 'mission.waiting_approval') {
+      return [
+        `🗺️ DAG 任务计划等待你的批准：${event.missionTitle}`,
+        `计划编号：${event.missionId}（v${event.planVersion}）`,
+        `卡点节点：${event.nodeTitle}（${event.nodeKey}）`,
+        ...(event.prompt ? ['', event.prompt.slice(0, 400)] : []),
+        ...(event.artifacts && event.artifacts.length > 0 ? ['', `前置产物：${event.artifacts.slice(0, 5).join('、')}`] : []),
+        '',
+        `回复「批准计划 ${event.missionId} 的 ${event.nodeKey} 节点」或直接点击卡片按钮继续。`,
+      ].join('\n')
+    }
+
+    if (event.kind === 'mission.failed') {
+      return [
+        `❌ DAG 任务计划执行受阻：${event.missionTitle}`,
+        `计划编号：${event.missionId}`,
+        event.summary,
+        ...event.failedNodes.slice(0, 4).map(n => `• ${n.key}（${n.title}）：${n.error || '失败'}`),
+      ].join('\n')
+    }
+
+    if (event.kind === 'milestone.progress') {
+      return [
+        `⏳ 任务阶段进度播报：${event.title}`,
+        `编号：${event.ticketId}｜已运行 ${event.elapsedMinutes} 分钟｜阶段：${event.stage}${event.round ? `（第 ${event.round} 轮）` : ''}`,
+        ...(event.lastStep ? [`当前正在：${event.lastStep.slice(0, 180)}`] : []),
+      ].join('\n')
+    }
+
+    if (event.kind === 'host.alert') {
+      return [
+        `⚠️ 主机健康巡检预警：${event.title}`,
+        event.summary,
+      ].join('\n')
+    }
+
     if (event.kind === 'budget.blocked') {
       return [
         `💸 任务因预算上限暂停：${event.title}`,
@@ -386,6 +641,11 @@ export class DirectorBridge {
     switch (event.kind) {
       case 'ticket.ended': return `ended:${event.ticketId}:${event.outcome}`
       case 'ticket.attention': return `attn:${event.ticketId}:${event.state}:${(event.question ?? event.summary).slice(0, 80)}`
+      case 'ticket.stalled': return `stalled:${event.ticketId}:${Math.floor(event.idleMinutes / 5)}`
+      case 'mission.waiting_approval': return `mis_wait:${event.missionId}:${event.nodeKey}:v${event.planVersion}`
+      case 'mission.failed': return `mis_fail:${event.missionId}:${event.failedNodes.map(n => n.key).join(',')}`
+      case 'milestone.progress': return `milestone:${event.ticketId}:${Math.floor(event.elapsedMinutes / 5)}`
+      case 'host.alert': return `host_alert:${event.alertKey}`
       case 'budget.blocked': return `budget:${event.ticketId}:${event.reason.slice(0, 60)}`
       case 'vault.request': return `vault:${event.ticketId}:${event.name}:${event.requestId ?? ''}`
       case 'council.ended': return `council:${event.councilId}:${event.status}`

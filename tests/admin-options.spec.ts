@@ -187,6 +187,11 @@ describe('defaultOptions', () => {
         maxRetries: 5,
         dailyUsd: 5,
         extraPrompt: '',
+        autoHeal: true,
+        maxAutoHealRounds: 2,
+        stallMinutes: 8,
+        milestoneMinutes: 5,
+        feishuInteractiveCards: true,
       },
     })
   })

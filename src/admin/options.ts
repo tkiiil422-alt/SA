@@ -392,6 +392,16 @@ export const DirectorSchema = z.object({
   dailyUsd: z.number().min(0, '不能小于 0').max(1000, '最多 $1000').default(5),
   /** Optional operator guidance appended to the Director's system prompt. */
   extraPrompt: z.string().max(2000, '补充提示词不能超过 2000 字').default(''),
+  /** Automatically wake Director to diagnose and heal failed/stalled tickets, missions, and commands. */
+  autoHeal: z.boolean().default(true),
+  /** Max autonomous self-heal attempts per ticket/incident to prevent infinite loops. */
+  maxAutoHealRounds: z.number().int('必须是整数').min(0, '不能小于 0').max(5, '最多 5 轮').default(2),
+  /** Minutes of inactivity before Watchdog treats a running ticket as potentially stalled. */
+  stallMinutes: z.number().int('必须是整数').min(2, '最少 2 分钟').max(120, '最多 120 分钟').default(8),
+  /** Proactive milestone update interval for long-running tasks (minutes; 0 disables). */
+  milestoneMinutes: z.number().int('必须是整数').min(0, '不能小于 0').max(120, '最多 120 分钟').default(5),
+  /** Send interactive Feishu button cards for high-risk confirmations, DAG approvals, vault requests, and escalations. */
+  feishuInteractiveCards: z.boolean().default(true),
 }).strict()
 
 export const OptionsSchema = z.object({
@@ -1110,6 +1120,11 @@ export function defaultOptions(env: NodeJS.ProcessEnv): Options {
       maxRetries: 5,
       dailyUsd: 5,
       extraPrompt: '',
+      autoHeal: true,
+      maxAutoHealRounds: 2,
+      stallMinutes: 8,
+      milestoneMinutes: 5,
+      feishuInteractiveCards: true,
     },
   })
 }

@@ -358,6 +358,55 @@ export class DirectorToolExecutor {
           })
         }
 
+        case 'ticket_diagnose': {
+          const ticketId = str(args.ticketId)
+          if (!ticketId) return fail('缺少 ticketId')
+          const detail = this.deps.host.ticket(ticketId)
+          if (!detail) return fail(`找不到工单：${ticketId}`)
+          const act = this.deps.activity?.list(ticketId)
+          const recentSteps = act ? act.items.slice(-15) : []
+          const lastStepAt = act?.updatedAt ?? detail.updatedAt
+          const idleMinutes = Math.max(0, Math.round((Date.now() - new Date(lastStepAt).getTime()) / 60_000))
+          const deliverables = this.deps.host.deliverables(ticketId).slice(0, 20)
+          const contract = this.deps.contracts?.get('ticket', ticketId)
+          const goal = this.deps.goals?.view(ticketId)
+          const receipt = this.deps.goals?.buildReceipt
+            ? this.deps.goals.buildReceipt(ticketId, {
+                deliverables: deliverables.map(d => ({ path: d.path, size: d.size, kind: d.kind })),
+                contractVersion: contract?.version ?? null,
+                ...(contract?.criteria ? { contractCriteria: contract.criteria } : {}),
+                needsPerson: Boolean(detail.attention?.question),
+                ...(detail.attention?.question ? { question: detail.attention.question } : {}),
+                ended: detail.status === 'ended',
+                ...(detail.outcome ? { outcome: detail.outcome } : {}),
+              })
+            : undefined
+          const healState = this.deps.store.getHealState(`ticket:${ticketId}`)
+          const recentEvents = this.deps.events.list({ ticketId, limit: 12 })
+          this.deps.store.updateSession(ctx.session.id, { focusTicketId: ticketId })
+          return out({
+            ticketId,
+            title: detail.title,
+            status: detail.status,
+            stage: detail.stage,
+            outcome: detail.outcome,
+            model: detail.model,
+            costUsd: detail.costUsd,
+            canRetry: detail.canRetry,
+            idleMinutes,
+            lastStepAt,
+            ...(detail.attention ? { attention: detail.attention } : {}),
+            latestReports: detail.reports.slice(-3).map(r => ({ state: r.state, at: r.at, summary: r.summary.slice(0, 1000) })),
+            recentSteps,
+            recentEvents: recentEvents.map(e => ({ kind: e.kind, level: e.level, at: e.at, text: e.text.slice(0, 260) })),
+            ...(goal ? { goal: { status: goal.status, rounds: goal.rounds, roundCap: goal.roundCap, lastCheck: goal.last ?? goal.checks.at(-1) } } : {}),
+            ...(contract ? { contract: { version: contract.version, goal: contract.goal, criteria: contract.criteria } } : {}),
+            ...(receipt ? { receipt: { status: receipt.status, pendingItems: receipt.pendingItems, missingCriteria: receipt.criteria.filter(c => c.status !== 'passed').map(c => c.text), failedEvidences: receipt.evidences.filter(e => !e.passed).slice(-5) } } : {}),
+            ...(healState ? { healState } : {}),
+            deliverableCount: deliverables.length,
+          })
+        }
+
         case 'ticket_activity': {
           const ticketId = str(args.ticketId)
           if (!ticketId) return fail('缺少 ticketId')

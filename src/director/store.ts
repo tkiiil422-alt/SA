@@ -94,6 +94,17 @@ export interface SessionListItem extends DirectorSession {
   lastMessage?: string
 }
 
+export type HealStatus = 'healing' | 'resolved' | 'escalated'
+
+export interface HealAttemptState {
+  targetKey: string
+  attempts: number
+  status: HealStatus
+  lastReason: string
+  lastAction: string
+  updatedAt: string
+}
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS director_sessions (
   id TEXT PRIMARY KEY,
@@ -170,6 +181,15 @@ CREATE TABLE IF NOT EXISTS director_followups (
 );
 CREATE INDEX IF NOT EXISTS director_followups_target ON director_followups (trigger_kind, target_id, status);
 CREATE INDEX IF NOT EXISTS director_followups_session ON director_followups (session_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS director_heal_attempts (
+  target_key TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'healing',
+  last_reason TEXT NOT NULL DEFAULT '',
+  last_action TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL
+);
 `
 
 const MAX_MESSAGES_PER_SESSION = 500
@@ -748,5 +768,71 @@ export class DirectorStore {
       createdAt: row.created_at!,
       ...(row.triggered_at ? { triggeredAt: row.triggered_at } : {}),
     }
+  }
+
+  // --- 主动自愈状态追踪（重启不丢计数，防死循环） ---
+
+  getHealState(targetKey: string): HealAttemptState | undefined {
+    const row = this.db.prepare('SELECT * FROM director_heal_attempts WHERE target_key = ?').get(targetKey) as Record<string, unknown> | undefined
+    if (!row) return undefined
+    return {
+      targetKey: String(row.target_key),
+      attempts: Number(row.attempts ?? 0),
+      status: String(row.status ?? 'healing') as HealStatus,
+      lastReason: String(row.last_reason ?? ''),
+      lastAction: String(row.last_action ?? ''),
+      updatedAt: String(row.updated_at ?? ''),
+    }
+  }
+
+  recordHealAttempt(targetKey: string, reason: string, action = ''): HealAttemptState {
+    const now = this.now().toISOString()
+    const existing = this.getHealState(targetKey)
+    const nextAttempts = (existing?.attempts ?? 0) + 1
+    this.db.prepare(`
+      INSERT INTO director_heal_attempts (target_key, attempts, status, last_reason, last_action, updated_at)
+      VALUES (?, ?, 'healing', ?, ?, ?)
+      ON CONFLICT(target_key) DO UPDATE SET
+        attempts = excluded.attempts,
+        status = 'healing',
+        last_reason = excluded.last_reason,
+        last_action = CASE WHEN excluded.last_action != '' THEN excluded.last_action ELSE director_heal_attempts.last_action END,
+        updated_at = excluded.updated_at
+    `).run(targetKey, nextAttempts, reason.slice(0, 600), action.slice(0, 600), now)
+    return {
+      targetKey,
+      attempts: nextAttempts,
+      status: 'healing',
+      lastReason: reason.slice(0, 600),
+      lastAction: action ? action.slice(0, 600) : (existing?.lastAction ?? ''),
+      updatedAt: now,
+    }
+  }
+
+  updateHealAction(targetKey: string, action: string): void {
+    const now = this.now().toISOString()
+    this.db.prepare('UPDATE director_heal_attempts SET last_action = ?, updated_at = ? WHERE target_key = ?')
+      .run(action.slice(0, 600), now, targetKey)
+  }
+
+  markHealResolved(targetKey: string, summary = ''): void {
+    const now = this.now().toISOString()
+    this.db.prepare(`
+      UPDATE director_heal_attempts
+      SET status = 'resolved', last_action = CASE WHEN ? != '' THEN ? ELSE last_action END, updated_at = ?
+      WHERE target_key = ?
+    `).run(summary.slice(0, 600), summary.slice(0, 600), now, targetKey)
+  }
+
+  markHealEscalated(targetKey: string, reason = ''): void {
+    const now = this.now().toISOString()
+    this.db.prepare(`
+      INSERT INTO director_heal_attempts (target_key, attempts, status, last_reason, last_action, updated_at)
+      VALUES (?, 0, 'escalated', ?, '', ?)
+      ON CONFLICT(target_key) DO UPDATE SET
+        status = 'escalated',
+        last_reason = CASE WHEN excluded.last_reason != '' THEN excluded.last_reason ELSE director_heal_attempts.last_reason END,
+        updated_at = excluded.updated_at
+    `).run(targetKey, reason.slice(0, 600), now)
   }
 }
