@@ -303,6 +303,7 @@ function buildProviderRecord(raw: Record<string, unknown>, prior?: Provider): Re
       api: prior.api,
       baseUrl: prior.baseUrl,
       sessionHeader: prior.sessionHeader,
+      ...(prior.maxPromptKb !== undefined ? { maxPromptKb: prior.maxPromptKb } : {}),
       enabled: prior.enabled,
     }
     : {

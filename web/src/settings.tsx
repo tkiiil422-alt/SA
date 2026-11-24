@@ -186,7 +186,10 @@ function ProviderEdit({ p, upd }: { p: any; upd: (patch: any) => void }) {
     <Select label="接口类型" v={p.api} set={v => upd({ api: v })} options={[['openai-completions', 'OpenAI 兼容'], ['anthropic-messages', 'Anthropic Messages']]} />
     <Text label="接口地址" mono placeholder="https://api.example.com" v={p.baseUrl} set={v => upd({ baseUrl: v })} />
     <Secret label="API Key" isSet={p.apiKeySet} tail={p.apiKeyTail} v={p.apiKey} set={v => upd({ apiKey: v })} />
-    <Text label="会话头（可选）" hint="有的网关按这个请求头把同一任务路由到同一后端，保留缓存" mono v={p.sessionHeader} set={v => upd({ sessionHeader: v })} />
+    <div className="cols">
+      <Text label="会话头（可选）" hint="有的网关按这个请求头把同一任务路由到同一后端，保留缓存" mono v={p.sessionHeader} set={v => upd({ sessionHeader: v })} />
+      <Num label="单次请求体上限（KB，0=不限）" hint="部分中转网关会在约 192KB 处静默截断末尾消息导致总控重复回答旧问题；填入网关安全上限（如 160）后自动从最旧历史裁剪并压缩，始终保住最新提问" min={0} max={102400} step={16} v={p.maxPromptKb ?? 0} set={v => upd({ maxPromptKb: Math.max(0, Math.round(v)) })} />
+    </div>
     <div className="headrow"><h4>模型 <small>{(p.models || []).length}</small></h4>
       <button type="button" disabled={busy || !p.baseUrl} onClick={discover}>{busy ? '获取中…' : '从接口获取模型列表'}</button></div>
     <ListEdit items={p.models || []} onChange={v => upd({ models: v })} addLabel="手动添加模型"

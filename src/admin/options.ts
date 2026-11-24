@@ -40,6 +40,8 @@ export const ProviderSchema = z.object({
   baseUrl: z.string().url().refine(u => /^https?:\/\//.test(u), '必须是 http(s) 地址'),
   apiKey: z.string().default(''),
   sessionHeader: z.string().regex(/^[A-Za-z0-9-]*$/),
+  /** Optional upstream gateway prompt byte ceiling in KiB (1 KiB = 1024 bytes; 0 or omitted = unlimited). */
+  maxPromptKb: z.number().int('必须是整数').min(0, '不能小于 0').max(102_400, '最多 102400 KB').optional(),
   enabled: z.boolean(),
   models: z.array(ModelSchema).min(1).max(50),
 }).strict().superRefine((provider, ctx) => {

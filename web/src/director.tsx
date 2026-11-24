@@ -689,8 +689,8 @@ export function Director() {
               {st.effectiveContextTokens && st.modelContextWindow ? (
                 <>
                   <span aria-hidden="true"> · </span>
-                  <span title={`有效上下文 ${st.effectiveContextTokens.toLocaleString()} / 模型上限 ${st.modelContextWindow.toLocaleString()} tokens（${st.contextWindowPercent ?? 80}%），单步最大输出 ${(st.effectiveOutputTokens ?? 0).toLocaleString()} tokens`}>
-                    上下文 {Math.round(st.effectiveContextTokens / 1000)}k/{Math.round(st.modelContextWindow / 1000)}k
+                  <span title={`有效上下文 ${st.effectiveContextTokens.toLocaleString()} / 模型上限 ${st.modelContextWindow.toLocaleString()} tokens（${st.contextWindowPercent ?? 80}%），单步最大输出 ${(st.effectiveOutputTokens ?? 0).toLocaleString()} tokens${st.maxPromptKb ? `，网关单次请求上限 ${st.maxPromptKb} KB` : ''}`}>
+                    上下文 {Math.round(st.effectiveContextTokens / 1000)}k/{Math.round(st.modelContextWindow / 1000)}k{st.maxPromptKb ? ` · 网关上限 ${st.maxPromptKb}KB` : ''}
                   </span>
                 </>
               ) : null}

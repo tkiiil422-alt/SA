@@ -18,6 +18,8 @@ import {
   computeDirectorContextBudget,
   estimateTextTokens,
   findSafeCompactCutIndex,
+  trimConversationToBudget,
+  utf8Bytes,
 } from '../src/director/service.ts'
 import { DirectorStore } from '../src/director/store.ts'
 import { EventLog } from '../src/ledger/events.ts'
@@ -1787,6 +1789,187 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
       expect(exhausted.text).toBe('')
       expect(exhausted.error).toContain('伪装报错')
       expect(exhausted.error).toContain('failed to construct executor')
+    })
+
+    it('computeDirectorContextBudget respects maxPromptKb ceiling and leaves unlimited behavior unchanged', () => {
+      const unlimited = computeDirectorContextBudget(
+        { contextWindow: 1_048_576, maxTokens: 65_536 },
+        { contextWindowPercent: 80, maxContextTokens: 0, maxOutputTokens: 0 },
+      )
+      expect(unlimited.maxPromptBytes).toBe(0)
+      expect(unlimited.toolOutputLiveChars).toBe(100_663)
+      expect(unlimited.toolOutputHistoryChars).toBe(32_000)
+
+      const limited = computeDirectorContextBudget(
+        { contextWindow: 1_048_576, maxTokens: 65_536, maxPromptKb: 160 },
+        { contextWindowPercent: 80, maxContextTokens: 0, maxOutputTokens: 0 },
+      )
+      expect(limited.maxPromptBytes).toBe(163_840)
+      expect(limited.toolOutputLiveChars).toBe(40_960)
+      expect(limited.toolOutputHistoryChars).toBe(6_553)
+    })
+
+    it('buildConversationWindow trims oldest groups by UTF-8 maxBytes and strips disguised upstream error replies', () => {
+      const base = { sessionId: 's_bytes', archived: false, createdAt: '2026-11-24T00:00:00.000Z' }
+      const messages = [
+        { ...base, id: 1, role: 'user' as const, content: `最早中文问题_${'甲'.repeat(3000)}` }, // > 9KB UTF-8
+        { ...base, id: 2, role: 'assistant' as const, content: '最早回答' },
+        { ...base, id: 3, role: 'user' as const, content: '你再次联网确认一下' },
+        { ...base, id: 4, role: 'assistant' as const, content: '', toolCalls: [{ id: 'tc_web', name: 'platform_query', arguments: {} }] },
+        { ...base, id: 5, role: 'tool' as const, toolCallId: 'tc_web', toolName: 'platform_query', content: '搜索结果' },
+        { ...base, id: 6, role: 'assistant' as const, content: '⚠ failed to construct executor: plan model not specified; you must specify a valid model' },
+        { ...base, id: 7, role: 'user' as const, content: '小说任务进行得如何了？' },
+      ]
+
+      const win = buildConversationWindow(messages, { maxItems: 50, maxBytes: 4_000 })
+      expect(win[0]?.role).toBe('user')
+      expect(win[0]?.content).toBe('你再次联网确认一下')
+      expect(win[win.length - 1]?.content).toBe('小说任务进行得如何了？')
+      // 配对工具未被拆散，历史伪装报错助手回复被自动过滤
+      expect(win.some(m => m.role === 'tool' && m.toolCallId === 'tc_web')).toBe(true)
+      expect(win.some(m => m.content.includes('failed to construct executor'))).toBe(false)
+    })
+
+    it('trimConversationToBudget drops oldest turns cleanly and shrinks earlier tool outputs when a single turn still exceeds budget', () => {
+      const multiTurn = [
+        { role: 'user' as const, content: `旧提问_${'一'.repeat(2000)}` },
+        { role: 'assistant' as const, content: '旧回答' },
+        { role: 'user' as const, content: '最新提问：小说第4弧进度如何？' },
+        { role: 'assistant' as const, content: '', toolCalls: [{ id: 'tc1', name: 'platform_query', arguments: {} }] },
+        { role: 'tool' as const, toolCallId: 'tc1', name: 'platform_query', content: '第一份正常工具结果' },
+      ]
+      const trimmedTurns = trimConversationToBudget(multiTurn, 2_000)
+      expect(trimmedTurns[0]).toEqual({ role: 'user', content: '最新提问：小说第4弧进度如何？' })
+      expect(trimmedTurns).toHaveLength(3)
+
+      const singleTurnHeavyTools = [
+        { role: 'user' as const, content: '查看两份超大报告' },
+        { role: 'assistant' as const, content: '', toolCalls: [{ id: 'tc_old', name: 'platform_query', arguments: {} }] },
+        { role: 'tool' as const, toolCallId: 'tc_old', name: 'platform_query', content: '旧数据_'.repeat(3000) },
+        { role: 'assistant' as const, content: '', toolCalls: [{ id: 'tc_new', name: 'platform_query', arguments: {} }] },
+        { role: 'tool' as const, toolCallId: 'tc_new', name: 'platform_query', content: '最新关键结果_KEEP' },
+      ]
+      const trimmedSingle = trimConversationToBudget(singleTurnHeavyTools, 4_000)
+      expect(trimmedSingle[0]?.content).toBe('查看两份超大报告')
+      const oldTool = trimmedSingle.find(m => m.role === 'tool' && m.toolCallId === 'tc_old')
+      const newTool = trimmedSingle.find(m => m.role === 'tool' && m.toolCallId === 'tc_new')
+      expect(oldTool?.role === 'tool' ? oldTool.content : '').toContain('已按请求体字节上限压缩旧工具输出')
+      expect(newTool?.role === 'tool' ? newTool.content : '').toBe('最新关键结果_KEEP')
+    })
+
+    it('enforces provider maxPromptKb across multi-step calls and auto-shrinks window when upstream reports tail truncation', async () => {
+      const env = setup()
+      const baseModels = env.options.get().models
+      const p0 = baseModels.providers[0]!
+      const m0 = p0.models[0]!
+      env.options.update('models', {
+        ...baseModels,
+        providers: [{
+          ...p0,
+          id: 'gwcap',
+          enabled: true,
+          maxPromptKb: 80,
+          models: [{ ...m0, id: 'm1m', contextWindow: 1_048_576, maxTokens: 65_536, autoPick: true }],
+        }],
+        routing: {
+          ...baseModels.routing,
+          worker: { provider: 'gwcap', model: 'm1m' },
+          assessor: { ...baseModels.routing.assessor, provider: 'gwcap', model: 'm1m' },
+        },
+      })
+      env.options.update('director', {
+        ...env.options.get().director,
+        model: { provider: 'gwcap', model: 'm1m' },
+      })
+
+      // 预先写入超过 80KB 的旧历史消息（模拟网关未触发 token 压缩但已超字节上限的场景）
+      const sess = env.store.getOrCreateSession('web', 'owner_cap')
+      for (let i = 0; i < 6; i += 1) {
+        env.store.addMessage({ sessionId: sess.id, role: 'user', content: `历史提问${i}_${'旧'.repeat(7_000)}` }) // ~21KB/条
+        env.store.addMessage({ sessionId: sess.id, role: 'assistant', content: `历史回答${i}` })
+      }
+
+      const seenRequests: { msgs: ToolModelRequest['messages']; bytes: number }[] = []
+      let stepCall = 0
+      const service = new DirectorService({
+        host: env.fake.host,
+        options: env.options,
+        ledger: env.ledger,
+        events: env.events,
+        store: env.store,
+        redact: env.redact,
+        callTool: async (_target, req) => {
+          stepCall += 1
+          const bytes = req.messages.reduce((s, m) => s + utf8Bytes(m.content), 0)
+          seenRequests.push({ msgs: req.messages, bytes })
+          if (stepCall === 1) {
+            return {
+              ok: true,
+              status: 200,
+              latencyMs: 5,
+              text: '',
+              toolCalls: [{ id: 'tc_big_step', name: 'platform_query', arguments: { action: 'overview' } }],
+            }
+          }
+          return { ok: true, status: 200, latencyMs: 5, text: '小说第4弧正在正常运行。', toolCalls: [] }
+        },
+      })
+
+      const st = service.status()
+      expect(st.maxPromptKb).toBe(80)
+
+      const res = await service.chat({ channel: 'web', userId: 'owner_cap', text: '小说进行得怎么样了？' })
+      expect(res.reply).toBe('小说第4弧正在正常运行。')
+      expect(seenRequests).toHaveLength(2)
+      for (const req of seenRequests) {
+        // 80KB 上限扣除系统提示词 (~15KB) 后，消息总字节应严格受控且保留最新用户提问
+        expect(req.bytes).toBeLessThan(80 * 1024)
+        expect(req.msgs.some(m => m.content === '小说进行得怎么样了？')).toBe(true)
+      }
+      service.close()
+
+      // 验证未配置 maxPromptKb 时，上游若返回「末尾被截断」提示能自动缩窗重发并成功恢复
+      const env2 = setup()
+      const m2Base = env2.options.get().models
+      env2.options.update('director', { ...env2.options.get().director, model: null })
+      const sess2 = env2.store.getOrCreateSession('web', 'owner_heal')
+      for (let i = 0; i < 6; i += 1) {
+        env2.store.addMessage({ sessionId: sess2.id, role: 'user', content: `旧消息${i}_${'文'.repeat(6_000)}` }) // ~18KB/条，总计 >108KB
+        env2.store.addMessage({ sessionId: sess2.id, role: 'assistant', content: `旧回复${i}` })
+      }
+      const attemptBytes: number[] = []
+      let attempts = 0
+      const healService = new DirectorService({
+        host: env2.fake.host,
+        options: env2.options,
+        ledger: env2.ledger,
+        events: env2.events,
+        store: env2.store,
+        redact: env2.redact,
+        callTool: async (_target, req) => {
+          attempts += 1
+          const bytes = req.messages.reduce((s, m) => s + utf8Bytes(m.content), 0)
+          attemptBytes.push(bytes)
+          if (attempts === 1) {
+            return {
+              ok: true,
+              status: 200,
+              latencyMs: 5,
+              text: '上下文末尾被截断了 20,583 字节，未能看到你最后提出的具体问题。',
+              toolCalls: [],
+            }
+          }
+          return { ok: true, status: 200, latencyMs: 5, text: '已缩窗恢复并回答你的最新问题。', toolCalls: [] }
+        },
+      })
+      const healed = await healService.chat({ channel: 'web', userId: 'owner_heal', text: '现在小说进行得怎么样了？' })
+      expect(attempts).toBe(2)
+      expect(attemptBytes[1]!).toBeLessThan(attemptBytes[0]!)
+      expect(healed.reply).toBe('已缩窗恢复并回答你的最新问题。')
+      const truncEvents = env2.events.list({ limit: 50 }).filter(e => e.kind === 'director.upstream_truncation_detected')
+      expect(truncEvents.length).toBeGreaterThanOrEqual(1)
+      expect(m2Base.providers.length).toBeGreaterThan(0)
+      healService.close()
     })
   })
 })

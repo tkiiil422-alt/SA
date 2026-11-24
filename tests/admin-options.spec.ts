@@ -622,4 +622,28 @@ describe('OptionsStore change listeners', () => {
     expect(() => options.update('director', { ...base, maxContextTokens: -1 })).toThrow(/0/)
     expect(() => options.update('director', { ...base, maxOutputTokens: -1 })).toThrow(/0/)
   })
+
+  it('validates optional provider maxPromptKb bounds', () => {
+    const options = store()
+    const baseModels = options.get().models
+    const p0 = baseModels.providers[0]!
+    expect(p0.maxPromptKb).toBeUndefined()
+
+    expect(() => options.updateModels({
+      ...baseModels,
+      providers: [{ ...p0, maxPromptKb: 160 }],
+    })).not.toThrow()
+    expect(options.get().models.providers[0]!.maxPromptKb).toBe(160)
+
+    expect(() => options.updateModels({
+      ...baseModels,
+      providers: [{ ...p0, maxPromptKb: 0 }],
+    })).not.toThrow()
+    expect(options.get().models.providers[0]!.maxPromptKb).toBe(0)
+
+    expect(() => options.updateModels({
+      ...baseModels,
+      providers: [{ ...p0, maxPromptKb: -1 }],
+    })).toThrow(/0/)
+  })
 })

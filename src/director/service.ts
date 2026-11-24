@@ -8,7 +8,7 @@
  */
 import type { AdminHost } from '../admin/host.ts'
 import { findModel, formatRef, parseRef, type DirectorOptions, type ModelRef, type OptionsStore } from '../admin/options.ts'
-import { callModel, type ModelTarget } from '../assessor/model-call.ts'
+import { callModel, detectDisguisedUpstreamError, type ModelTarget } from '../assessor/model-call.ts'
 import { costOf } from '../gateway/pricing.ts'
 import type { Usage } from '../gateway/usage.ts'
 import type { EventLog } from '../ledger/events.ts'
@@ -116,6 +116,7 @@ export interface DirectorStatus {
   contextWindowPercent: number
   effectiveContextTokens: number
   effectiveOutputTokens: number
+  maxPromptKb?: number
   notifyScope: DirectorOptions['notifyScope']
   confirmHighRisk: boolean
   sessions: number
@@ -131,6 +132,7 @@ export interface DirectorContextBudget {
   contextWindowPercent: number
   effectiveContextTokens: number
   effectiveOutputTokens: number
+  maxPromptBytes: number
   maxHistoryMessages: number
   toolOutputLiveChars: number
   toolOutputHistoryChars: number
@@ -138,6 +140,21 @@ export interface DirectorContextBudget {
   compactKeepTokens: number
   summaryMaxChars: number
   summaryMaxTokens: number
+}
+
+/** 识别上游中转网关达到字节上限后静默截断末尾消息时模型的典型反馈。 */
+const UPSTREAM_TAIL_TRUNCATED_RE = /(?:上下文|对话|消息|输入).{0,12}(?:末尾|尾部).{0,8}被截断|(?:末尾|尾部)被截断.{0,16}\d+\s*(?:字节|bytes)|truncated\s+(?:at\s+the\s+end|tail|\d[\d,]*\s*bytes)/i
+
+/** 计算文本的 UTF-8 字节长度。 */
+export function utf8Bytes(text: string): number {
+  return text ? Buffer.byteLength(text, 'utf8') : 0
+}
+
+/** 估算单条 AgentMessage 序列化为网关 JSON 载荷时的字节占用（含结构字段冗余）。 */
+function agentMessageBytes(m: AgentMessage): number {
+  return utf8Bytes(m.content)
+    + ('toolCalls' in m && m.toolCalls ? utf8Bytes(JSON.stringify(m.toolCalls)) : 0)
+    + 192
 }
 
 /** 保守估算文本占用的 Token 数：中日韩表意字符按 1.0/字，其余字符按 0.35/字符向上取整。 */
@@ -161,7 +178,7 @@ export function estimateTextTokens(text: string): number {
 
 /** 按当前模型上下文与总控配置计算有效上下文预算，默认按模型上下文的 80%（缩小 20%）对齐。 */
 export function computeDirectorContextBudget(
-  model: { contextWindow: number; maxTokens: number },
+  model: { contextWindow: number; maxTokens: number; maxPromptKb?: number },
   cfg: Pick<DirectorOptions, 'contextWindowPercent' | 'maxContextTokens' | 'maxOutputTokens'>,
 ): DirectorContextBudget {
   const pct = Math.max(10, Math.min(95, Math.round(cfg.contextWindowPercent ?? 80)))
@@ -180,9 +197,14 @@ export function computeDirectorContextBudget(
     : autoOutput
   const effectiveOutputTokens = Math.min(modelMaxTokens, Math.max(1_024, Math.min(requestedOutput, headroom)))
 
+  const maxPromptBytes = (model.maxPromptKb ?? 0) > 0 ? Math.floor(model.maxPromptKb! * 1024) : 0
   const maxHistoryMessages = Math.max(36, Math.min(600, Math.floor(effectiveContextTokens / 1_000)))
-  const toolOutputLiveChars = Math.max(12_000, Math.min(120_000, Math.floor(effectiveContextTokens * 0.12)))
-  const toolOutputHistoryChars = Math.max(2_400, Math.min(32_000, Math.floor(effectiveContextTokens * 0.04)))
+  let toolOutputLiveChars = Math.max(12_000, Math.min(120_000, Math.floor(effectiveContextTokens * 0.12)))
+  let toolOutputHistoryChars = Math.max(2_400, Math.min(32_000, Math.floor(effectiveContextTokens * 0.04)))
+  if (maxPromptBytes > 0) {
+    toolOutputLiveChars = Math.max(4_000, Math.min(toolOutputLiveChars, Math.floor(maxPromptBytes * 0.25)))
+    toolOutputHistoryChars = Math.max(1_200, Math.min(toolOutputHistoryChars, Math.floor(maxPromptBytes * 0.04)))
+  }
   const compactTriggerTokens = Math.max(8_000, Math.floor(effectiveContextTokens * 0.85))
   const compactKeepTokens = Math.max(4_000, Math.floor(effectiveContextTokens * 0.40))
   const summaryMaxChars = Math.max(1_500, Math.min(8_000, Math.floor(effectiveContextTokens * 0.01)))
@@ -194,6 +216,7 @@ export function computeDirectorContextBudget(
     contextWindowPercent: pct,
     effectiveContextTokens,
     effectiveOutputTokens,
+    maxPromptBytes,
     maxHistoryMessages,
     toolOutputLiveChars,
     toolOutputHistoryChars,
@@ -297,12 +320,13 @@ function safeSummary(text: string, max = 140): string {
  */
 export function buildConversationWindow(
   messages: readonly DirectorMessage[],
-  maxItemsOrOpts: number | { maxItems?: number; maxTokens?: number; maxToolOutputChars?: number } = ACTIVE_WINDOW_MESSAGES,
+  maxItemsOrOpts: number | { maxItems?: number; maxTokens?: number; maxBytes?: number; maxToolOutputChars?: number } = ACTIVE_WINDOW_MESSAGES,
 ): AgentMessage[] {
   const maxItems = typeof maxItemsOrOpts === 'number'
     ? maxItemsOrOpts
     : (maxItemsOrOpts.maxItems ?? ACTIVE_WINDOW_MESSAGES)
   const maxTokens = typeof maxItemsOrOpts === 'number' ? undefined : maxItemsOrOpts.maxTokens
+  const maxBytes = typeof maxItemsOrOpts === 'number' ? undefined : maxItemsOrOpts.maxBytes
   const maxToolOutputChars = Math.max(
     500,
     typeof maxItemsOrOpts === 'number'
@@ -348,38 +372,157 @@ export function buildConversationWindow(
         }
         if (expected.size === 0) {
           groups.push([{ role: 'assistant', content: msg.content, toolCalls: msg.toolCalls }, ...results])
-        } else if (msg.content.trim()) {
+        } else if (msg.content.trim() && !detectDisguisedUpstreamError(msg.content)) {
           groups.push([{ role: 'assistant', content: msg.content }])
         }
         i = j - 1
-      } else {
+      } else if (!detectDisguisedUpstreamError(msg.content)) {
         groups.push([{ role: 'assistant', content: msg.content }])
       }
     }
     // 悬空的 tool 消息自然跳过
   }
 
-  if (maxTokens === undefined || maxTokens <= 0 || groups.length === 0) {
+  const hasTokenCap = maxTokens !== undefined && maxTokens > 0
+  const hasByteCap = maxBytes !== undefined && maxBytes > 0
+  if ((!hasTokenCap && !hasByteCap) || groups.length === 0) {
     return groups.flat()
   }
 
   const groupTokens = (g: readonly AgentMessage[]): number => g.reduce((acc, m) => (
     acc + estimateTextTokens(m.content) + ('toolCalls' in m && m.toolCalls ? estimateTextTokens(JSON.stringify(m.toolCalls)) : 0) + 16
   ), 0)
+  const groupBytes = (g: readonly AgentMessage[]): number => g.reduce((acc, m) => acc + agentMessageBytes(m), 0)
 
   const selected: AgentMessage[][] = []
   let usedTokens = 0
+  let usedBytes = 0
   for (let i = groups.length - 1; i >= 0; i -= 1) {
     const g = groups[i]!
     const gt = groupTokens(g)
-    if (selected.length > 0 && usedTokens + gt > maxTokens) break
+    const gb = groupBytes(g)
+    if (
+      selected.length > 0
+      && ((hasTokenCap && usedTokens + gt > maxTokens!) || (hasByteCap && usedBytes + gb > maxBytes!))
+    ) {
+      break
+    }
     selected.unshift(g)
     usedTokens += gt
+    usedBytes += gb
   }
   while (selected.length > 1 && selected[0]![0]?.role !== 'user') {
     selected.shift()
   }
   return selected.flat()
+}
+
+/**
+ * 在发送上游请求前按 UTF-8 字节上限安全裁剪消息列表：
+ * - 优先按对话轮次（从 user 开始直到下一条 user 前）从最旧头部丢弃，始终保留最新 user 提问及其工具链；
+ * - 若当前轮次自身仍超字节预算，从旧到新压缩较早的 `tool` 输出（优先保住最新工具结果），必要时再从本轮最早的 tool 对清理，绝不拆散配对或丢弃最后一条 user。
+ */
+export function trimConversationToBudget(messages: readonly AgentMessage[], maxBytes: number): AgentMessage[] {
+  if (maxBytes <= 0 || messages.length === 0) return [...messages]
+  const bytesOf = (list: readonly AgentMessage[]): number => list.reduce((sum, m) => sum + agentMessageBytes(m), 0)
+  if (bytesOf(messages) <= maxBytes) return [...messages]
+
+  // 先跳过游离在首条 user 之前的消息
+  let start = 0
+  while (start < messages.length && messages[start]!.role !== 'user') {
+    start += 1
+  }
+  if (start >= messages.length) return []
+
+  // 按轮次打包：每个 user 消息开启一个轮次（包含其后的 assistant / tool 直至下一条 user）
+  const turns: AgentMessage[][] = []
+  for (let i = start; i < messages.length; i += 1) {
+    const msg = messages[i]!
+    if (msg.role === 'user' || turns.length === 0) {
+      turns.push([msg])
+    } else {
+      turns[turns.length - 1]!.push(msg)
+    }
+  }
+
+  let usedBytes = turns.reduce((acc, t) => acc + bytesOf(t), 0)
+  while (turns.length > 1 && usedBytes > maxBytes) {
+    const dropped = turns.shift()!
+    usedBytes -= bytesOf(dropped)
+  }
+
+  const current = turns.flat().map(m => ({ ...m }))
+  usedBytes = bytesOf(current)
+  if (usedBytes <= maxBytes) return current
+
+  const TOOL_SUFFIX = '…（已按请求体字节上限压缩旧工具输出）'
+  const suffixBytes = utf8Bytes(TOOL_SUFFIX)
+  const lastToolIdx = (() => {
+    for (let k = current.length - 1; k >= 0; k -= 1) {
+      if (current[k]!.role === 'tool') return k
+    }
+    return -1
+  })()
+
+  const shrinkToolAt = (idx: number): void => {
+    const msg = current[idx]!
+    if (msg.role !== 'tool') return
+    const curBytes = agentMessageBytes(msg)
+    const curContentBytes = utf8Bytes(msg.content)
+    const needDrop = usedBytes - maxBytes
+    if (needDrop <= 0 || curContentBytes <= 400) return
+    const targetContentBytes = Math.max(400, curContentBytes - needDrop)
+    const keepBytes = Math.max(200, targetContentBytes - suffixBytes)
+    if (keepBytes >= curContentBytes) return
+    let cutChars = Math.min(
+      msg.content.length,
+      Math.max(120, Math.floor(msg.content.length * (keepBytes / Math.max(1, curContentBytes)))),
+    )
+    while (cutChars > 120 && utf8Bytes(msg.content.slice(0, cutChars)) > keepBytes) {
+      cutChars = Math.max(120, Math.floor(cutChars * 0.85))
+    }
+    const shrunkContent = `${msg.content.slice(0, cutChars)}${TOOL_SUFFIX}`
+    if (utf8Bytes(shrunkContent) < curContentBytes) {
+      current[idx] = { ...msg, content: shrunkContent }
+      usedBytes -= curBytes - agentMessageBytes(current[idx]!)
+    }
+  }
+
+  for (let i = 0; i < current.length && usedBytes > maxBytes; i += 1) {
+    if (i === lastToolIdx) continue
+    if (current[i]!.role === 'tool') shrinkToolAt(i)
+  }
+  if (usedBytes > maxBytes && lastToolIdx >= 0) {
+    shrinkToolAt(lastToolIdx)
+  }
+
+  // 若单轮内大量多步工具调用压缩后仍超预算，在保留首条 user 的前提下丢弃最早的 [assistant, ...tools] 原子块
+  if (usedBytes > maxBytes && current.length > 1) {
+    const headUser = current[0]!
+    const blocks: AgentMessage[][] = []
+    for (let i = 1; i < current.length; i += 1) {
+      const msg = current[i]!
+      if (msg.role === 'assistant' && msg.toolCalls && msg.toolCalls.length > 0) {
+        const blk: AgentMessage[] = [msg]
+        let j = i + 1
+        while (j < current.length && current[j]!.role === 'tool') {
+          blk.push(current[j]!)
+          j += 1
+        }
+        blocks.push(blk)
+        i = j - 1
+      } else {
+        blocks.push([msg])
+      }
+    }
+    while (blocks.length > 1 && usedBytes > maxBytes) {
+      const dropped = blocks.shift()!
+      usedBytes -= bytesOf(dropped)
+    }
+    return [headUser, ...blocks.flat()]
+  }
+
+  return current
 }
 
 interface PendingInboundBatch {
@@ -819,12 +962,18 @@ export class DirectorService {
       ...(liveSnapshot ? { liveSnapshot } : {}),
       ...(pluginSections && pluginSections.length > 0 ? { pluginSections } : {}),
     })
-    const systemTokens = estimateTextTokens(systemPrompt) + estimateTextTokens(JSON.stringify(this.tools.definitions()))
+    const toolDefsJson = JSON.stringify(this.tools.definitions())
+    const systemTokens = estimateTextTokens(systemPrompt) + estimateTextTokens(toolDefsJson)
     const historyTokenBudget = Math.max(2_048, ctxBudget.effectiveContextTokens - systemTokens)
+    const fixedPromptBytes = utf8Bytes(systemPrompt) + utf8Bytes(toolDefsJson) + 4_096
+    let runtimeByteBudget = ctxBudget.maxPromptBytes > 0
+      ? Math.max(8_192, ctxBudget.maxPromptBytes - fixedPromptBytes)
+      : undefined
     const active = this.store.activeMessages(session.id, ctxBudget.maxHistoryMessages + 24)
     const conversation = buildConversationWindow(active, {
       maxItems: ctxBudget.maxHistoryMessages,
       maxTokens: historyTokenBudget,
+      ...(runtimeByteBudget ? { maxBytes: runtimeByteBudget } : {}),
       maxToolOutputChars: ctxBudget.toolOutputHistoryChars,
     })
 
@@ -840,6 +989,8 @@ export class DirectorService {
     const maxSteps = Math.max(1, Math.min(15, cfg.maxToolSteps))
     const sessionKey = `director-${input.channel}-${input.userId}`
     let fallbackUsed = false
+    let autoShrunkForTruncation = false
+    let startEmitted = false
     let finalReply = ''
     let modelFailed = false
     /** 本轮提前中断原因：超时 / 模型失败，用于决定是否自动续跑。 */
@@ -864,17 +1015,24 @@ export class DirectorService {
 
         const allowTools = step < maxSteps
         // 满步数进入收口总结步时，临时附带系统收口指令（不落库），防止模型误以为工具未挂载或只剩 manage_task
-        const callMessages: AgentMessage[] = !allowTools && toolsUsed.length > 0
-          ? [
-              ...conversation,
-              {
-                role: 'user',
-                content: `[系统收口提示] 本轮已正常执行完成 ${toolsUsed.length} 次工具调用并拿到上述全部真实结果，现按单轮最大步数上限（${maxSteps} 步）主动关闭工具调用，进入最终中文总结阶段。绝非“工具未挂载”“仅剩 manage_task”或“运行时异常”！请仅基于上述已获结果简明汇报已完成项、尚未推进项与需要主人确认的下一步；严禁编造“工具未挂载”“unknown tool”或提及 \`manage_task\`。`,
-              },
-            ]
-          : conversation
+        let callMessages: AgentMessage[]
+        if (!allowTools && toolsUsed.length > 0) {
+          const closingMsg: AgentMessage = {
+            role: 'user',
+            content: `[系统收口提示] 本轮已正常执行完成 ${toolsUsed.length} 次工具调用并拿到上述全部真实结果，现按单轮最大步数上限（${maxSteps} 步）主动关闭工具调用，进入最终中文总结阶段。绝非“工具未挂载”“仅剩 manage_task”或“运行时异常”！请仅基于上述已获结果简明汇报已完成项、尚未推进项与需要主人确认的下一步；严禁编造“工具未挂载”“unknown tool”或提及 \`manage_task\`。`,
+          }
+          const trimmedBase = runtimeByteBudget
+            ? trimConversationToBudget(conversation, Math.max(4_096, runtimeByteBudget - agentMessageBytes(closingMsg)))
+            : conversation
+          callMessages = [...trimmedBase, closingMsg]
+        } else {
+          callMessages = runtimeByteBudget
+            ? trimConversationToBudget(conversation, runtimeByteBudget)
+            : conversation
+        }
 
-        if (step === 0) {
+        if (!startEmitted) {
+          startEmitted = true
           input.onProgress?.({ type: 'start', sessionId: session.id, model: activeModel.ref })
         }
         input.onProgress?.({
@@ -907,6 +1065,13 @@ export class DirectorService {
             const prevRef = activeModel.ref
             activeModel = alt
             ctxBudget = computeDirectorContextBudget(activeModel, cfg)
+            if (ctxBudget.maxPromptBytes > 0) {
+              const altBudget = Math.max(8_192, ctxBudget.maxPromptBytes - fixedPromptBytes)
+              runtimeByteBudget = runtimeByteBudget ? Math.min(runtimeByteBudget, altBudget) : altBudget
+            }
+            const altMessages = runtimeByteBudget
+              ? trimConversationToBudget(callMessages, runtimeByteBudget)
+              : callMessages
             this.logEvent('director.model_fallback', 'warn', `总控主模型 ${prevRef} 调用异常，自动切换备选模型 ${alt.ref}`, {
               sessionId: session.id,
               from: prevRef,
@@ -923,7 +1088,7 @@ export class DirectorService {
             result = await this.doCallTool(activeModel.target, {
               model: activeModel.model,
               system: systemPrompt,
-              messages: callMessages,
+              messages: altMessages,
               tools: allowTools ? this.tools.definitions() : [],
               maxTokens: ctxBudget.effectiveOutputTokens,
             }, {
@@ -958,9 +1123,37 @@ export class DirectorService {
           break
         }
 
-        // 若模型未发起工具调用，结束循环并输出最终回复（含满步数收口防幻觉护栏）
+        // 若模型未发起工具调用，先检查是否遭遇上游网关末尾静默截断，必要时自动缩窗重发；否则收口输出最终回复
         if (result.toolCalls.length === 0) {
           finalReply = result.text.trim()
+          const sentBytes = callMessages.reduce((sum, m) => sum + agentMessageBytes(m), 0)
+          if (
+            step === 0
+            && !autoShrunkForTruncation
+            && callMessages.length > 2
+            && sentBytes > 65_536
+            && UPSTREAM_TAIL_TRUNCATED_RE.test(finalReply)
+          ) {
+            autoShrunkForTruncation = true
+            const shrunkBudget = Math.max(32_768, Math.floor(sentBytes * 0.45))
+            runtimeByteBudget = runtimeByteBudget ? Math.min(runtimeByteBudget, shrunkBudget) : shrunkBudget
+            const shrunk = trimConversationToBudget(conversation, runtimeByteBudget)
+            conversation.splice(0, conversation.length, ...shrunk)
+            this.logEvent('director.upstream_truncation_detected', 'warn', `检测到上游网关疑似截断末尾上下文，已自动缩窗至 ${Math.round(runtimeByteBudget / 1024)}KB 并重试`, {
+              sessionId: session.id,
+              model: activeModel.ref,
+              sentBytes,
+              shrunkBudget,
+              keptMessages: conversation.length,
+            })
+            input.onProgress?.({
+              type: 'thinking',
+              step: step + 1,
+              message: '检测到上游网关截断历史上下文，正在自动精简历史后重试…',
+            })
+            step -= 1
+            continue
+          }
           if (toolsUsed.length > 0 && HALLUCINATION_RE.test(finalReply)) {
             this.logEvent('director.reply_sanitized', 'warn', '拦截总控收口幻觉回复（工具未挂载/manage_task）并已改写为真实汇总', {
               sessionId: session.id,
@@ -1914,10 +2107,10 @@ export class DirectorService {
     const resolved = this.resolveModel()
     const fallbackFound = resolved ? undefined : findModel(opts.models, opts.models.routing.worker)
     const budgetModel = resolved
-      ? { contextWindow: resolved.contextWindow, maxTokens: resolved.maxTokens }
+      ? { contextWindow: resolved.contextWindow, maxTokens: resolved.maxTokens, maxPromptKb: resolved.maxPromptKb }
       : fallbackFound
-        ? { contextWindow: fallbackFound.model.contextWindow, maxTokens: fallbackFound.model.maxTokens }
-        : { contextWindow: 128_000, maxTokens: 4_096 }
+        ? { contextWindow: fallbackFound.model.contextWindow, maxTokens: fallbackFound.model.maxTokens, maxPromptKb: fallbackFound.provider.maxPromptKb ?? 0 }
+        : { contextWindow: 128_000, maxTokens: 4_096, maxPromptKb: 0 }
     const ctxBudget = computeDirectorContextBudget(budgetModel, opts.director)
     return {
       enabled: opts.director.enabled,
@@ -1926,6 +2119,7 @@ export class DirectorService {
       contextWindowPercent: ctxBudget.contextWindowPercent,
       effectiveContextTokens: ctxBudget.effectiveContextTokens,
       effectiveOutputTokens: ctxBudget.effectiveOutputTokens,
+      ...(ctxBudget.maxPromptBytes > 0 ? { maxPromptKb: Math.round(ctxBudget.maxPromptBytes / 1024) } : {}),
       notifyScope: opts.director.notifyScope,
       confirmHighRisk: opts.director.confirmHighRisk,
       sessions: this.store.listSessions().length,
@@ -2080,7 +2274,7 @@ export class DirectorService {
     return lines.join('\n')
   }
 
-  private resolveModel(): { provider: string; model: string; ref: string; contextWindow: number; maxTokens: number; target: ModelTarget } | undefined {
+  private resolveModel(): { provider: string; model: string; ref: string; contextWindow: number; maxTokens: number; maxPromptKb: number; target: ModelTarget } | undefined {
     const opts = this.deps.options.get()
     const preferred: ModelRef = opts.director.model ?? opts.models.routing.worker
     const found = findModel(opts.models, preferred, { enabledOnly: true })
@@ -2093,6 +2287,7 @@ export class DirectorService {
       ref: formatRef({ provider: provider.id, model: model.id }),
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
+      maxPromptKb: provider.maxPromptKb ?? 0,
       target: {
         api: provider.api,
         baseUrl: provider.baseUrl,
@@ -2103,7 +2298,7 @@ export class DirectorService {
   }
 
   /** 主总控模型上游故障时，优先跨服务商挑选可用模型兜底重试，规避单点网关故障；若无其他服务商则回落同服务商其他模型。 */
-  private resolveFallbackModel(excludeRef: string): { provider: string; model: string; ref: string; contextWindow: number; maxTokens: number; target: ModelTarget } | undefined {
+  private resolveFallbackModel(excludeRef: string): { provider: string; model: string; ref: string; contextWindow: number; maxTokens: number; maxPromptKb: number; target: ModelTarget } | undefined {
     const opts = this.deps.options.get()
     const excludeProvider = parseRef(excludeRef)?.provider
     const toTarget = (
@@ -2116,6 +2311,7 @@ export class DirectorService {
       ref,
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
+      maxPromptKb: provider.maxPromptKb ?? 0,
       target: {
         api: provider.api,
         baseUrl: provider.baseUrl,
@@ -2203,18 +2399,38 @@ export class DirectorService {
     const msgTokens = active.map(m => (
       estimateTextTokens(m.content) + (m.toolCalls ? estimateTextTokens(JSON.stringify(m.toolCalls)) : 0) + 12
     ))
+    const msgBytes = active.map(m => (
+      utf8Bytes(m.content) + (m.toolCalls ? utf8Bytes(JSON.stringify(m.toolCalls)) : 0) + 192
+    ))
     const totalTokens = msgTokens.reduce((sum, n) => sum + n, 0)
+    const totalBytes = msgBytes.reduce((sum, n) => sum + n, 0)
+    const compactTriggerBytes = ctxBudget.maxPromptBytes > 0
+      ? Math.max(16_384, Math.floor(ctxBudget.maxPromptBytes * 0.75))
+      : 0
+    const compactKeepBytes = ctxBudget.maxPromptBytes > 0
+      ? Math.max(8_192, Math.floor(ctxBudget.maxPromptBytes * 0.35))
+      : 0
     const triggerByCount = active.length >= Math.max(COMPACT_TRIGGER_MESSAGES, ctxBudget.maxHistoryMessages)
     const triggerByTokens = totalTokens >= ctxBudget.compactTriggerTokens
-    if (!triggerByCount && !triggerByTokens) return
+    const triggerByBytes = compactTriggerBytes > 0 && totalBytes >= compactTriggerBytes
+    if (!triggerByCount && !triggerByTokens && !triggerByBytes) return
 
-    // 从尾部反向累加 Token 至 compactKeepTokens（且不少于 COMPACT_KEEP_TAIL 条）
+    // 从尾部反向累加 Token/字节至保留上限（按字节触发且消息较少时允许保留最少 4 条以确保可切分）
     let keepTokens = 0
+    let keepBytes = 0
     let keepTail = 0
+    const minKeepTail = triggerByBytes && !triggerByCount && !triggerByTokens ? 4 : COMPACT_KEEP_TAIL
     for (let i = active.length - 1; i >= 0; i -= 1) {
       const mt = msgTokens[i]!
-      if (keepTail >= COMPACT_KEEP_TAIL && keepTokens + mt > ctxBudget.compactKeepTokens) break
+      const mb = msgBytes[i]!
+      if (
+        keepTail >= minKeepTail
+        && (keepTokens + mt > ctxBudget.compactKeepTokens || (compactKeepBytes > 0 && keepBytes + mb > compactKeepBytes))
+      ) {
+        break
+      }
       keepTokens += mt
+      keepBytes += mb
       keepTail += 1
     }
     const cutIndex = findSafeCompactCutIndex(active, keepTail)
@@ -2228,15 +2444,23 @@ export class DirectorService {
         if (!curSession) return
         if (!this.checkBudget().ok) return
 
-        const maxArchiveChars = Math.max(8_000, Math.floor(ctxBudget.effectiveContextTokens * 0.5))
+        const maxArchiveChars = ctxBudget.maxPromptBytes > 0
+          ? Math.min(Math.max(8_000, Math.floor(ctxBudget.effectiveContextTokens * 0.5)), Math.max(4_000, Math.floor(ctxBudget.maxPromptBytes * 0.28)))
+          : Math.max(8_000, Math.floor(ctxBudget.effectiveContextTokens * 0.5))
+        const maxArchiveBytes = ctxBudget.maxPromptBytes > 0
+          ? Math.max(4_096, Math.floor(ctxBudget.maxPromptBytes * 0.55) - utf8Bytes(curSession.summary || '') - 4_096)
+          : Number.POSITIVE_INFINITY
         const lines: string[] = []
         let usedChars = 0
+        let usedBytes = 0
         for (const m of toArchive) {
           if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'event') continue
           const line = `${m.role === 'user' ? '用户' : m.role === 'event' ? '事件' : '助手'}：${m.content.slice(0, 800)}`
-          if (usedChars + line.length > maxArchiveChars) break
+          const lb = utf8Bytes(line) + 1
+          if (usedChars + line.length > maxArchiveChars || usedBytes + lb > maxArchiveBytes) break
           lines.push(line)
           usedChars += line.length + 1
+          usedBytes += lb
         }
         const transcript = lines.join('\n')
         const prompt = [
