@@ -122,7 +122,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
 ])
 
-const RETRYABLE_ERROR_TEXT = /fetch failed|socket hang up|other side closed|terminated|network socket disconnected|unexpected eof|econnreset|etimedout|epipe/i
+const RETRYABLE_ERROR_TEXT = /fetch failed|socket hang up|other side closed|terminated|network socket disconnected|unexpected eof|econnreset|etimedout|epipe|upstream response aborted|closed prematurely|premature close|connection reset|tls|ssl|handshake/i
 
 const CONTENT_FILTER_TEXT = /blocked by gemini'?s filters|PROHIBITED_CONTENT|HARM_CATEGORY|content_filter|finish_reason["':\s]+["']?content_filter|blockReason["':\s]+["']?(SAFETY|PROHIBITED_CONTENT)/i
 
@@ -168,7 +168,7 @@ export function retryBackoffMs(attempt: number, baseDelayMs: number, retryAfterH
     const sec = Number(retryAfterHeader.trim())
     if (Number.isFinite(sec) && sec > 0) return Math.min(10_000, Math.round(sec * 1000))
   }
-  const exp = Math.min(6_000, baseDelayMs * (2 ** attempt))
+  const exp = Math.min(15_000, baseDelayMs * (2 ** attempt))
   return Math.max(0, Math.round(exp * (0.85 + Math.random() * 0.3)))
 }
 

@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { nextCronTime, parseCron, previewCronTimes } from '../src/scheduler/cron.ts'
 import { SchedulerStore } from '../src/scheduler/store.ts'
 import { SchedulerService } from '../src/scheduler/service.ts'
+import { ContractStore } from '../src/contracts/store.ts'
 import { EventLog } from '../src/ledger/events.ts'
 import { parseConfig } from '../src/config.ts'
 import { createRuntime, type Runtime } from '../src/runtime.ts'
@@ -162,6 +163,45 @@ describe('SchedulerService execution modes', () => {
     expect(r4.status).toBe('changed')
     expect(dispatched[1]).toContain('状态码异常')
     expect(alerts).toHaveLength(0) // 配置了 onChangePrompt 优先走自动处理
+  })
+
+  it('syncs existing ContractStore goal when updating a director_prompt schedule prompt', () => {
+    const db = new DatabaseSync(':memory:')
+    const store = new SchedulerStore(db)
+    const events = new EventLog(db)
+    const contracts = new ContractStore(db)
+    let now = new Date('2026-11-24T08:00:00.000Z')
+    const svc = new SchedulerService({
+      store,
+      events,
+      contracts,
+      isPaused: () => false,
+      now: () => now,
+      dispatchTicket: async () => ({ ticketId: 't_1', triggerId: 'tr_1' }),
+    })
+
+    const sched = svc.create({
+      name: '每小时小说巡检',
+      triggerKind: 'interval',
+      intervalSec: 3600,
+      actionKind: 'director_prompt',
+      actionConfig: { prompt: '盯紧第3弧《初入宗门》进度，如有卡死及时唤醒' },
+    })
+    contracts.save({
+      targetKind: 'schedule',
+      targetId: sched.id,
+      goal: '盯紧第3弧《初入宗门》进度，如有卡死及时唤醒',
+    }, now)
+
+    now = new Date('2026-11-24T09:00:00.000Z')
+    svc.update(sched.id, {
+      actionConfig: { prompt: '改为盯紧第5弧《宗门大比》并自动精修超长章节' },
+    })
+
+    const synced = contracts.get('schedule', sched.id)
+    expect(synced?.goal).toBe('改为盯紧第5弧《宗门大比》并自动精修超长章节')
+    expect(synced?.version).toBe(2)
+    expect(synced?.amendmentReason).toContain('自动同步')
   })
 })
 

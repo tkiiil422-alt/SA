@@ -431,7 +431,7 @@ export class NovelService {
    * Rewrite one committed chapter's prose from a person's note, in the background. Facts stay as recorded (the prompt
    * forbids changing them), so the canon and later chapters are untouched; the old text is kept for undo.
    */
-  editChapter(bookId: string, n: number, note: string): ChapterEdit {
+  editChapter(bookId: string, n: number, note: string, opts?: { allowShorten?: boolean }): ChapterEdit {
     this.requireEnabled()
     const files = this.requireBook(bookId)
     const text = files.readChapter(n)
@@ -445,11 +445,11 @@ export class NovelService {
     this.options.db.prepare(`INSERT INTO novel_edits (id, book_id, n, status, note, old_text, created_at, updated_at)
       VALUES (?, ?, ?, 'running', ?, ?, ?, ?)`).run(id, bookId, n, clean, text, at, at)
     this.drafting.add(id)
-    void this.runEdit(id, bookId, n, clean, text).finally(() => this.drafting.delete(id))
+    void this.runEdit(id, bookId, n, clean, text, opts).finally(() => this.drafting.delete(id))
     return this.lastEdit(bookId, n)!
   }
 
-  private async runEdit(id: string, bookId: string, n: number, note: string, text: string): Promise<void> {
+  private async runEdit(id: string, bookId: string, n: number, note: string, text: string, opts?: { allowShorten?: boolean }): Promise<void> {
     const files = this.files(bookId)
     const book = files.readBook()
     const summary = files.readSummary<ChapterSummary>(n)
@@ -481,7 +481,10 @@ export class NovelService {
       if (!result?.ok || !result.text.trim()) { fail(`模型调用失败：${result?.error ?? result?.status ?? ''}`); return }
       if (result.truncated) { fail('改稿被截断，原稿没有动。'); return }
       const after = countChars(result.text)
-      if (after < countChars(text) * 0.75 || after < book.chapterChars[0] * 0.75) { fail(`改稿只有 ${after} 字，比原稿短太多，原稿没有动。`); return }
+      const minAllowed = Math.floor(book.chapterChars[0] * 0.75)
+      const effectiveBefore = Math.min(countChars(text), Math.round(book.chapterChars[1] * 1.15))
+      const minFromOriginal = opts?.allowShorten ? minAllowed : Math.floor(effectiveBefore * 0.75)
+      if (after < minAllowed || after < minFromOriginal) { fail(`改稿只有 ${after} 字，比原稿短太多，原稿没有动。`); return }
       const fresh = normalizeDraft(result.text, summary?.title ?? `第${n}章`).text
       this.applyText(bookId, n, fresh)
       this.options.db.prepare("UPDATE novel_edits SET status = 'done', new_text = ?, cost_usd = ?, error = NULL, updated_at = ? WHERE id = ?")

@@ -7,7 +7,7 @@
  * - 自动滑动窗口 + 异步滚动摘要压缩
  */
 import type { AdminHost } from '../admin/host.ts'
-import { findModel, formatRef, type DirectorOptions, type ModelRef, type OptionsStore } from '../admin/options.ts'
+import { findModel, formatRef, parseRef, type DirectorOptions, type ModelRef, type OptionsStore } from '../admin/options.ts'
 import { callModel, type ModelTarget } from '../assessor/model-call.ts'
 import { costOf } from '../gateway/pricing.ts'
 import type { Usage } from '../gateway/usage.ts'
@@ -17,7 +17,7 @@ import { callToolModel, type AgentMessage, type ToolCall } from './llm.ts'
 import { buildDirectorSystemPrompt } from './prompt.ts'
 import { redactPendingAction, redactToolCallArgs } from './settings-patch.ts'
 import { DirectorStore, type DirectorChannel, type DirectorFollowup, type DirectorMessage, type DirectorSession, type FollowupTriggerKind, type PendingAction, type SessionListItem } from './store.ts'
-import { DirectorToolExecutor, type DirectorToolsDeps } from './tools.ts'
+import { DirectorToolExecutor, type DirectorToolsDeps, type ToolRunResult } from './tools.ts'
 import type { DirectorProgressEvent } from '../shared/api-types.ts'
 import {
   buildPendingActionCard,
@@ -161,6 +161,46 @@ function isReadOnlyToolCall(tc: ToolCall): boolean {
   return false
 }
 
+/** 归一化只读轮询输出中的易变遥测字段，避免 uptimeSec / calls 等变化掩盖实质空轮询。 */
+function normalizePollOutput(text: string): string {
+  return text
+    .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g, '<TS>')
+    .replace(/"(?:calls|uptimeSec|latencyMs|promptTokens|completionTokens|freeMemMb)":\s*\d+/g, '"<N>":0')
+    .replace(/"costUsd":\s*[0-9.]+/g, '"costUsd":0')
+    .replace(/"loadAvg":\s*\[[^\]]*\]/g, '"loadAvg":[]')
+}
+
+const HALLUCINATION_RE = /工具未挂载|未挂载.{0,24}(?:工具|host_ops|platform_query|subsystem_action|dispatch_ticket)|unknown\s+tool|manage_task/i
+
+/** 计算不会拆散 `assistant(toolCalls)` 与配对 `tool` 消息的安全压缩切分下标（未找到则返回 -1）。 */
+export function findSafeCompactCutIndex(active: readonly DirectorMessage[], keepTail: number): number {
+  let cutIndex = active.length - keepTail
+  if (cutIndex <= 4) return -1
+  while (cutIndex > 4) {
+    const cur = active[cutIndex]!
+    const prev = active[cutIndex - 1]!
+    const safeStart = cur.role === 'user' || cur.role === 'event'
+    const prevClean = prev.role !== 'assistant' || !prev.toolCalls || prev.toolCalls.length === 0
+    if (safeStart && prevClean) return cutIndex
+    cutIndex -= 1
+  }
+  return -1
+}
+
+function buildToolAuditFallbackSummary(toolsUsed: readonly DirectorToolAudit[], maxSteps: number, reasonText: string): string {
+  const recent = toolsUsed.slice(-10).map((t, idx) => {
+    const act = typeof t.args.action === 'string' && t.args.action ? `(${t.args.action})` : ''
+    const status = t.ok ? '✅' : '❌'
+    return `${idx + 1}. ${status} \`${t.name}${act}\`：${safeSummary(t.summary || (t.ok ? '已完成' : '失败'), 120)}`
+  })
+  return [
+    `本轮已执行完成 ${toolsUsed.length} 次工具调用${toolsUsed.length >= maxSteps ? `（已达单轮 ${maxSteps} 步上限自动收口）` : ''}，${reasonText}：`,
+    ...recent,
+    '',
+    '如需继续推进剩余事项，请直接回复具体要求或「继续」。',
+  ].join('\n')
+}
+
 function safeSummary(text: string, max = 140): string {
   const one = text.replace(/\s+/g, ' ').trim()
   return one.length <= max ? one : `${one.slice(0, max - 1)}…`
@@ -246,6 +286,7 @@ export class DirectorService {
   private readonly doNow: () => Date
   private readonly debounceMap = new Map<string, PendingInboundBatch>()
   private readonly userQueues = new Map<string, Promise<void>>()
+  private readonly activeTurns = new Set<string>()
   private readonly compacting = new Set<string>()
   private readonly cardActionLocks = new Set<string>()
   private readonly resumeTimers = new Map<string, ReturnType<typeof setTimeout>>()
@@ -681,251 +722,340 @@ export class DirectorService {
     let interruptedBy: 'deadline' | 'model_failed' | undefined
     let lastModelError = ''
     let toolsUnsupportedHit = false
+    const readOnlyPollMap = new Map<string, { totalCount: number; sameOutputCount: number; lastNormalizedOutput: string }>()
 
-    for (let step = 0; step <= maxSteps; step += 1) {
-      if (input.signal?.aborted) {
-        finalReply = '已按你的操作中止本轮推理。'
-        break
-      }
-      const remainingMs = deadline - Date.now()
-      if (remainingMs < 3_000) {
-        interruptedBy = 'deadline'
-        finalReply = '本次排查调用耗时较长已达上限，以上已获取部分信息。'
-        break
-      }
-
-      const allowTools = step < maxSteps
-      if (step === 0) {
-        input.onProgress?.({ type: 'start', sessionId: session.id, model: activeModel.ref })
-      }
-      input.onProgress?.({
-        type: 'thinking',
-        step: step + 1,
-        message: step === 0 ? '正在结合实时态势、项目背景与长期偏好理解需求…' : `第 ${step + 1} 轮综合工具结果继续研判…`,
-      })
-      let result = await this.doCallTool(activeModel.target, {
-        model: activeModel.model,
-        system: systemPrompt,
-        messages: conversation,
-        tools: allowTools ? this.tools.definitions() : [],
-        maxTokens: Math.min(4096, activeModel.maxTokens),
-      }, {
-        timeoutMs: Math.min(stepTimeoutMs, remainingMs),
-        sessionId: sessionKey,
-        stream: true,
-        cacheTtl: '5m',
-        maxRetries,
-        firstByteTimeoutMs,
-      })
-
-      this.recordUsage(activeModel.provider, activeModel.model, result.status ?? 0, result.usage, result.latencyMs)
-
-      // 故障自动备选模型降级：主模型上游报错/超时且非工具不兼容时，自动切换另一已启用模型重试本步
-      if (!result.ok && !result.toolsUnsupported && !fallbackUsed && !input.signal?.aborted) {
-        const alt = this.resolveFallbackModel(activeModel.ref)
-        if (alt) {
-          fallbackUsed = true
-          const prevRef = activeModel.ref
-          activeModel = alt
-          this.logEvent('director.model_fallback', 'warn', `总控主模型 ${prevRef} 调用异常，自动切换备选模型 ${alt.ref}`, {
-            sessionId: session.id,
-            from: prevRef,
-            to: alt.ref,
-            error: (result.error ?? '').slice(0, 120),
-          })
-          input.onProgress?.({
-            type: 'thinking',
-            step: step + 1,
-            message: `主模型 ${prevRef} 响应异常，已自动切换至备选模型 ${alt.ref} 继续处理…`,
-          })
-          // 备选模型拥有独立的完整重试额度与单步时间预算（不再被主模型重试耗尽的时间挤占，也不再硬限 2 次）
-          deadline = Math.max(deadline, Date.now() + stepTimeoutMs + 60_000)
-          result = await this.doCallTool(activeModel.target, {
-            model: activeModel.model,
-            system: systemPrompt,
-            messages: conversation,
-            tools: allowTools ? this.tools.definitions() : [],
-            maxTokens: Math.min(4096, activeModel.maxTokens),
-          }, {
-            timeoutMs: stepTimeoutMs,
-            sessionId: `${sessionKey}-fb`,
-            stream: true,
-            cacheTtl: '5m',
-            maxRetries,
-            firstByteTimeoutMs,
-          })
-          this.recordUsage(activeModel.provider, activeModel.model, result.status ?? 0, result.usage, result.latencyMs)
+    this.activeTurns.add(session.id)
+    try {
+      for (let step = 0; step <= maxSteps; step += 1) {
+        if (input.signal?.aborted) {
+          finalReply = '已按你的操作中止本轮推理。'
+          break
         }
-      }
+        const remainingMs = deadline - Date.now()
+        if (remainingMs < 3_000) {
+          interruptedBy = 'deadline'
+          finalReply = '本次排查调用耗时较长已达上限，以上已获取部分信息。'
+          break
+        }
 
-      if (!result.ok) {
-        modelFailed = true
-        lastModelError = result.error ?? ''
-        toolsUnsupportedHit = Boolean(result.toolsUnsupported)
-        this.logEvent('director.model_failed', 'warn', `总控模型调用失败（${activeModel.ref}）：${(result.error ?? '未知错误').slice(0, 120)}`, {
-          sessionId: session.id,
-          model: activeModel.ref,
+        const allowTools = step < maxSteps
+        // 满步数进入收口总结步时，临时附带系统收口指令（不落库），防止模型误以为工具未挂载或只剩 manage_task
+        const callMessages: AgentMessage[] = !allowTools && toolsUsed.length > 0
+          ? [
+              ...conversation,
+              {
+                role: 'user',
+                content: `[系统收口提示] 本轮已正常执行完成 ${toolsUsed.length} 次工具调用并拿到上述全部真实结果，现按单轮最大步数上限（${maxSteps} 步）主动关闭工具调用，进入最终中文总结阶段。绝非“工具未挂载”“仅剩 manage_task”或“运行时异常”！请仅基于上述已获结果简明汇报已完成项、尚未推进项与需要主人确认的下一步；严禁编造“工具未挂载”“unknown tool”或提及 \`manage_task\`。`,
+              },
+            ]
+          : conversation
+
+        if (step === 0) {
+          input.onProgress?.({ type: 'start', sessionId: session.id, model: activeModel.ref })
+        }
+        input.onProgress?.({
+          type: 'thinking',
           step: step + 1,
-          status: result.status ?? 0,
-          latencyMs: result.latencyMs,
+          message: step === 0 ? '正在结合实时态势、项目背景与长期偏好理解需求…' : `第 ${step + 1} 轮综合工具结果继续研判…`,
         })
-        if (result.toolsUnsupported) {
-          finalReply = `当前总控模型（${activeModel.ref}）的上游接口不支持原生工具调用（Function Calling）。请在后台「设置 → 总控助手」切换一个支持工具调用的模型（如 Claude、Gemini 或 DeepSeek 官方/兼容接口）。`
-        } else {
-          interruptedBy = 'model_failed'
-          finalReply = `调用总控模型（${activeModel.ref}）失败：${result.error ?? '未知错误'}。`
+        let result = await this.doCallTool(activeModel.target, {
+          model: activeModel.model,
+          system: systemPrompt,
+          messages: callMessages,
+          tools: allowTools ? this.tools.definitions() : [],
+          maxTokens: Math.min(4096, activeModel.maxTokens),
+        }, {
+          timeoutMs: Math.min(stepTimeoutMs, remainingMs),
+          sessionId: sessionKey,
+          stream: true,
+          cacheTtl: '5m',
+          maxRetries,
+          firstByteTimeoutMs,
+        })
+
+        this.recordUsage(activeModel.provider, activeModel.model, result.status ?? 0, result.usage, result.latencyMs)
+
+        // 故障自动备选模型降级：主模型上游报错/超时且非工具不兼容时，自动切换另一已启用模型重试本步
+        if (!result.ok && !result.toolsUnsupported && !fallbackUsed && !input.signal?.aborted) {
+          const alt = this.resolveFallbackModel(activeModel.ref)
+          if (alt) {
+            fallbackUsed = true
+            const prevRef = activeModel.ref
+            activeModel = alt
+            this.logEvent('director.model_fallback', 'warn', `总控主模型 ${prevRef} 调用异常，自动切换备选模型 ${alt.ref}`, {
+              sessionId: session.id,
+              from: prevRef,
+              to: alt.ref,
+              error: (result.error ?? '').slice(0, 120),
+            })
+            input.onProgress?.({
+              type: 'thinking',
+              step: step + 1,
+              message: `主模型 ${prevRef} 响应异常，已自动切换至备选模型 ${alt.ref} 继续处理…`,
+            })
+            // 备选模型拥有独立的完整重试额度与单步时间预算（不再被主模型重试耗尽的时间挤占，也不再硬限 2 次）
+            deadline = Math.max(deadline, Date.now() + stepTimeoutMs + 60_000)
+            result = await this.doCallTool(activeModel.target, {
+              model: activeModel.model,
+              system: systemPrompt,
+              messages: callMessages,
+              tools: allowTools ? this.tools.definitions() : [],
+              maxTokens: Math.min(4096, activeModel.maxTokens),
+            }, {
+              timeoutMs: stepTimeoutMs,
+              sessionId: `${sessionKey}-fb`,
+              stream: true,
+              cacheTtl: '5m',
+              maxRetries,
+              firstByteTimeoutMs,
+            })
+            this.recordUsage(activeModel.provider, activeModel.model, result.status ?? 0, result.usage, result.latencyMs)
+          }
         }
-        break
+
+        if (!result.ok) {
+          modelFailed = true
+          lastModelError = result.error ?? ''
+          toolsUnsupportedHit = Boolean(result.toolsUnsupported)
+          this.logEvent('director.model_failed', 'warn', `总控模型调用失败（${activeModel.ref}）：${(result.error ?? '未知错误').slice(0, 120)}`, {
+            sessionId: session.id,
+            model: activeModel.ref,
+            step: step + 1,
+            status: result.status ?? 0,
+            latencyMs: result.latencyMs,
+          })
+          if (result.toolsUnsupported) {
+            finalReply = `当前总控模型（${activeModel.ref}）的上游接口不支持原生工具调用（Function Calling）。请在后台「设置 → 总控助手」切换一个支持工具调用的模型（如 Claude、Gemini 或 DeepSeek 官方/兼容接口）。`
+          } else {
+            interruptedBy = 'model_failed'
+            finalReply = `调用总控模型（${activeModel.ref}）失败：${result.error ?? '未知错误'}。`
+          }
+          break
+        }
+
+        // 若模型未发起工具调用，结束循环并输出最终回复（含满步数收口防幻觉护栏）
+        if (result.toolCalls.length === 0) {
+          finalReply = result.text.trim()
+          if (toolsUsed.length > 0 && HALLUCINATION_RE.test(finalReply)) {
+            this.logEvent('director.reply_sanitized', 'warn', '拦截总控收口幻觉回复（工具未挂载/manage_task）并已改写为真实汇总', {
+              sessionId: session.id,
+              model: activeModel.ref,
+              toolsCount: toolsUsed.length,
+            })
+            finalReply = buildToolAuditFallbackSummary(toolsUsed, maxSteps, '真实执行进展汇总如下')
+          }
+          if (!finalReply) {
+            finalReply = toolsUsed.length > 0
+              ? buildToolAuditFallbackSummary(toolsUsed, maxSteps, '模型未补充总结文字，真实进展汇总如下')
+              : '已完成检查，但模型未返回文字说明，请补充告诉我你最关注哪部分。'
+          }
+          break
+        }
+
+        // 满步数步若仍返回 toolCalls，不再执行工具，直接收口输出真实汇总
+        if (!allowTools) {
+          finalReply = result.text.trim()
+          if (!finalReply || (toolsUsed.length > 0 && HALLUCINATION_RE.test(finalReply))) {
+            if (HALLUCINATION_RE.test(finalReply)) {
+              this.logEvent('director.reply_sanitized', 'warn', '拦截总控收口幻觉回复（工具未挂载/manage_task）并已改写为真实汇总', {
+                sessionId: session.id,
+                model: activeModel.ref,
+                toolsCount: toolsUsed.length,
+              })
+            }
+            finalReply = buildToolAuditFallbackSummary(toolsUsed, maxSteps, '真实执行进展汇总如下')
+          }
+          break
+        }
+
+        // 执行模型请求的工具调用，并持久化脱敏后的中间轨迹用于审计与连续记忆
+        const assistantCalls: ToolCall[] = result.toolCalls
+        const sanitizedCalls: ToolCall[] = assistantCalls.map(tc => ({
+          ...tc,
+          arguments: redactToolCallArgs(tc.name, tc.arguments),
+        }))
+        this.store.addMessage({
+          sessionId: session.id,
+          role: 'assistant',
+          content: result.text.trim(),
+          toolCalls: sanitizedCalls,
+          meta: { model: activeModel.ref, step: step + 1 },
+        })
+        conversation.push({ role: 'assistant', content: result.text.trim(), toolCalls: sanitizedCalls })
+
+        const pollKeyOf = (tc: ToolCall): string => {
+          const act = typeof tc.arguments.action === 'string' ? tc.arguments.action.trim() : ''
+          const params = typeof tc.arguments.params_json === 'string' ? tc.arguments.params_json.trim() : JSON.stringify(tc.arguments ?? {})
+          return `${tc.name}:${act}:${params}`
+        }
+
+        // 多个纯只读工具调用并发加速执行；包含任何写/派单/高危动作则严格串行执行保证顺序与一致性
+        const allReadOnly = assistantCalls.length > 1 && assistantCalls.every(isReadOnlyToolCall)
+        const execOne = async (idx: number) => {
+          const tc = assistantCalls[idx]!
+          const safeArgs = sanitizedCalls[idx]!.arguments
+          const actName = typeof safeArgs.action === 'string' ? safeArgs.action : undefined
+          const readOnly = isReadOnlyToolCall(tc)
+          const pKey = readOnly ? pollKeyOf(tc) : ''
+          const prevPoll = readOnly ? readOnlyPollMap.get(pKey) : undefined
+          input.onProgress?.({
+            type: 'tool_start',
+            step: step + 1,
+            name: tc.name,
+            ...(actName ? { action: actName } : {}),
+            summary: `执行 ${tc.name}${actName ? `(${actName})` : ''}`,
+          })
+          if (readOnly && prevPoll && (prevPoll.sameOutputCount >= 2 || prevPoll.totalCount >= 3)) {
+            prevPoll.totalCount += 1
+            prevPoll.sameOutputCount += 1
+            const blockedOutput = '[已拦截重复空轮询] 你在同一轮内已连续 3 次以上查询完全相同的接口，后台异步任务不会在数秒内完成。本调用已跳过以节省步数，请立即停止查询，直接基于已有结果向主人汇总！'
+            const sum = safeSummary(blockedOutput, 160)
+            input.onProgress?.({
+              type: 'tool_done',
+              step: step + 1,
+              name: tc.name,
+              ...(actName ? { action: actName } : {}),
+              ok: true,
+              ms: 0,
+              summary: sum,
+            })
+            return { tc, safeArgs, runRes: { ok: true, output: blockedOutput } as ToolRunResult, ms: 0, sum, shortCircuited: true, readOnly, pKey }
+          }
+          const t0 = Date.now()
+          const runRes = await this.tools.run(tc.name, tc.arguments, {
+            session: this.store.getSession(session.id) ?? session,
+            confirmHighRisk: cfg.confirmHighRisk,
+          })
+          const ms = Date.now() - t0
+          const sum = safeSummary(runRes.output, 160)
+          input.onProgress?.({
+            type: 'tool_done',
+            step: step + 1,
+            name: tc.name,
+            ...(actName ? { action: actName } : {}),
+            ok: runRes.ok,
+            ms,
+            summary: sum,
+            ...(runRes.pendingActionId ? { pendingActionId: runRes.pendingActionId } : {}),
+          })
+          return { tc, safeArgs, runRes, ms, sum, shortCircuited: false, readOnly, pKey }
+        }
+
+        const outcomes = allReadOnly
+          ? await Promise.all(assistantCalls.map((_, idx) => execOne(idx)))
+          : await (async () => {
+              const list: Awaited<ReturnType<typeof execOne>>[] = []
+              for (let i = 0; i < assistantCalls.length; i += 1) {
+                list.push(await execOne(i))
+              }
+              return list
+            })()
+
+        for (const item of outcomes) {
+          if (!item.readOnly) {
+            readOnlyPollMap.clear()
+          } else if (!item.shortCircuited) {
+            const normOut = normalizePollOutput(item.runRes.output)
+            const prev = readOnlyPollMap.get(item.pKey)
+            if (prev && prev.lastNormalizedOutput === normOut) {
+              prev.totalCount += 1
+              prev.sameOutputCount += 1
+              item.runRes.output += '\n\n[防空轮询提示] 该只读查询结果与刚才完全一致（后台异步任务仍在执行中），请勿在本轮重复空轮询，请直接向主人汇报进展或用 followup_set/定时巡检跟踪后续完成状态。'
+              item.sum = safeSummary(item.runRes.output, 160)
+            } else if (prev) {
+              prev.totalCount += 1
+              prev.sameOutputCount = 1
+              prev.lastNormalizedOutput = normOut
+            } else {
+              readOnlyPollMap.set(item.pKey, { totalCount: 1, sameOutputCount: 1, lastNormalizedOutput: normOut })
+            }
+          }
+
+          const { tc, safeArgs, runRes, ms, sum } = item
+          toolsUsed.push({
+            name: tc.name,
+            args: safeArgs,
+            ok: runRes.ok,
+            ms,
+            summary: sum,
+            ...(runRes.pendingActionId ? { pendingActionId: runRes.pendingActionId } : {}),
+          })
+          this.store.addMessage({
+            sessionId: session.id,
+            role: 'tool',
+            toolCallId: tc.id,
+            toolName: tc.name,
+            content: runRes.output,
+            meta: { ok: runRes.ok, ms, ...(runRes.pendingActionId ? { pendingActionId: runRes.pendingActionId } : {}) },
+          })
+          conversation.push({
+            role: 'tool',
+            toolCallId: tc.id,
+            name: tc.name,
+            content: runRes.output,
+            isError: !runRes.ok,
+          })
+        }
       }
 
-      // 若模型未发起工具调用，结束循环并输出最终回复
-      if (result.toolCalls.length === 0) {
-        finalReply = result.text.trim()
-        if (!finalReply) finalReply = '已完成检查，但模型未返回文字说明，请补充告诉我你最关注哪部分。'
-        break
+      // 本轮因超时或模型上游故障中断时，自动排队续跑（用户无需重发），避免「派发的任务没有后续」
+      const resumeDepth = input.autoTrigger?.resumeDepth ?? 0
+      const resumable = interruptedBy !== undefined
+        && !toolsUnsupportedHit
+        && !input.signal?.aborted
+        && cfg.enabled
+        && !this.closed
+        && (!input.autoTrigger || input.autoTrigger.eventKind === 'turn_resume')
+      let resumeScheduled = false
+      if (resumable && interruptedBy) {
+        if (resumeDepth < MAX_TURN_RESUMES) {
+          const nextDepth = resumeDepth + 1
+          const delayMs = interruptedBy === 'model_failed' ? Math.min(120_000, 30_000 * nextDepth) : 2_000
+          this.scheduleTurnResume({
+            sessionId: session.id,
+            reason: interruptedBy,
+            depth: nextDepth,
+            delayMs,
+            errorText: lastModelError,
+            doneTools: toolsUsed.map(t => `${t.name}${typeof t.args.action === 'string' ? `(${t.args.action})` : ''}:${t.ok ? 'ok' : 'err'}`),
+          })
+          resumeScheduled = true
+          finalReply += interruptedBy === 'model_failed'
+            ? `已安排 ${Math.round(delayMs / 1000)} 秒后自动重试（第 ${nextDepth}/${MAX_TURN_RESUMES} 次），无需你重发，成功后会直接汇报。`
+            : `我已自动在后台续跑剩余步骤（第 ${nextDepth}/${MAX_TURN_RESUMES} 次），完成后会直接向你汇报，无需重发。`
+        } else {
+          finalReply += interruptedBy === 'model_failed'
+            ? `已自动重试 ${MAX_TURN_RESUMES} 轮仍未恢复。你可以稍后重试，或发 /状态 查看实时面板。`
+            : '已多轮自动续跑仍未收敛，请告诉我优先要完成的那一项，我会聚焦推进。'
+        }
       }
 
-      // 执行模型请求的工具调用，并持久化脱敏后的中间轨迹用于审计与连续记忆
-      const assistantCalls: ToolCall[] = result.toolCalls
-      const sanitizedCalls: ToolCall[] = assistantCalls.map(tc => ({
-        ...tc,
-        arguments: redactToolCallArgs(tc.name, tc.arguments),
-      }))
+      const safeReply = `${missedPrefix}${this.deps.redact(finalReply)}`
       this.store.addMessage({
         sessionId: session.id,
         role: 'assistant',
-        content: result.text.trim(),
-        toolCalls: sanitizedCalls,
-        meta: { model: activeModel.ref, step: step + 1 },
+        content: safeReply,
+        meta: {
+          model: activeModel.ref,
+          toolsCount: toolsUsed.length,
+          tools: toolsUsed.map(t => ({ name: t.name, ok: t.ok, ms: t.ms })),
+        },
       })
-      conversation.push({ role: 'assistant', content: result.text.trim(), toolCalls: sanitizedCalls })
 
-      // 多个纯只读工具调用并发加速执行；包含任何写/派单/高危动作则严格串行执行保证顺序与一致性
-      const allReadOnly = assistantCalls.length > 1 && assistantCalls.every(isReadOnlyToolCall)
-      const execOne = async (idx: number) => {
-        const tc = assistantCalls[idx]!
-        const safeArgs = sanitizedCalls[idx]!.arguments
-        const actName = typeof safeArgs.action === 'string' ? safeArgs.action : undefined
-        input.onProgress?.({
-          type: 'tool_start',
-          step: step + 1,
-          name: tc.name,
-          ...(actName ? { action: actName } : {}),
-          summary: `执行 ${tc.name}${actName ? `(${actName})` : ''}`,
-        })
-        const t0 = Date.now()
-        const runRes = await this.tools.run(tc.name, tc.arguments, {
-          session: this.store.getSession(session.id) ?? session,
-          confirmHighRisk: cfg.confirmHighRisk,
-        })
-        const ms = Date.now() - t0
-        const sum = safeSummary(runRes.output, 160)
-        input.onProgress?.({
-          type: 'tool_done',
-          step: step + 1,
-          name: tc.name,
-          ...(actName ? { action: actName } : {}),
-          ok: runRes.ok,
-          ms,
-          summary: sum,
-          ...(runRes.pendingActionId ? { pendingActionId: runRes.pendingActionId } : {}),
-        })
-        return { tc, safeArgs, runRes, ms, sum }
-      }
-
-      const outcomes = allReadOnly
-        ? await Promise.all(assistantCalls.map((_, idx) => execOne(idx)))
-        : await (async () => {
-            const list: Awaited<ReturnType<typeof execOne>>[] = []
-            for (let i = 0; i < assistantCalls.length; i += 1) {
-              list.push(await execOne(i))
-            }
-            return list
-          })()
-
-      for (const { tc, safeArgs, runRes, ms, sum } of outcomes) {
-        toolsUsed.push({
-          name: tc.name,
-          args: safeArgs,
-          ok: runRes.ok,
-          ms,
-          summary: sum,
-          ...(runRes.pendingActionId ? { pendingActionId: runRes.pendingActionId } : {}),
-        })
-        this.store.addMessage({
-          sessionId: session.id,
-          role: 'tool',
-          toolCallId: tc.id,
-          toolName: tc.name,
-          content: runRes.output,
-          meta: { ok: runRes.ok, ms, ...(runRes.pendingActionId ? { pendingActionId: runRes.pendingActionId } : {}) },
-        })
-        conversation.push({
-          role: 'tool',
-          toolCallId: tc.id,
-          name: tc.name,
-          content: runRes.output,
-          isError: !runRes.ok,
-        })
-      }
-    }
-
-    // 本轮因超时或模型上游故障中断时，自动排队续跑（用户无需重发），避免「派发的任务没有后续」
-    const resumeDepth = input.autoTrigger?.resumeDepth ?? 0
-    const resumable = interruptedBy !== undefined
-      && !toolsUnsupportedHit
-      && !input.signal?.aborted
-      && cfg.enabled
-      && !this.closed
-      && (!input.autoTrigger || input.autoTrigger.eventKind === 'turn_resume')
-    let resumeScheduled = false
-    if (resumable && interruptedBy) {
-      if (resumeDepth < MAX_TURN_RESUMES) {
-        const nextDepth = resumeDepth + 1
-        const delayMs = interruptedBy === 'model_failed' ? Math.min(120_000, 30_000 * nextDepth) : 2_000
-        this.scheduleTurnResume({
-          sessionId: session.id,
-          reason: interruptedBy,
-          depth: nextDepth,
-          delayMs,
-          errorText: lastModelError,
-          doneTools: toolsUsed.map(t => `${t.name}${typeof t.args.action === 'string' ? `(${t.args.action})` : ''}:${t.ok ? 'ok' : 'err'}`),
-        })
-        resumeScheduled = true
-        finalReply += interruptedBy === 'model_failed'
-          ? `已安排 ${Math.round(delayMs / 1000)} 秒后自动重试（第 ${nextDepth}/${MAX_TURN_RESUMES} 次），无需你重发，成功后会直接汇报。`
-          : `我已自动在后台续跑剩余步骤（第 ${nextDepth}/${MAX_TURN_RESUMES} 次），完成后会直接向你汇报，无需重发。`
-      } else {
-        finalReply += interruptedBy === 'model_failed'
-          ? `已自动重试 ${MAX_TURN_RESUMES} 轮仍未恢复。你可以稍后重试，或发 /状态 查看实时面板。`
-          : '已多轮自动续跑仍未收敛，请告诉我优先要完成的那一项，我会聚焦推进。'
-      }
-    }
-
-    const safeReply = `${missedPrefix}${this.deps.redact(finalReply)}`
-    this.store.addMessage({
-      sessionId: session.id,
-      role: 'assistant',
-      content: safeReply,
-      meta: {
+      return finish({
+        sessionId: session.id,
+        reply: safeReply,
+        toolsUsed,
+        pendingActions: this.store.listPendingActions(session.id, true),
         model: activeModel.ref,
-        toolsCount: toolsUsed.length,
-        tools: toolsUsed.map(t => ({ name: t.name, ok: t.ok, ms: t.ms })),
-      },
-    })
-
-    // 异步检查是否需要滚动压缩早期上下文
-    this.maybeCompactAsync(session.id)
-
-    return finish({
-      sessionId: session.id,
-      reply: safeReply,
-      toolsUsed,
-      pendingActions: this.store.listPendingActions(session.id, true),
-      model: activeModel.ref,
-      ...(modelFailed ? { modelFailed: true } : {}),
-      ...(resumeScheduled ? { resumeScheduled: true } : {}),
-    })
+        ...(modelFailed ? { modelFailed: true } : {}),
+        ...(resumeScheduled ? { resumeScheduled: true } : {}),
+      })
+    } finally {
+      this.activeTurns.delete(session.id)
+      // 在本轮完全结束并落库后再触发异步滚动压缩，避免压缩切分撕裂活跃工具对
+      this.maybeCompactAsync(session.id)
+    }
   }
 
   /** 排队一次延迟续跑：同一会话仅保留最新一个待执行续跑，用户发新消息时自动取消。 */
@@ -962,8 +1092,10 @@ export class DirectorService {
     if (this.closed) return
     const session = this.store.getSession(input.sessionId)
     if (!session) return
+    const rawErr = input.errorText.trim().slice(0, 140)
+    const cleanErr = (rawErr.replace(/[（(][^）)]*$/, '').trim() || rawErr.replace(/[（(\s]+$/, '')) || '连接中断'
     const text = [
-      `[系统自动续跑 · 第 ${input.depth}/${MAX_TURN_RESUMES} 次] 上一轮处理因${input.reason === 'deadline' ? '单轮耗时达到上限' : `模型上游连接故障（${input.errorText.slice(0, 80) || '连接中断'}）`}被中断。`,
+      `[系统自动续跑 · 第 ${input.depth}/${MAX_TURN_RESUMES} 次] 上一轮处理因${input.reason === 'deadline' ? '单轮耗时达到上限' : `模型上游连接故障（${cleanErr}）`}被中断。`,
       '请回看上方对话中主人最近的原始需求和已有的工具结果，继续完成尚未做完的部分。',
       '注意：已经成功执行的步骤（尤其是已派发的工单、已创建的计划）不要重复执行，先用只读查询确认现状再往下推进。',
       `上一轮已执行的工具：${input.doneTools.length > 0 ? input.doneTools.slice(-10).join('、') : '（无）'}`,
@@ -1827,47 +1959,45 @@ export class DirectorService {
     }
   }
 
-  /** 主总控模型上游故障时，自动挑选一个不同的已启用模型兜底重试。 */
+  /** 主总控模型上游故障时，优先跨服务商挑选可用模型兜底重试，规避单点网关故障；若无其他服务商则回落同服务商其他模型。 */
   private resolveFallbackModel(excludeRef: string): { provider: string; model: string; ref: string; maxTokens: number; target: ModelTarget } | undefined {
     const opts = this.deps.options.get()
-    const workerRef = formatRef(opts.models.routing.worker)
-    if (workerRef !== excludeRef) {
-      const w = findModel(opts.models, opts.models.routing.worker, { enabledOnly: true })
-      if (w) {
-        return {
-          provider: w.provider.id,
-          model: w.model.id,
-          ref: workerRef,
-          maxTokens: w.model.maxTokens,
-          target: {
-            api: w.provider.api,
-            baseUrl: w.provider.baseUrl,
-            apiKey: w.provider.apiKey,
-            ...(w.provider.sessionHeader ? { sessionHeader: w.provider.sessionHeader } : {}),
-          },
+    const excludeProvider = parseRef(excludeRef)?.provider
+    const toTarget = (
+      provider: (typeof opts.models.providers)[number],
+      model: (typeof opts.models.providers)[number]['models'][number],
+      ref: string,
+    ) => ({
+      provider: provider.id,
+      model: model.id,
+      ref,
+      maxTokens: model.maxTokens,
+      target: {
+        api: provider.api,
+        baseUrl: provider.baseUrl,
+        apiKey: provider.apiKey,
+        ...(provider.sessionHeader ? { sessionHeader: provider.sessionHeader } : {}),
+      },
+    })
+
+    const pick = (requireDiffProvider: boolean) => {
+      const workerRef = formatRef(opts.models.routing.worker)
+      if (workerRef !== excludeRef && (!requireDiffProvider || opts.models.routing.worker.provider !== excludeProvider)) {
+        const w = findModel(opts.models, opts.models.routing.worker, { enabledOnly: true })
+        if (w) return toTarget(w.provider, w.model, workerRef)
+      }
+      for (const provider of opts.models.providers) {
+        if (!provider.enabled) continue
+        if (requireDiffProvider && provider.id === excludeProvider) continue
+        for (const model of provider.models) {
+          const ref = formatRef({ provider: provider.id, model: model.id })
+          if (ref !== excludeRef) return toTarget(provider, model, ref)
         }
       }
+      return undefined
     }
-    for (const provider of opts.models.providers) {
-      if (!provider.enabled) continue
-      for (const model of provider.models) {
-        const ref = formatRef({ provider: provider.id, model: model.id })
-        if (ref === excludeRef) continue
-        return {
-          provider: provider.id,
-          model: model.id,
-          ref,
-          maxTokens: model.maxTokens,
-          target: {
-            api: provider.api,
-            baseUrl: provider.baseUrl,
-            apiKey: provider.apiKey,
-            ...(provider.sessionHeader ? { sessionHeader: provider.sessionHeader } : {}),
-          },
-        }
-      }
-    }
-    return undefined
+
+    return pick(true) ?? pick(false)
   }
 
   private directorTodayUsd(): number {
@@ -1920,14 +2050,14 @@ export class DirectorService {
   }
 
   private maybeCompactAsync(sessionId: string): void {
-    if (this.compacting.has(sessionId) || this.closed) return
+    if (this.compacting.has(sessionId) || this.activeTurns.has(sessionId) || this.closed) return
     const active = this.store.activeMessages(sessionId, COMPACT_TRIGGER_MESSAGES + 10)
     if (active.length < COMPACT_TRIGGER_MESSAGES) return
+    const cutIndex = findSafeCompactCutIndex(active, COMPACT_KEEP_TAIL)
+    if (cutIndex <= 4) return
     this.compacting.add(sessionId)
     void (async () => {
       try {
-        const cutIndex = active.length - COMPACT_KEEP_TAIL
-        if (cutIndex <= 4) return
         const toArchive = active.slice(0, cutIndex)
         const lastArchiveId = toArchive[toArchive.length - 1]!.id
         const curSession = this.store.getSession(sessionId)
@@ -1953,7 +2083,7 @@ export class DirectorService {
           maxTokens: 600,
         }, { timeoutMs, sessionId: `director-compact-${sessionId}`, maxRetries })
         this.recordUsage(resolved.provider, resolved.model, res.status ?? 0, res.usage, res.latencyMs)
-        if (res.ok && res.text.trim()) {
+        if (res.ok && res.text.trim() && !this.activeTurns.has(sessionId) && !this.closed) {
           this.store.updateSession(sessionId, { summary: this.deps.redact(res.text.trim()).slice(0, 1500) })
           this.store.archiveMessages(sessionId, lastArchiveId)
         }

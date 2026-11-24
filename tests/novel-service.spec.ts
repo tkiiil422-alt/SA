@@ -150,4 +150,28 @@ describe('NovelService setup drafting', () => {
     expect(h.status().status).toBe('failed')
     expect(h.sleeps).toHaveLength(6)
   })
+
+  it('allows deduplicating an accidentally doubled chapter back to target length while rejecting abnormally short rewrites', async () => {
+    const bodyDoubled = `${'晨光穿透薄雾落在青石镇屋檐上。'.repeat(411)}`
+    const dedupBody = `# 第1章 晨雾重整\n\n${'晨光穿透薄雾落在青石镇屋檐上。'.repeat(220)}`
+    const h = harness([
+      { ok: true, status: 200, text: JSON.stringify(RAW_SETUP) },
+      { ok: true, status: 200, text: dedupBody },
+      { ok: true, status: 200, text: '# 第1章 太短\n\n太短了。' },
+    ])
+    h.service.openBook({ idea: '药铺学徒捡到小鼎', genre: 'xianxia', chapterChars: [2500, 3500] })
+    await h.service.idle()
+    const files = new BookFiles(h.root, 'b_test')
+    files.writeChapter(1, bodyDoubled)
+
+    h.service.editChapter('b_test', 1, '删除重复拼接的后半段，恢复正常单章篇幅')
+    await h.service.idle()
+    expect(h.service.lastEdit('b_test', 1)?.status).toBe('done')
+
+    h.service.editChapter('b_test', 1, '极度缩写')
+    await h.service.idle()
+    const failed = h.service.lastEdit('b_test', 1)
+    expect(failed?.status).toBe('failed')
+    expect(failed?.error).toContain('短太多')
+  })
 })

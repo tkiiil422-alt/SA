@@ -1213,10 +1213,15 @@ export class DirectorToolExecutor {
           if (!this.deps.novels) return fail('未启用小说模块')
           const bookId = str(args.bookId)
           const chapter = int(args.chapter, 1, 1, 10_000)
-          const note = str(args.note)
+          const note = str(args.note) || str(args.instruction) || str(args.text)
+          const allowShorten = args.allowShorten === true || args.allowShorten === 'true'
           if (!bookId || !note) return fail('缺少 bookId 或修改意见 note')
-          const edit = this.deps.novels.editChapter(bookId, chapter, note)
-          return out({ ok: true, edit })
+          const edit = this.deps.novels.editChapter(bookId, chapter, note, { allowShorten })
+          return out({
+            ok: true,
+            edit,
+            hint: '章节精修已在后台异步执行，请勿在本轮连续轮询 novel_chapter 等待结果。',
+          })
         }
 
         case 'pentest_scan': {
@@ -1328,6 +1333,14 @@ export class DirectorToolExecutor {
           const chapter = int(args.chapter, 1, 1, 10_000)
           if (!bookId) return fail('缺少 bookId')
           return out({ ok: true, edit: this.deps.novels.undoEdit(bookId, chapter) })
+        }
+        case 'novel_mark_read': {
+          if (!this.deps.novels) return fail('未启用小说模块')
+          const bookId = str(args.bookId)
+          const chapter = int(args.chapter, 1, 1, 10_000)
+          if (!bookId) return fail('缺少 bookId')
+          this.deps.novels.markRead(bookId, chapter)
+          return out({ ok: true, bookId, chapter, message: `第 ${chapter} 章已标记为已阅` })
         }
 
         case 'fanqie_check': {

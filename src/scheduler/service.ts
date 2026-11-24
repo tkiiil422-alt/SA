@@ -94,7 +94,19 @@ export class SchedulerService {
     const kind = patch.actionKind ?? cur.actionKind
     const cfg = patch.actionConfig ?? cur.actionConfig
     this.validateActionConfig(kind, cfg)
-    return this.deps.store.update(id, patch, this.doNow())
+    const now = this.doNow()
+    const updated = this.deps.store.update(id, patch, now)
+    if (updated && patch.actionConfig && typeof patch.actionConfig.prompt === 'string') {
+      const nextPrompt = patch.actionConfig.prompt.trim()
+      const prevPrompt = typeof cur.actionConfig.prompt === 'string' ? cur.actionConfig.prompt.trim() : ''
+      if (nextPrompt && nextPrompt !== prevPrompt && this.deps.contracts?.get('schedule', id)) {
+        this.deps.contracts.amend('schedule', id, { goal: nextPrompt }, {
+          scope: 'project',
+          reason: '定时任务指令已更新，自动同步约定目标',
+        }, now)
+      }
+    }
+    return updated
   }
 
   delete(id: string): boolean {

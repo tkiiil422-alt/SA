@@ -10,11 +10,13 @@ import type { AdminHost, TicketDetailView, TicketSummaryView } from '../src/admi
 import { OptionsStore, defaultOptions } from '../src/admin/options.ts'
 import { DirectorBridge } from '../src/director/bridge.ts'
 import { HostOpsService, isSensitiveHostPath } from '../src/director/host-ops.ts'
-import { callToolModel, type ToolModelRequest, type ToolModelResult } from '../src/director/llm.ts'
-import { DirectorService, buildConversationWindow } from '../src/director/service.ts'
+import { isRetryableNetworkError, retryBackoffMs } from '../src/assessor/model-call.ts'
+import { callToolModel, flattenToolHistory, type ToolModelRequest, type ToolModelResult } from '../src/director/llm.ts'
+import { DirectorService, buildConversationWindow, findSafeCompactCutIndex } from '../src/director/service.ts'
 import { DirectorStore } from '../src/director/store.ts'
 import { EventLog } from '../src/ledger/events.ts'
 import { Ledger } from '../src/ledger/ledger.ts'
+import type { NovelService } from '../src/novel/service.ts'
 
 const dirs: string[] = []
 const dbs: DatabaseSync[] = []
@@ -1263,5 +1265,347 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()))
     }
+  })
+
+  describe('director reliability & anti-hallucination guardrails', () => {
+    it('flattenToolHistory flattens tool_use and tool_result blocks cleanly when tools are omitted', async () => {
+      const flattened = flattenToolHistory([
+        { role: 'user', content: '查概览' },
+        {
+          role: 'assistant',
+          content: '我先查一下',
+          toolCalls: [{ id: 'c1', name: 'platform_query', arguments: { action: 'platform_overview' } }],
+        },
+        { role: 'tool', toolCallId: 'c1', name: 'platform_query', content: '{"ok":true,"tickets":1}' },
+      ])
+
+      expect(flattened).toHaveLength(3)
+      expect(flattened.every(m => m.role === 'user' || m.role === 'assistant')).toBe(true)
+      expect(flattened[1]!.content).toContain('[已调用工具]')
+      expect(flattened[1]!.content).toContain('platform_query')
+      expect(flattened[2]!.role).toBe('user')
+      expect(flattened[2]!.content).toContain('[工具返回 platform_query（成功）]')
+
+      let capturedOpenAi: any
+      const fakeFetch: typeof fetch = async (_url, init) => {
+        capturedOpenAi = JSON.parse(String(init?.body))
+        return new Response(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: '汇总完成' } }],
+          usage: { prompt_tokens: 10, completion_tokens: 5 },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      const res = await callToolModel(
+        { api: 'openai-completions', baseUrl: 'https://api.example.com/v1', apiKey: 'sk-test' },
+        {
+          model: 'm1',
+          system: 'sys',
+          messages: [
+            { role: 'user', content: 'hi' },
+            { role: 'assistant', content: '', toolCalls: [{ id: 'tc1', name: 'platform_query', arguments: { action: 'platform_overview' } }] },
+            { role: 'tool', toolCallId: 'tc1', name: 'platform_query', content: '{"ok":true}' },
+          ],
+          tools: [],
+          maxTokens: 256,
+        },
+        { timeoutMs: 5000, fetch: fakeFetch },
+      )
+      expect(res.ok).toBe(true)
+      expect(capturedOpenAi.tools).toBeUndefined()
+      expect(capturedOpenAi.messages.some((m: any) => m.role === 'tool' || m.tool_calls)).toBe(false)
+    })
+
+    it('injects closing instruction on exhausted maxToolSteps and sanitizes unmounted-tool / manage_task hallucinations', async () => {
+      const env = setup()
+      env.options.update('director', { ...env.options.get().director, maxToolSteps: 1 })
+      const requests: ToolModelRequest[] = []
+      let step = 0
+      const service = new DirectorService({
+        host: env.fake.host,
+        options: env.options,
+        ledger: env.ledger,
+        events: env.events,
+        store: env.store,
+        redact: env.redact,
+        callTool: async (_target, req) => {
+          requests.push(req)
+          step += 1
+          if (step === 1) {
+            return {
+              ok: true,
+              status: 200,
+              latencyMs: 10,
+              text: '',
+              toolCalls: [
+                { id: 'c_ov', name: 'platform_query', arguments: { action: 'platform_overview', params_json: '{}' } },
+              ],
+            }
+          }
+          // 模拟收口轮在 tools: [] 情况下仍幻觉声称“工具未挂载/仅剩 manage_task”
+          return {
+            ok: true,
+            status: 200,
+            latencyMs: 10,
+            text: '抱歉，当前工具未挂载，仅剩 manage_task 可用（unknown tool）。',
+            toolCalls: [],
+          }
+        },
+      })
+
+      const res = await service.chat({ channel: 'web', userId: 'owner', text: '看看平台概览' })
+      expect(requests).toHaveLength(2)
+      expect(requests[1]!.tools).toEqual([])
+      const lastMsg = requests[1]!.messages[requests[1]!.messages.length - 1]
+      expect(lastMsg?.role).toBe('user')
+      expect(lastMsg?.content).toContain('[系统收口提示]')
+      expect(lastMsg?.content).toContain('主动关闭工具调用')
+      expect(res.reply).not.toMatch(/工具未挂载|manage_task|unknown\s+tool/i)
+      expect(res.reply).toContain('platform_query')
+      expect(env.events.recent(20).some(e => e.kind === 'director.reply_sanitized')).toBe(true)
+      service.close()
+    })
+
+    it('warns on 2nd identical read-only poll and short-circuits 3rd+ poll while resetting after write actions', async () => {
+      const env = setup()
+      env.options.update('director', { ...env.options.get().director, maxToolSteps: 8 })
+      let overviewCalls = 0
+      const origOverview = env.fake.host.overview
+      env.fake.host.overview = () => {
+        overviewCalls += 1
+        return origOverview()
+      }
+
+      const seenToolOutputs: string[] = []
+      let turn = 0
+      const service = new DirectorService({
+        host: env.fake.host,
+        options: env.options,
+        ledger: env.ledger,
+        events: env.events,
+        store: env.store,
+        redact: env.redact,
+        callTool: async (_target, req) => {
+          turn += 1
+          const latestTool = [...req.messages].reverse().find(m => m.role === 'tool')
+          if (latestTool) seenToolOutputs.push(latestTool.content)
+
+          if (turn <= 3) {
+            return {
+              ok: true,
+              status: 200,
+              latencyMs: 5,
+              text: '',
+              toolCalls: [
+                { id: `ov_${turn}`, name: 'platform_query', arguments: { action: 'platform_overview', params_json: '{}' } },
+              ],
+            }
+          }
+          if (turn === 4) {
+            // 穿插一次写操作后应清空只读防重计数
+            return {
+              ok: true,
+              status: 200,
+              latencyMs: 5,
+              text: '',
+              toolCalls: [
+                { id: 'w_1', name: 'dispatch_ticket', arguments: { prompt: '执行一次状态检查工单' } },
+              ],
+            }
+          }
+          if (turn === 5) {
+            return {
+              ok: true,
+              status: 200,
+              latencyMs: 5,
+              text: '',
+              toolCalls: [
+                { id: 'ov_after_write', name: 'platform_query', arguments: { action: 'platform_overview', params_json: '{}' } },
+              ],
+            }
+          }
+          return { ok: true, status: 200, latencyMs: 5, text: '巡检完成，共执行真实概览查询。', toolCalls: [] }
+        },
+      })
+
+      const res = await service.chat({ channel: 'web', userId: 'owner', text: '测试防空轮询' })
+      expect(res.reply).toContain('巡检完成')
+      // 开场态势快照 1 次 + 第1、2轮真实执行 + 第3轮被短路拦截 + 写操作清空后第5轮重新执行 1 次 => 总计 4 次
+      expect(overviewCalls).toBe(4)
+      expect(seenToolOutputs[1]).toContain('防空轮询提示')
+      expect(seenToolOutputs[2]).toContain('已拦截重复空轮询')
+      service.close()
+    })
+
+    it('findSafeCompactCutIndex backs up before assistant(toolCalls) so tool pairs are never torn during compaction', () => {
+      const base = { sessionId: 's1', archived: false, createdAt: '2026-11-24T00:00:00.000Z' }
+      const messages = [
+        { ...base, id: 1, role: 'user' as const, content: 'q0' },
+        { ...base, id: 2, role: 'assistant' as const, content: 'a0' },
+        { ...base, id: 3, role: 'user' as const, content: 'q0_2' },
+        { ...base, id: 4, role: 'assistant' as const, content: 'a0_2' },
+        { ...base, id: 5, role: 'user' as const, content: 'q0_3' },
+        { ...base, id: 6, role: 'assistant' as const, content: 'a0_3' },
+        { ...base, id: 7, role: 'user' as const, content: 'q1' },
+        { ...base, id: 8, role: 'assistant' as const, content: '', toolCalls: [{ id: 'tc1', name: 'platform_query', arguments: {} }] },
+        { ...base, id: 9, role: 'tool' as const, toolCallId: 'tc1', toolName: 'platform_query', content: '{"ok":1}' },
+        { ...base, id: 10, role: 'tool' as const, toolCallId: 'tc2', toolName: 'platform_query', content: '{"ok":2}' },
+        { ...base, id: 11, role: 'assistant' as const, content: 'answer1' },
+        { ...base, id: 12, role: 'user' as const, content: 'q2' },
+      ]
+
+      // len=12, keepTail=4 => 初步 cutIndex=8（正好停在 role='tool' 上），必须回退到 index=6（保留 index=7 的 user 与配对 assistant(toolCalls)）
+      expect(findSafeCompactCutIndex(messages, 4)).toBe(6)
+      // len=12, keepTail=3 => 初步 cutIndex=9（也在 tool 上），同样必须回退到 index=6
+      expect(findSafeCompactCutIndex(messages, 3)).toBe(6)
+      // len=12, keepTail=1 => 初步 cutIndex=11（role='user' 且前一条非 toolCalls），无需回退
+      expect(findSafeCompactCutIndex(messages, 1)).toBe(11)
+      // 不足最小归档阈值（<=4）时返回 -1
+      expect(findSafeCompactCutIndex(messages.slice(0, 6), 4)).toBe(-1)
+    })
+
+    it('prioritizes cross-provider models in resolveFallbackModel before same-provider alternatives', async () => {
+      const env = setup()
+      const baseModels = env.options.get().models
+      const templateProvider = baseModels.providers[0]!
+      const templateModel = templateProvider.models[0]!
+      env.options.update('models', {
+        ...baseModels,
+        providers: [
+          {
+            ...templateProvider,
+            id: 'primary-gw',
+            name: 'Primary GW',
+            baseUrl: 'https://primary-gw.example/v1',
+            apiKey: 'sk-primary',
+            enabled: true,
+            models: [
+              { ...templateModel, id: 'p-main', autoPick: true },
+              { ...templateModel, id: 'p-same-backup', autoPick: true },
+            ],
+          },
+          {
+            ...templateProvider,
+            id: 'secondary-direct',
+            name: 'Secondary Direct',
+            baseUrl: 'https://secondary-direct.example/v1',
+            apiKey: 'sk-secondary',
+            enabled: true,
+            models: [
+              { ...templateModel, id: 's-cross-backup', autoPick: true },
+            ],
+          },
+        ],
+        routing: {
+          ...baseModels.routing,
+          worker: { provider: 'primary-gw', model: 'p-main' },
+          assessor: { ...baseModels.routing.assessor, provider: 'primary-gw', model: 'p-main' },
+        },
+      })
+      env.options.update('director', {
+        ...env.options.get().director,
+        model: { provider: 'primary-gw', model: 'p-main' },
+        maxRetries: 0,
+      })
+
+      const triedTargets: Array<{ baseUrl: string; model: string }> = []
+      const service = new DirectorService({
+        host: env.fake.host,
+        options: env.options,
+        ledger: env.ledger,
+        events: env.events,
+        store: env.store,
+        redact: env.redact,
+        callTool: async (target, req) => {
+          triedTargets.push({ baseUrl: target.baseUrl, model: req.model })
+          if (req.model === 'p-main') {
+            return { ok: false, status: 503, text: '', error: 'Upstream gateway TLS disconnected', latencyMs: 5, toolCalls: [] }
+          }
+          return { ok: true, status: 200, text: '已自动切换至跨服务商备援模型完成回复。', latencyMs: 5, toolCalls: [] }
+        },
+      })
+
+      const res = await service.chat({ channel: 'web', userId: 'owner', text: '测试跨服务商优先备援' })
+      expect(res.reply).toContain('跨服务商备援模型')
+      expect(triedTargets).toEqual([
+        { baseUrl: 'https://primary-gw.example/v1', model: 'p-main' },
+        { baseUrl: 'https://secondary-direct.example/v1', model: 's-cross-backup' },
+      ])
+      service.close()
+    })
+
+    it('supports instruction alias + allowShorten on novel_edit_chapter and exposes novel_mark_read tool', async () => {
+      const env = setup()
+      const editCalls: Array<{ bookId: string; n: number; note: string; opts?: { allowShorten?: boolean } }> = []
+      const markReadCalls: Array<{ bookId: string; n: number }> = []
+      const fakeNovels = {
+        editChapter: (bookId: string, n: number, note: string, opts?: { allowShorten?: boolean }) => {
+          editCalls.push({ bookId, n, note, opts })
+          return { id: 'e_1', n, status: 'running', note, costUsd: 0, createdAt: '2026-11-24T00:00:00Z', updatedAt: '2026-11-24T00:00:00Z' }
+        },
+        markRead: (bookId: string, n: number) => {
+          markReadCalls.push({ bookId, n })
+        },
+      } as unknown as NovelService
+
+      let turn = 0
+      const toolOutputs: string[] = []
+      const service = new DirectorService({
+        host: env.fake.host,
+        options: env.options,
+        ledger: env.ledger,
+        events: env.events,
+        store: env.store,
+        redact: env.redact,
+        novels: fakeNovels,
+        callTool: async (_target, req) => {
+          turn += 1
+          for (const m of req.messages) {
+            if (m.role === 'tool') toolOutputs.push(m.content)
+          }
+          if (turn === 1) {
+            return {
+              ok: true,
+              status: 200,
+              latencyMs: 5,
+              text: '',
+              toolCalls: [
+                {
+                  id: 'n_edit',
+                  name: 'subsystem_action',
+                  arguments: {
+                    action: 'novel_edit_chapter',
+                    params_json: JSON.stringify({ bookId: 'b_novel_1', chapter: 12, instruction: '删除重复段落', allowShorten: true }),
+                  },
+                },
+                {
+                  id: 'n_read',
+                  name: 'subsystem_action',
+                  arguments: {
+                    action: 'novel_mark_read',
+                    params_json: JSON.stringify({ bookId: 'b_novel_1', chapter: 12 }),
+                  },
+                },
+              ],
+            }
+          }
+          return { ok: true, status: 200, latencyMs: 5, text: '已触发精修并标记已阅。', toolCalls: [] }
+        },
+      })
+
+      const res = await service.chat({ channel: 'web', userId: 'owner', text: '精修第12章并标记已阅' })
+      expect(res.reply).toContain('已触发精修')
+      expect(editCalls).toEqual([{ bookId: 'b_novel_1', n: 12, note: '删除重复段落', opts: { allowShorten: true } }])
+      expect(markReadCalls).toEqual([{ bookId: 'b_novel_1', n: 12 }])
+      expect(toolOutputs.some(t => t.includes('请勿在本轮连续轮询 novel_chapter'))).toBe(true)
+      expect(toolOutputs.some(t => t.includes('已标记为已阅'))).toBe(true)
+      service.close()
+    })
+
+    it('treats Upstream response aborted as retryable and caps exponential backoff at 15s base', () => {
+      expect(isRetryableNetworkError(new Error('Upstream response aborted'))).toBe(true)
+      expect(isRetryableNetworkError(new Error('Client network socket disconnected before secure TLS connection was established'))).toBe(true)
+      const ms = retryBackoffMs(10, 1000)
+      expect(ms).toBeGreaterThanOrEqual(Math.round(15_000 * 0.85))
+      expect(ms).toBeLessThanOrEqual(Math.round(15_000 * 1.15))
+    })
   })
 })

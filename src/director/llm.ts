@@ -90,6 +90,33 @@ function looksLikeToolsUnsupported(status: number | undefined, raw: string): boo
   return /(tool|function).*(not\s+support|unsupported|invalid|not\s+allowed)|does\s+not\s+support\s+tools/i.test(raw)
 }
 
+function flattenToolHistory(messages: readonly AgentMessage[]): AgentMessage[] {
+  const out: AgentMessage[] = []
+  for (const msg of messages) {
+    if (msg.role === 'user') {
+      out.push({ role: 'user', content: msg.content })
+    } else if (msg.role === 'assistant') {
+      const parts: string[] = []
+      if (msg.content.trim()) parts.push(msg.content.trim())
+      if (msg.toolCalls && msg.toolCalls.length > 0) {
+        const callsText = msg.toolCalls.map(tc => {
+          const argsStr = JSON.stringify(tc.arguments ?? {})
+          return `- ${tc.name}(${argsStr.length > 300 ? `${argsStr.slice(0, 297)}…` : argsStr})`
+        }).join('\n')
+        parts.push(`[已调用工具]\n${callsText}`)
+      }
+      out.push({ role: 'assistant', content: parts.join('\n\n') || ' ' })
+    } else {
+      const prefix = `[工具返回 ${msg.name}${msg.isError ? '（失败）' : '（成功）'}]`
+      const body = msg.content.length > 3000 ? `${msg.content.slice(0, 2997)}…` : msg.content
+      out.push({ role: 'user', content: `${prefix}\n${body}` })
+    }
+  }
+  return out
+}
+
+export { flattenToolHistory }
+
 function toOpenAiMessages(system: string, messages: readonly AgentMessage[]): unknown[] {
   const out: unknown[] = [{ role: 'system', content: system }]
   for (const msg of messages) {
@@ -430,7 +457,8 @@ export function nodeHttpFetch(input: Parameters<typeof fetch>[0], init?: Request
       method: init?.method ?? 'GET',
       headers,
       timeout: 0,
-      ...(forceClose ? { agent: false } : {}),
+      // 长超时请求统一禁用连接池复用，避免被代理/TUN 或 NAT 静默回收产生半开 TLS 断连
+      agent: false,
     })
     req.setTimeout(0)
 
@@ -504,6 +532,16 @@ export function nodeHttpFetch(input: Parameters<typeof fetch>[0], init?: Request
           })
           res.on('error', err => finishError(err))
           res.on('aborted', () => finishError(new Error('Upstream response aborted')))
+          res.on('close', () => {
+            if (streamDone) return
+            if (res.complete) {
+              streamDone = true
+              cleanupSignal()
+              try { controller.close() } catch { /* stream already closed */ }
+            } else {
+              finishError(new Error('Upstream response closed prematurely'))
+            }
+          })
         },
         pull() {
           if (!streamDone) res.resume()
@@ -543,13 +581,18 @@ export async function callToolModel(
 
   let url: string
   let body: Record<string, unknown>
+  // 当 tools 为空（如收口总结步）而历史消息包含 toolCalls/tool 时，折叠为纯文本上下文，避免无 tools 时暴露裸 tool_use/tool_result 导致上游网关错乱
+  const hasToolHistory = request.messages.some(m => m.role === 'tool' || (m.role === 'assistant' && Boolean(m.toolCalls?.length)))
+  const effectiveMessages = request.tools.length === 0 && hasToolHistory
+    ? flattenToolHistory(request.messages)
+    : request.messages
 
   if (target.api === 'openai-completions') {
     url = `${base}/chat/completions`
     headers.authorization = `Bearer ${target.apiKey}`
     body = {
       model: request.model,
-      messages: toOpenAiMessages(request.system, request.messages),
+      messages: toOpenAiMessages(request.system, effectiveMessages),
       max_tokens: request.maxTokens,
       stream: opts.stream === true,
       ...(opts.stream === true ? { stream_options: { include_usage: true } } : {}),
@@ -578,7 +621,7 @@ export async function callToolModel(
     body = {
       model: request.model,
       system: [{ type: 'text', text: request.system, cache_control: mark }],
-      messages: toAnthropicMessages(request.messages, mark),
+      messages: toAnthropicMessages(effectiveMessages, mark),
       max_tokens: request.maxTokens,
       ...(anthropicTools.length > 0 ? { tools: anthropicTools } : {}),
       ...(opts.stream === true ? { stream: true } : {}),
