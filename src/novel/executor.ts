@@ -190,7 +190,20 @@ export class NovelExecutor implements Executor {
       const files = new BookFiles(this.options.root, book.bookId)
       this.steers.set(ticketId, { note, untilCh: files.readBook().lastChapter + 5 })
     }
-    this.begin(ticketId, assignmentId, book.bookId, book.arc, note)
+    const started = this.options.tickets.get(ticketId)
+    const initialInstrs = (started?.undelivered ?? [])
+      .map(id => started?.inputs.find(inp => inp.id === id))
+      .filter((inp): inp is TicketInput => inp?.kind === 'text')
+      .map(inp => ({ id: inp.id, text: this.personText(inp) }))
+      .filter((item): item is { id: string; text: string } => Boolean(item.text))
+    if (initialInstrs.length > 0) {
+      const instrIds = initialInstrs.map(item => item.id)
+      this.options.atomic(() => {
+        this.options.engine().inputsDelivered(ticketId, assignmentId, instrIds)
+        this.options.engine().inputsRead(ticketId, instrIds)
+      })
+    }
+    this.begin(ticketId, assignmentId, book.bookId, book.arc, note, initialInstrs.map(item => item.text))
   }
 
   private async deliverQueued({ ticketId, assignmentId }: Payload): Promise<void> {
@@ -246,8 +259,8 @@ export class NovelExecutor implements Executor {
 
   // --- The arc loop ---------------------------------------------------------------------------------------------------
 
-  private begin(ticketId: string, assignmentId: string, bookId: string, arcN: number, note?: string): void {
-    const run: Run = { assignmentId, stopped: false, inbox: [], done: Promise.resolve() }
+  private begin(ticketId: string, assignmentId: string, bookId: string, arcN: number, note?: string, initialInbox: string[] = []): void {
+    const run: Run = { assignmentId, stopped: false, inbox: [...initialInbox], done: Promise.resolve() }
     this.runs.set(ticketId, run)
     run.done = this.loop(ticketId, bookId, arcN, run, note)
       .catch(error => this.options.onError?.(error))
