@@ -1619,4 +1619,27 @@ describe('ignores from the card', () => {
     h.engine.receive(trigger('5', { actor: guest })); h.engine.reevaluate('5'); h.pump()
     expect(() => h.engine.decide('5', { kind: 'accept', title: 'Fix', scope: 'small', reason: 'chat' })).toThrow(new UserError('notExplicit'))
   })
+
+  it('clears stale ticket.attention and withdraws outbox reply when instruct() or retryTicket() restarts a blocked ticket', () => {
+    const h = harness()
+    const t1 = accepted(h, 'a1', 'ta1').ticketId!
+    const blocked1 = h.engine.report(t1, { state: 'blocked', summary: 'model err', question: 'Retry with another model?' })
+    const att1 = blocked1.attention!
+    expect(ticketStage(blocked1)).toEqual({ stage: 'person', action: 'answer' })
+
+    const resumed1 = h.engine.instruct(t1, '继续')
+    expect(resumed1.attention).toBeUndefined()
+    expect(waitsForPerson(resumed1)).toBe(false)
+    expect(ticketStage(resumed1)).not.toEqual({ stage: 'person', action: 'answer' })
+    expect(h.withdrawn).toContain(key('attention-reply', att1.id))
+
+    const t2 = accepted(h, 'a2', 'ta2').ticketId!
+    const blocked2 = h.engine.report(t2, { state: 'blocked', summary: 'need fix', question: 'Retry now?' })
+    const att2 = blocked2.attention!
+    const retried2 = h.engine.retryTicket(t2)
+    expect(retried2.attention).toBeUndefined()
+    expect(waitsForPerson(retried2)).toBe(false)
+    expect(ticketStage(retried2)).not.toEqual({ stage: 'person', action: 'answer' })
+    expect(h.withdrawn).toContain(key('attention-reply', att2.id))
+  })
 })

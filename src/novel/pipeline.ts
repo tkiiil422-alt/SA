@@ -29,6 +29,7 @@ import { applyDelta, validateDelta } from './checks.ts'
 import type { CheckIssue } from './checks.ts'
 import { countChars, lintChapter } from './lint.ts'
 import type { LintIssue } from './lint.ts'
+import { detectDisguisedUpstreamError } from '../assessor/model-call.ts'
 
 export type Role = 'planner' | 'writer' | 'reviewer' | 'extractor'
 
@@ -47,6 +48,17 @@ export class Stopped extends Error {
 }
 /** An upstream model kept failing after retries. */
 export class ModelFailure extends Error {}
+
+/** 检查章节草稿是否混入上游伪装报错或严重残缺（防止把报错文本当作正文写入检查点或提交）。 */
+function corruptedDraftReason(text: string, minTargetChars: number): string | undefined {
+  const body = stripTitle(text).trim()
+  const disguised = detectDisguisedUpstreamError(body)
+  if (disguised) return `正文命中网关伪装报错（${disguised.slice(0, 120)}）`
+  const chars = countChars(body)
+  const floor = Math.max(120, Math.floor(minTargetChars * 0.25))
+  if (chars < floor) return `正文仅 ${chars} 字，低于异常拦截门槛（${floor} 字）`
+  return undefined
+}
 
 export interface WriterOptions {
   maxRevisions: number
@@ -388,6 +400,7 @@ export class NovelWriter {
     // 2. Draft
     let draftIndex = 0
     let draft = this.files.readWork(n, 'draft-0.md')
+    if (draft && corruptedDraftReason(draft, book.chapterChars[0])) draft = undefined
     if (!draft) {
       const castIds = [...new Set([...contract.appearing, ...this.namedIn(canon, contract.beats.join(''))])]
       const result = await this.ask('writer', WRITER_SYSTEM, writerUser({
@@ -415,11 +428,17 @@ export class NovelWriter {
         raw = `${raw}${more.text}`
       }
       draft = normalizeDraft(raw, contract.title).text
+      const badDraft = corruptedDraftReason(draft, book.chapterChars[0])
+      if (badDraft) throw new ModelFailure(`写作产出异常：${badDraft}`)
       this.files.writeWork(n, 'draft-0.md', draft)
       mark('draft', 1)
     } else {
-      while (this.files.readWork(n, `draft-${draftIndex + 1}.md`)) draftIndex++
-      draft = this.files.readWork(n, `draft-${draftIndex}.md`) ?? draft
+      while (true) {
+        const nextDraft = this.files.readWork(n, `draft-${draftIndex + 1}.md`)
+        if (!nextDraft || corruptedDraftReason(nextDraft, book.chapterChars[0])) break
+        draftIndex++
+        draft = nextDraft
+      }
     }
     this.checkpoint()
 
@@ -589,6 +608,8 @@ export class NovelWriter {
     this.checkpoint()
 
     // 5. Commit
+    const badCommit = corruptedDraftReason(draft, book.chapterChars[0])
+    if (badCommit) throw new ModelFailure(`写作产出异常：${badCommit}`)
     const prior = this.files.readWork(n, 'meta.json')
     const meta = prior ? JSON.parse(prior) as { costUsd: number; flagged: boolean; notes: string[] } : { costUsd: 0, flagged: false, notes: [] }
     const totalCost = meta.costUsd + cost
@@ -607,6 +628,7 @@ export class NovelWriter {
       targetChars: book.chapterChars,
     }), 8192)
     addCost(result.costUsd)
+    if (detectDisguisedUpstreamError(stripTitle(result.text))) return draft
     // A truncated revision, or one that lost a quarter of the chapter, is worse than the draft it replaces: rewrites
     // tend to compress, and a shrinking chapter drifts out of the target range after two rounds.
     const before = countChars(draft)

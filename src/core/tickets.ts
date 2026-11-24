@@ -169,6 +169,11 @@ export class Tickets extends EnginePart {
     const ticket = this.require(ticketId)
     const latest = latestAssignment(ticket)
     if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
+    const asked = ticket.attention
+    if (asked) {
+      delete ticket.attention
+      this.replies.withdrawAttention(asked.id)
+    }
     this.endAssignment(ticket, latest, 'retried')
     this.requeueUntaken(ticket, latest)
     const assignment = this.newAssignment(ticket)
@@ -432,7 +437,12 @@ export class Tickets extends EnginePart {
       this.endAssignment(ticket, live, 'retried')
       this.requeueUntaken(ticket, live)
     }
-    if (ended) { delete ticket.ended; delete ticket.attention }
+    const asked = ticket.attention
+    if (asked) {
+      delete ticket.attention
+      this.replies.withdrawAttention(asked.id)
+    }
+    if (ended) delete ticket.ended
     const assignment = this.newAssignment(ticket)
     ticket.inputs.push(input); ticket.undelivered.push(input.id); ticket.updatedAt = at
     this.repo.tickets.save(ticket)

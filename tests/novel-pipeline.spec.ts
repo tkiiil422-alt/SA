@@ -10,7 +10,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BookFiles } from '../src/novel/files.ts'
 import { NovelStore } from '../src/novel/store.ts'
-import { NeedsPerson, NovelWriter, Stopped } from '../src/novel/pipeline.ts'
+import { ModelFailure, NeedsPerson, NovelWriter, Stopped } from '../src/novel/pipeline.ts'
 import type { Ask, Role } from '../src/novel/pipeline.ts'
 import {
   ARC_CLOSE_SYSTEM, ARC_PLANNER_SYSTEM, EXTRACTOR_SYSTEM, PLANNER_SYSTEM, REVIEWER_SYSTEM, REVISER_SYSTEM, WRITER_SYSTEM,
@@ -292,5 +292,61 @@ describe('NovelWriter', () => {
     const outcome = await writer.writeChapter(again)
     expect(outcome.n).toBe(3)
     expect(files.readCanon().timeline.map(t => t.dayTo)).toEqual([1, 2, 3])
+  })
+
+  it('rejects disguised upstream gateway error text from writer without writing draft-0 or committing chapter', async () => {
+    const script: Script = { calls: [] }
+    const innerAsk = scriptedAsk(script)
+    const root = mkdtempSync(join(tmpdir(), 'novel-pipeline-bad-'))
+    dirs.push(root)
+    const at = new Date('2026-11-07T00:00:00Z').toISOString()
+    const book = BookSchema.parse({
+      id: 'b_test', title: '噬法', genre: 'xianxia', idea: '', phase: 'ready', chapterChars: [500, 3000],
+      volumesPlanned: 1, chaptersPerVolume: 100, lastChapter: 0, createdAt: at, updatedAt: at,
+    })
+    const files = BookFiles.create(root, book, SETUP)
+    const db = new DatabaseSync(':memory:')
+    const store = new NovelStore(db)
+    const writer = new NovelWriter({
+      files,
+      store,
+      db,
+      now: () => new Date('2026-11-07T01:00:00Z'),
+      ask: async (role, system, user, maxTokens, context) => {
+        if (system === WRITER_SYSTEM) {
+          return { text: '⚠ failed to construct executor: unknown model key MODEL_PLACEHOLDER_M525: model not found', truncated: false, costUsd: 0.001 }
+        }
+        return innerAsk(role, system, user, maxTokens, context)
+      },
+    })
+
+    const arc = await writer.nextArc()
+    await expect(writer.writeChapter(arc)).rejects.toBeInstanceOf(ModelFailure)
+    expect(files.readWork(1, 'draft-0.md')).toBeUndefined()
+    expect(files.readChapter(1)).toBeUndefined()
+    expect(files.readBook().lastChapter).toBe(0)
+  })
+
+  it('discards pre-existing corrupted draft-0 checkpoint on disk and regenerates valid prose', async () => {
+    const script: Script = { calls: [] }
+    let stopOnce = true
+    const { files, writer } = setup(script, f => {
+      if (stopOnce && f.readWork(1, 'contract.json')) {
+        stopOnce = false
+        throw new Stopped()
+      }
+    })
+    const arc = await writer.nextArc()
+    await expect(writer.writeChapter(arc)).rejects.toBeInstanceOf(Stopped)
+
+    // 模拟历史版本留下的被网关报错污染的 draft-0 检查点
+    files.writeWork(1, 'draft-0.md', '# 试炼1\n\n⚠ failed to construct executor: unknown model key MODEL_PLACEHOLDER_M525: model not found')
+    const outcome = await writer.writeChapter(arc)
+    expect(outcome.n).toBe(1)
+    expect(outcome.status).toBe('committed')
+    expect(drafts(script)).toBe(1)
+    const committed = files.readChapter(1) ?? ''
+    expect(committed).not.toContain('failed to construct executor')
+    expect(committed).toContain(quoteOf(1))
   })
 })
