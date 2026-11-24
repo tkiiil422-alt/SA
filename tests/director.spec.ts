@@ -1748,5 +1748,45 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
       expect(st.effectiveOutputTokens).toBe(104_857)
       service.close()
     })
+
+    it('retries HTTP 200 disguised upstream errors in callToolModel SSE stream and returns 502 once retries exhaust', async () => {
+      const sseReply = (text: string) => [
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })}\n\n`,
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":24}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ].join('')
+
+      let calls = 0
+      const recoverFetch: typeof fetch = async () => {
+        calls += 1
+        const body = calls === 1
+          ? sseReply('⚠ failed to construct executor: plan model not specified; you must specify a valid model')
+          : sseReply('正常回复')
+        return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+      }
+      const recovered = await callToolModel(
+        { api: 'anthropic-messages', baseUrl: 'https://api.example.com', apiKey: 'sk-test' },
+        { model: 'gemini-4-neon', system: 'sys', messages: [{ role: 'user', content: 'hi' }], tools: [], maxTokens: 512 },
+        { timeoutMs: 5000, stream: true, maxRetries: 1, retryDelayMs: 5, fetch: recoverFetch },
+      )
+      expect(calls).toBe(2)
+      expect(recovered.ok).toBe(true)
+      expect(recovered.text).toBe('正常回复')
+
+      const failFetch: typeof fetch = async () => new Response(
+        sseReply('⚠ failed to construct executor: plan model not specified; you must specify a valid model'),
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+      const exhausted = await callToolModel(
+        { api: 'anthropic-messages', baseUrl: 'https://api.example.com', apiKey: 'sk-test' },
+        { model: 'gemini-4-neon', system: 'sys', messages: [{ role: 'user', content: 'hi' }], tools: [], maxTokens: 512 },
+        { timeoutMs: 5000, stream: true, maxRetries: 0, retryDelayMs: 5, fetch: failFetch },
+      )
+      expect(exhausted.ok).toBe(false)
+      expect(exhausted.status).toBe(502)
+      expect(exhausted.text).toBe('')
+      expect(exhausted.error).toContain('伪装报错')
+      expect(exhausted.error).toContain('failed to construct executor')
+    })
   })
 })

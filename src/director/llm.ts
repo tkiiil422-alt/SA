@@ -10,6 +10,7 @@ import { createSseUsageParser, usageFrom, type Usage } from '../gateway/usage.ts
 import {
   appendSafetyFilterHint,
   describeFetchError,
+  detectDisguisedUpstreamError,
   isRetryableNetworkError,
   RETRYABLE_HTTP_STATUSES,
   retryBackoffMs,
@@ -654,6 +655,26 @@ export async function callToolModel(
       : undefined
     // 重试时禁用 keep-alive 连接复用，强制建立全新 TCP+TLS 连接，避免撞到代理/TUN 半开旧套接字。
     const attemptHeaders = attempt > 0 ? { ...headers, connection: 'close' } : headers
+    const handleDisguised = async (disguised: string, statusCode: number, usage?: Usage): Promise<ToolModelResult | null> => {
+      if (attempt < maxRetries && (deadline - Date.now()) > minRetryBudgetMs) {
+        const wait = Math.min(
+          retryBackoffMs(attempt, retryDelayMs),
+          Math.max(0, deadline - Date.now() - minRetryBudgetMs),
+        )
+        await sleepMs(wait)
+        return null
+      }
+      const suffix = attempt > 0 ? `（已自动重试 ${attempt} 次）` : ''
+      return {
+        ok: false,
+        status: 502,
+        text: '',
+        toolCalls: [],
+        latencyMs: Date.now() - started,
+        ...(usage ? { usage } : {}),
+        error: `上游网关 HTTP ${statusCode} 伪装报错：${redact(disguised).slice(0, ERROR_TAIL_CHARS)}${suffix}`,
+      }
+    }
     try {
       const response = await doFetch(url, {
         method: 'POST',
@@ -664,6 +685,14 @@ export async function callToolModel(
       if (stallTimer) clearTimeout(stallTimer)
       if (opts.stream === true && response.ok && (response.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
         const streamed = await readToolStream(target.api, response)
+        if (streamed.toolCalls.length === 0) {
+          const disguised = detectDisguisedUpstreamError(streamed.text)
+          if (disguised) {
+            const failure = await handleDisguised(disguised, response.status, streamed.usage)
+            if (!failure) continue
+            return failure
+          }
+        }
         return {
           ok: true,
           status: response.status,
@@ -708,6 +737,14 @@ export async function callToolModel(
       }
       const usage = usageFrom(json)
       const extracted = target.api === 'openai-completions' ? extractOpenAiResponse(json) : extractAnthropicResponse(json)
+      if (extracted.toolCalls.length === 0) {
+        const disguised = detectDisguisedUpstreamError(extracted.text)
+        if (disguised) {
+          const failure = await handleDisguised(disguised, response.status, usage)
+          if (!failure) continue
+          return failure
+        }
+      }
       return {
         ok: true,
         status: response.status,

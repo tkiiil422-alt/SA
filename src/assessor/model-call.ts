@@ -162,6 +162,21 @@ export function isRetryableNetworkError(error: unknown): boolean {
   return RETRYABLE_ERROR_TEXT.test(error.message)
 }
 
+const DISGUISED_ERROR_MARKED_RE = /^[⚠❌]\uFE0F?\s*(?:failed\s+to\s+construct\s+executor|upstream\s+(?:error|timeout|aborted|unavailable|overloaded|failed)|internal\s+(?:server\s+)?error|bad\s+gateway|service\s+unavailable|gateway\s+timeout|rate\s*limit|too\s+many\s+requests|model\s+(?:not\s+found|not\s+specified|unavailable|overloaded)|connection\s+(?:reset|refused|closed)|invalid\s+(?:model|api\s*key|token)|error:|exception:)/i
+const DISGUISED_ERROR_PLAIN_RE = /^(?:failed\s+to\s+construct\s+executor\s*:|upstream\s+(?:request\s+)?(?:failed|error|timeout|response\s+aborted)\s*:|bad\s+gateway\s*:|service\s+unavailable\s*:|gateway\s+timeout\s*:)/i
+
+/** 识别中转网关伪装成 HTTP 200 正文吐出的简短内部错误信息（防止误把网关报错当正式回复或跳过重试）。 */
+export function detectDisguisedUpstreamError(text: string): string | undefined {
+  const clean = text.trim()
+  if (!clean || clean.length > 600) return undefined
+  const nonEmptyLines = clean.split(/\r?\n/).filter(line => line.trim().length > 0)
+  if (nonEmptyLines.length > 3) return undefined
+  if (DISGUISED_ERROR_MARKED_RE.test(clean) || DISGUISED_ERROR_PLAIN_RE.test(clean)) {
+    return clean
+  }
+  return undefined
+}
+
 /** 计算下一次重试等待毫秒数（优先尊重 Retry-After，其次指数退避 + 轻微抖动）。 */
 export function retryBackoffMs(attempt: number, baseDelayMs: number, retryAfterHeader?: string | null): number {
   if (retryAfterHeader) {
@@ -225,6 +240,25 @@ export async function callModel(target: ModelTarget, request: ModelRequest, opts
     const timer = setTimeout(() => controller.abort(), remaining)
     // 重试时强制关闭连接复用，绕开代理/TUN 中可能已半开的陈旧 keep-alive 套接字。
     const attemptHeaders = attempt > 0 ? { ...headers, connection: 'close' } : headers
+    const handleDisguised = async (disguised: string, statusCode: number, usage?: Usage): Promise<ModelCallResult | null> => {
+      if (attempt < maxRetries && (deadline - Date.now()) > MIN_RETRY_BUDGET_MS) {
+        const wait = Math.min(
+          retryBackoffMs(attempt, retryDelayMs),
+          Math.max(0, deadline - Date.now() - MIN_RETRY_BUDGET_MS),
+        )
+        await sleepMs(wait)
+        return null
+      }
+      const suffix = attempt > 0 ? ` (after ${attempt} retries)` : ''
+      return {
+        ok: false,
+        status: 502,
+        text: '',
+        latencyMs: Date.now() - started,
+        ...(usage ? { usage } : {}),
+        error: `disguised HTTP ${statusCode} upstream error: ${redact(disguised).slice(0, ERROR_TAIL_CHARS)}${suffix}`,
+      }
+    }
     try {
       const response = await doFetch(url, {
         method: 'POST',
@@ -236,6 +270,12 @@ export async function callModel(target: ModelTarget, request: ModelRequest, opts
       if (opts.stream === true && response.ok && (response.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
         const streamed = await readStream(target.api, response)
         const usage = streamed.usage
+        const disguised = detectDisguisedUpstreamError(streamed.text)
+        if (disguised) {
+          const failure = await handleDisguised(disguised, response.status, usage)
+          if (!failure) continue
+          return failure
+        }
         return {
           ok: true,
           status: response.status,
@@ -276,10 +316,17 @@ export async function callModel(target: ModelTarget, request: ModelRequest, opts
         return { ok: false, status: response.status, text: '', latencyMs, error: 'response is not JSON' }
       }
       const usage = usageFrom(json)
+      const text = extractText(target.api, json)
+      const disguised = detectDisguisedUpstreamError(text)
+      if (disguised) {
+        const failure = await handleDisguised(disguised, response.status, usage)
+        if (!failure) continue
+        return failure
+      }
       return {
         ok: true,
         status: response.status,
-        text: extractText(target.api, json),
+        text,
         latencyMs,
         ...(usage ? { usage } : {}),
         ...(isTruncated(target.api, json) ? { truncated: true } : {}),

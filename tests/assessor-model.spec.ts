@@ -11,7 +11,7 @@ import {
   ModelAssessor,
   parseAnalysis,
 } from '../src/assessor/model.ts'
-import { callModel, type ModelCallResult, type ModelRequest, type ModelTarget } from '../src/assessor/model-call.ts'
+import { callModel, detectDisguisedUpstreamError, type ModelCallResult, type ModelRequest, type ModelTarget } from '../src/assessor/model-call.ts'
 import type { AssessmentOutcome, Candidate, EngineForMainSession, Outcome, Strength } from '../src/core/index.ts'
 import { ModelChoices } from '../src/ledger/choices.ts'
 import type { Assessment } from '../src/policy.ts'
@@ -604,6 +604,58 @@ describe('callModel', () => {
     expect(result.status).toBe(401)
     expect(result.error).toContain('HTTP 401')
     expect(result.error).not.toContain('sk-leak-123')
+  })
+
+  it('detects disguised HTTP 200 upstream gateway errors without false-positiving on normal prose', () => {
+    expect(detectDisguisedUpstreamError('⚠ failed to construct executor: plan model not specified; you must specify a valid model'))
+      .toBe('⚠ failed to construct executor: plan model not specified; you must specify a valid model')
+    expect(detectDisguisedUpstreamError('❌ upstream error: bad gateway')).toBe('❌ upstream error: bad gateway')
+    expect(detectDisguisedUpstreamError('upstream request failed: connection reset')).toBeTruthy()
+    expect(detectDisguisedUpstreamError('⚠ 当前暂无运行中工单，已跳过本次巡检')).toBeUndefined()
+    expect(detectDisguisedUpstreamError('原因如下：\n1. 网关日志\n2. 请检查\n3. 详情见下')).toBeUndefined()
+  })
+
+  it('retries disguised HTTP 200 errors in both SSE and JSON responses and returns 502 when retries exhaust', async () => {
+    let sseAttempt = 0
+    respond = res => {
+      sseAttempt += 1
+      res.setHeader('content-type', 'text/event-stream; charset=utf-8')
+      const text = sseAttempt === 1
+        ? '⚠ failed to construct executor: plan model not specified; you must specify a valid model'
+        : '{"ok":true}'
+      res.end([
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })}\n\n`,
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ].join(''))
+    }
+    const sseRecovered = await callModel({ api: 'anthropic-messages', baseUrl: base, apiKey: 'ak' }, request, {
+      timeoutMs: 3000,
+      stream: true,
+      maxRetries: 1,
+      retryDelayMs: 5,
+    })
+    expect(sseAttempt).toBe(2)
+    expect(sseRecovered).toMatchObject({ ok: true, text: '{"ok":true}' })
+
+    let jsonAttempt = 0
+    respond = res => {
+      jsonAttempt += 1
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({
+        choices: [{ message: { content: '⚠ failed to construct executor: plan model not specified; you must specify a valid model' }, finish_reason: 'stop' }],
+      }))
+    }
+    const exhausted = await callModel({ api: 'openai-completions', baseUrl: base, apiKey: 'ak' }, request, {
+      timeoutMs: 3000,
+      maxRetries: 1,
+      retryDelayMs: 5,
+    })
+    expect(jsonAttempt).toBe(2)
+    expect(exhausted.ok).toBe(false)
+    expect(exhausted.status).toBe(502)
+    expect(exhausted.text).toBe('')
+    expect(exhausted.error).toContain('disguised HTTP 200 upstream error')
+    expect(exhausted.error).toContain('failed to construct executor')
   })
 })
 
