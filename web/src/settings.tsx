@@ -645,6 +645,9 @@ function DirectorForm({ f, set }: FormProps) {
         <Num label="模型请求失败最多重试次数" hint="0–20 次，默认 5（遇断连 / 5xx 自动新建连接重试）" step={1} min={0} max={20} v={f.maxRetries ?? 5} set={v => set({ maxRetries: v })} />
         <Num label="单步模型请求超时（秒）" hint="30–3600 秒，默认 1800（30 分钟，适配高推理长时间思考）" step={30} min={30} max={3600} v={f.stepTimeoutSec ?? 1800} set={v => set({ stepTimeoutSec: v })} />
         <Num label="流式首包看门狗超时（秒）" hint="0–3600 秒，默认 1500（25 分钟；0 表示关闭，等待上游思考完再吐字）" step={15} min={0} max={3600} v={f.firstByteTimeoutSec ?? 1500} set={v => set({ firstByteTimeoutSec: v })} />
+        <Num label="上下文对齐比例（%）" hint="10–95%，默认 80（自动对齐当前模型上下文并缩小 20%，如 1M 模型 ≈ 800,000 tokens）" step={5} min={10} max={95} v={f.contextWindowPercent ?? 80} set={v => set({ contextWindowPercent: v })} />
+        <Num label="上下文硬上限（tokens，0=自动）" hint="0 表示按上方比例自动对齐模型上下文；设正整数时再按不超过模型 95% 封顶" step={10000} min={0} max={10000000} v={f.maxContextTokens ?? 0} set={v => set({ maxContextTokens: v })} />
+        <Num label="单步最大输出（tokens，0=自动）" hint="0 表示按比例自动对齐模型 maxTokens 且不超过剩余上下文余量（默认约 80%）" step={1024} min={0} max={1000000} v={f.maxOutputTokens ?? 0} set={v => set({ maxOutputTokens: v })} />
         <Num label="总控每日独立预算（美元）" hint="0 表示仅受全局每日预算约束" min={0} max={1000} v={f.dailyUsd ?? 5} set={v => set({ dailyUsd: v })} />
       </div>
       <Area label="主人附加指令（可选）" hint="追加到总控系统提示词末尾，如称呼偏好、默认模型习惯、汇报风格等" rows={4} v={f.extraPrompt || ''} set={v => set({ extraPrompt: v })} />

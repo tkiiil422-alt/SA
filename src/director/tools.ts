@@ -70,6 +70,8 @@ export interface ToolRunContext {
   confirmHighRisk: boolean
   /** 仅在用户显式批准 PendingAction 后由代码置为 true。 */
   bypassConfirm?: boolean
+  /** 动态工具返回文本上限（字符数，未传时按默认 MAX_TOOL_OUTPUT_CHARS）。 */
+  maxOutputChars?: number
 }
 
 export interface ToolRunResult {
@@ -80,7 +82,7 @@ export interface ToolRunResult {
 }
 
 const MAX_TOOL_OUTPUT_CHARS = 12_000
-const MAX_READ_BYTES = 128 * 1024
+const MAX_READ_BYTES = 384 * 1024
 
 function str(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v.trim() : fallback
@@ -110,10 +112,11 @@ function strArray(v: unknown, max = 50): string[] {
   return v.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map(x => x.trim()).slice(0, max)
 }
 
-function clampOutput(text: string, redact: (s: string) => string): string {
+function clampOutput(text: string, redact: (s: string) => string, maxChars = MAX_TOOL_OUTPUT_CHARS): string {
   const clean = redact(text)
-  if (clean.length <= MAX_TOOL_OUTPUT_CHARS) return clean
-  return `${clean.slice(0, MAX_TOOL_OUTPUT_CHARS - 80)}\n…（内容超过 ${MAX_TOOL_OUTPUT_CHARS} 字上限已截断，可缩小查询范围或分页读取）`
+  const cap = Math.max(2_000, Math.min(200_000, Math.floor(maxChars)))
+  if (clean.length <= cap) return clean
+  return `${clean.slice(0, cap - 80)}\n…（内容超过 ${cap} 字上限已截断，可缩小查询范围或分页读取）`
 }
 
 function wrapUntrusted(label: string, text: string): string {
@@ -214,12 +217,12 @@ export class DirectorToolExecutor {
 
     const out = (data: unknown, extra: Partial<ToolRunResult> = {}): ToolRunResult => ({
       ok: true,
-      output: clampOutput(typeof data === 'string' ? data : JSON.stringify(data, null, 2), this.deps.redact),
+      output: clampOutput(typeof data === 'string' ? data : JSON.stringify(data, null, 2), this.deps.redact, ctx.maxOutputChars),
       ...extra,
     })
     const fail = (message: string): ToolRunResult => ({
       ok: false,
-      output: clampOutput(JSON.stringify({ ok: false, error: message }), this.deps.redact),
+      output: clampOutput(JSON.stringify({ ok: false, error: message }), this.deps.redact, ctx.maxOutputChars),
     })
     const needConfirm = (summary: string, cleanArgs: Record<string, unknown>): ToolRunResult | undefined => {
       if (!ctx.confirmHighRisk || ctx.bypassConfirm) return undefined

@@ -112,6 +112,10 @@ export interface DirectorSessionDetail {
 export interface DirectorStatus {
   enabled: boolean
   model: string
+  modelContextWindow: number
+  contextWindowPercent: number
+  effectiveContextTokens: number
+  effectiveOutputTokens: number
   notifyScope: DirectorOptions['notifyScope']
   confirmHighRisk: boolean
   sessions: number
@@ -119,6 +123,85 @@ export interface DirectorStatus {
   pendingFollowups: number
   todayUsd: number
   dailyUsd: number
+}
+
+export interface DirectorContextBudget {
+  modelContextWindow: number
+  modelMaxTokens: number
+  contextWindowPercent: number
+  effectiveContextTokens: number
+  effectiveOutputTokens: number
+  maxHistoryMessages: number
+  toolOutputLiveChars: number
+  toolOutputHistoryChars: number
+  compactTriggerTokens: number
+  compactKeepTokens: number
+  summaryMaxChars: number
+  summaryMaxTokens: number
+}
+
+/** 保守估算文本占用的 Token 数：中日韩表意字符按 1.0/字，其余字符按 0.35/字符向上取整。 */
+export function estimateTextTokens(text: string): number {
+  if (!text) return 0
+  let cjk = 0
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i)
+    if (
+      (code >= 0x4e00 && code <= 0x9fff)
+      || (code >= 0x3400 && code <= 0x4dbf)
+      || (code >= 0x3000 && code <= 0x30ff)
+      || (code >= 0xff00 && code <= 0xffef)
+    ) {
+      cjk += 1
+    }
+  }
+  const nonCjk = text.length - cjk
+  return Math.ceil(cjk + nonCjk * 0.35)
+}
+
+/** 按当前模型上下文与总控配置计算有效上下文预算，默认按模型上下文的 80%（缩小 20%）对齐。 */
+export function computeDirectorContextBudget(
+  model: { contextWindow: number; maxTokens: number },
+  cfg: Pick<DirectorOptions, 'contextWindowPercent' | 'maxContextTokens' | 'maxOutputTokens'>,
+): DirectorContextBudget {
+  const pct = Math.max(10, Math.min(95, Math.round(cfg.contextWindowPercent ?? 80)))
+  const ratio = pct / 100
+  const modelContextWindow = Math.max(4_096, Math.floor(model.contextWindow || 128_000))
+  const modelMaxTokens = Math.max(256, Math.floor(model.maxTokens || 4_096))
+
+  const effectiveContextTokens = (cfg.maxContextTokens ?? 0) > 0
+    ? Math.max(4_096, Math.min(cfg.maxContextTokens!, Math.floor(modelContextWindow * 0.95)))
+    : Math.max(4_096, Math.floor(modelContextWindow * ratio))
+
+  const headroom = Math.max(4_096, modelContextWindow - effectiveContextTokens)
+  const autoOutput = Math.min(modelMaxTokens, Math.max(1_024, Math.floor(modelMaxTokens * ratio)))
+  const requestedOutput = (cfg.maxOutputTokens ?? 0) > 0
+    ? Math.min(cfg.maxOutputTokens!, modelMaxTokens)
+    : autoOutput
+  const effectiveOutputTokens = Math.min(modelMaxTokens, Math.max(1_024, Math.min(requestedOutput, headroom)))
+
+  const maxHistoryMessages = Math.max(36, Math.min(600, Math.floor(effectiveContextTokens / 1_000)))
+  const toolOutputLiveChars = Math.max(12_000, Math.min(120_000, Math.floor(effectiveContextTokens * 0.12)))
+  const toolOutputHistoryChars = Math.max(2_400, Math.min(32_000, Math.floor(effectiveContextTokens * 0.04)))
+  const compactTriggerTokens = Math.max(8_000, Math.floor(effectiveContextTokens * 0.85))
+  const compactKeepTokens = Math.max(4_000, Math.floor(effectiveContextTokens * 0.40))
+  const summaryMaxChars = Math.max(1_500, Math.min(8_000, Math.floor(effectiveContextTokens * 0.01)))
+  const summaryMaxTokens = Math.min(modelMaxTokens, Math.min(4_096, Math.max(600, Math.ceil(summaryMaxChars / 2))))
+
+  return {
+    modelContextWindow,
+    modelMaxTokens,
+    contextWindowPercent: pct,
+    effectiveContextTokens,
+    effectiveOutputTokens,
+    maxHistoryMessages,
+    toolOutputLiveChars,
+    toolOutputHistoryChars,
+    compactTriggerTokens,
+    compactKeepTokens,
+    summaryMaxChars,
+    summaryMaxTokens,
+  }
 }
 
 const MAX_TOOL_OUTPUT_IN_HISTORY = 2400
@@ -212,7 +295,21 @@ function safeSummary(text: string, max = 140): string {
  * - 确保第一条必须是 `user`，绝不以孤立的 `tool` 或 `assistant` 开头；
  * - 确保每条带 `toolCalls` 的 `assistant` 后都有配对的 `tool` 结果，否则丢弃不完整片段避免上游 400。
  */
-export function buildConversationWindow(messages: readonly DirectorMessage[], maxItems = ACTIVE_WINDOW_MESSAGES): AgentMessage[] {
+export function buildConversationWindow(
+  messages: readonly DirectorMessage[],
+  maxItemsOrOpts: number | { maxItems?: number; maxTokens?: number; maxToolOutputChars?: number } = ACTIVE_WINDOW_MESSAGES,
+): AgentMessage[] {
+  const maxItems = typeof maxItemsOrOpts === 'number'
+    ? maxItemsOrOpts
+    : (maxItemsOrOpts.maxItems ?? ACTIVE_WINDOW_MESSAGES)
+  const maxTokens = typeof maxItemsOrOpts === 'number' ? undefined : maxItemsOrOpts.maxTokens
+  const maxToolOutputChars = Math.max(
+    500,
+    typeof maxItemsOrOpts === 'number'
+      ? MAX_TOOL_OUTPUT_IN_HISTORY
+      : (maxItemsOrOpts.maxToolOutputChars ?? MAX_TOOL_OUTPUT_IN_HISTORY),
+  )
+
   const tail = messages.length > maxItems ? messages.slice(-maxItems) : [...messages]
   // 跳过开头的非 user/event 消息，确保首条不是悬空的 tool 或 assistant
   let start = 0
@@ -220,17 +317,17 @@ export function buildConversationWindow(messages: readonly DirectorMessage[], ma
     start += 1
   }
   const sliced = tail.slice(start)
-  const out: AgentMessage[] = []
+  const groups: AgentMessage[][] = []
 
   for (let i = 0; i < sliced.length; i += 1) {
     const msg = sliced[i]!
     if (msg.role === 'user') {
-      out.push({ role: 'user', content: msg.content })
+      groups.push([{ role: 'user', content: msg.content }])
     } else if (msg.role === 'event') {
-      out.push({ role: 'user', content: `[平台后台事件通知]\n${msg.content}` })
+      groups.push([{ role: 'user', content: `[平台后台事件通知]\n${msg.content}` }])
     } else if (msg.role === 'assistant') {
       if (msg.toolCalls && msg.toolCalls.length > 0) {
-        // 收集紧随其后的匹配 tool 结果
+        // 收集紧随其后的匹配 tool 结果，确保配对组原子裁剪不拆散
         const expected = new Set(msg.toolCalls.map(tc => tc.id))
         const results: AgentMessage[] = []
         let j = i + 1
@@ -241,8 +338,8 @@ export function buildConversationWindow(messages: readonly DirectorMessage[], ma
               role: 'tool',
               toolCallId: t.toolCallId,
               name: t.toolName || 'tool',
-              content: t.content.length > MAX_TOOL_OUTPUT_IN_HISTORY
-                ? `${t.content.slice(0, MAX_TOOL_OUTPUT_IN_HISTORY)}…（历史工具输出已省略）`
+              content: t.content.length > maxToolOutputChars
+                ? `${t.content.slice(0, maxToolOutputChars)}…（历史工具输出已省略）`
                 : t.content,
             })
             expected.delete(t.toolCallId)
@@ -250,19 +347,39 @@ export function buildConversationWindow(messages: readonly DirectorMessage[], ma
           j += 1
         }
         if (expected.size === 0) {
-          out.push({ role: 'assistant', content: msg.content, toolCalls: msg.toolCalls })
-          out.push(...results)
+          groups.push([{ role: 'assistant', content: msg.content, toolCalls: msg.toolCalls }, ...results])
         } else if (msg.content.trim()) {
-          out.push({ role: 'assistant', content: msg.content })
+          groups.push([{ role: 'assistant', content: msg.content }])
         }
         i = j - 1
       } else {
-        out.push({ role: 'assistant', content: msg.content })
+        groups.push([{ role: 'assistant', content: msg.content }])
       }
     }
     // 悬空的 tool 消息自然跳过
   }
-  return out
+
+  if (maxTokens === undefined || maxTokens <= 0 || groups.length === 0) {
+    return groups.flat()
+  }
+
+  const groupTokens = (g: readonly AgentMessage[]): number => g.reduce((acc, m) => (
+    acc + estimateTextTokens(m.content) + ('toolCalls' in m && m.toolCalls ? estimateTextTokens(JSON.stringify(m.toolCalls)) : 0) + 16
+  ), 0)
+
+  const selected: AgentMessage[][] = []
+  let usedTokens = 0
+  for (let i = groups.length - 1; i >= 0; i -= 1) {
+    const g = groups[i]!
+    const gt = groupTokens(g)
+    if (selected.length > 0 && usedTokens + gt > maxTokens) break
+    selected.unshift(g)
+    usedTokens += gt
+  }
+  while (selected.length > 1 && selected[0]![0]?.role !== 'user') {
+    selected.shift()
+  }
+  return selected.flat()
 }
 
 interface PendingInboundBatch {
@@ -680,8 +797,8 @@ export class DirectorService {
       }
     }
 
-    const active = this.store.activeMessages(session.id, ACTIVE_WINDOW_MESSAGES + 12)
-    const conversation = buildConversationWindow(active, ACTIVE_WINDOW_MESSAGES)
+    let activeModel = resolved
+    let ctxBudget = computeDirectorContextBudget(activeModel, cfg)
     const pendingBefore = this.store.listPendingActions(session.id, true)
     const pendingFollowups = this.store.listFollowups(session.id, true)
     const freshSession = this.store.getSession(session.id) ?? session
@@ -702,6 +819,14 @@ export class DirectorService {
       ...(liveSnapshot ? { liveSnapshot } : {}),
       ...(pluginSections && pluginSections.length > 0 ? { pluginSections } : {}),
     })
+    const systemTokens = estimateTextTokens(systemPrompt) + estimateTextTokens(JSON.stringify(this.tools.definitions()))
+    const historyTokenBudget = Math.max(2_048, ctxBudget.effectiveContextTokens - systemTokens)
+    const active = this.store.activeMessages(session.id, ctxBudget.maxHistoryMessages + 24)
+    const conversation = buildConversationWindow(active, {
+      maxItems: ctxBudget.maxHistoryMessages,
+      maxTokens: historyTokenBudget,
+      maxToolOutputChars: ctxBudget.toolOutputHistoryChars,
+    })
 
     const toolsUsed: DirectorToolAudit[] = []
     const maxRetries = Math.max(0, Math.min(20, cfg.maxRetries ?? 5))
@@ -714,7 +839,6 @@ export class DirectorService {
     let deadline = Date.now() + turnTimeoutMs
     const maxSteps = Math.max(1, Math.min(15, cfg.maxToolSteps))
     const sessionKey = `director-${input.channel}-${input.userId}`
-    let activeModel = resolved
     let fallbackUsed = false
     let finalReply = ''
     let modelFailed = false
@@ -763,7 +887,7 @@ export class DirectorService {
           system: systemPrompt,
           messages: callMessages,
           tools: allowTools ? this.tools.definitions() : [],
-          maxTokens: Math.min(4096, activeModel.maxTokens),
+          maxTokens: ctxBudget.effectiveOutputTokens,
         }, {
           timeoutMs: Math.min(stepTimeoutMs, remainingMs),
           sessionId: sessionKey,
@@ -782,6 +906,7 @@ export class DirectorService {
             fallbackUsed = true
             const prevRef = activeModel.ref
             activeModel = alt
+            ctxBudget = computeDirectorContextBudget(activeModel, cfg)
             this.logEvent('director.model_fallback', 'warn', `总控主模型 ${prevRef} 调用异常，自动切换备选模型 ${alt.ref}`, {
               sessionId: session.id,
               from: prevRef,
@@ -800,7 +925,7 @@ export class DirectorService {
               system: systemPrompt,
               messages: callMessages,
               tools: allowTools ? this.tools.definitions() : [],
-              maxTokens: Math.min(4096, activeModel.maxTokens),
+              maxTokens: ctxBudget.effectiveOutputTokens,
             }, {
               timeoutMs: stepTimeoutMs,
               sessionId: `${sessionKey}-fb`,
@@ -925,6 +1050,7 @@ export class DirectorService {
           const runRes = await this.tools.run(tc.name, tc.arguments, {
             session: this.store.getSession(session.id) ?? session,
             confirmHighRisk: cfg.confirmHighRisk,
+            maxOutputChars: ctxBudget.toolOutputLiveChars,
           })
           const ms = Date.now() - t0
           const sum = safeSummary(runRes.output, 160)
@@ -1150,10 +1276,15 @@ export class DirectorService {
       return { ok: true, ...(updated ? { action: redactPendingAction(updated) } : {}), message: `已取消操作 #${action.id}（${action.summary}）。` }
     }
 
+    const approvedBudget = this.resolveModel()
+    const maxOutputChars = approvedBudget
+      ? computeDirectorContextBudget(approvedBudget, this.deps.options.get().director).toolOutputLiveChars
+      : undefined
     const executed = await this.tools.run(action.toolName, action.args, {
       session,
       confirmHighRisk: false,
       bypassConfirm: true,
+      ...(maxOutputChars ? { maxOutputChars } : {}),
     })
     this.store.setActionStatus(action.id, 'approved', executed.output.slice(0, 1000), safeAction.args)
     this.logEvent('director.confirm_approved', 'info', `已批准并执行高危操作 #${action.id}`, {
@@ -1781,9 +1912,20 @@ export class DirectorService {
   status(): DirectorStatus {
     const opts = this.deps.options.get()
     const resolved = this.resolveModel()
+    const fallbackFound = resolved ? undefined : findModel(opts.models, opts.models.routing.worker)
+    const budgetModel = resolved
+      ? { contextWindow: resolved.contextWindow, maxTokens: resolved.maxTokens }
+      : fallbackFound
+        ? { contextWindow: fallbackFound.model.contextWindow, maxTokens: fallbackFound.model.maxTokens }
+        : { contextWindow: 128_000, maxTokens: 4_096 }
+    const ctxBudget = computeDirectorContextBudget(budgetModel, opts.director)
     return {
       enabled: opts.director.enabled,
       model: resolved?.ref ?? formatRef(opts.models.routing.worker),
+      modelContextWindow: ctxBudget.modelContextWindow,
+      contextWindowPercent: ctxBudget.contextWindowPercent,
+      effectiveContextTokens: ctxBudget.effectiveContextTokens,
+      effectiveOutputTokens: ctxBudget.effectiveOutputTokens,
       notifyScope: opts.director.notifyScope,
       confirmHighRisk: opts.director.confirmHighRisk,
       sessions: this.store.listSessions().length,
@@ -1938,7 +2080,7 @@ export class DirectorService {
     return lines.join('\n')
   }
 
-  private resolveModel(): { provider: string; model: string; ref: string; maxTokens: number; target: ModelTarget } | undefined {
+  private resolveModel(): { provider: string; model: string; ref: string; contextWindow: number; maxTokens: number; target: ModelTarget } | undefined {
     const opts = this.deps.options.get()
     const preferred: ModelRef = opts.director.model ?? opts.models.routing.worker
     const found = findModel(opts.models, preferred, { enabledOnly: true })
@@ -1949,6 +2091,7 @@ export class DirectorService {
       provider: provider.id,
       model: model.id,
       ref: formatRef({ provider: provider.id, model: model.id }),
+      contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
       target: {
         api: provider.api,
@@ -1960,7 +2103,7 @@ export class DirectorService {
   }
 
   /** 主总控模型上游故障时，优先跨服务商挑选可用模型兜底重试，规避单点网关故障；若无其他服务商则回落同服务商其他模型。 */
-  private resolveFallbackModel(excludeRef: string): { provider: string; model: string; ref: string; maxTokens: number; target: ModelTarget } | undefined {
+  private resolveFallbackModel(excludeRef: string): { provider: string; model: string; ref: string; contextWindow: number; maxTokens: number; target: ModelTarget } | undefined {
     const opts = this.deps.options.get()
     const excludeProvider = parseRef(excludeRef)?.provider
     const toTarget = (
@@ -1971,6 +2114,7 @@ export class DirectorService {
       provider: provider.id,
       model: model.id,
       ref,
+      contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
       target: {
         api: provider.api,
@@ -2051,9 +2195,29 @@ export class DirectorService {
 
   private maybeCompactAsync(sessionId: string): void {
     if (this.compacting.has(sessionId) || this.activeTurns.has(sessionId) || this.closed) return
-    const active = this.store.activeMessages(sessionId, COMPACT_TRIGGER_MESSAGES + 10)
-    if (active.length < COMPACT_TRIGGER_MESSAGES) return
-    const cutIndex = findSafeCompactCutIndex(active, COMPACT_KEEP_TAIL)
+    const opts = this.deps.options.get()
+    const resolved = this.resolveModel()
+    if (!resolved) return
+    const ctxBudget = computeDirectorContextBudget(resolved, opts.director)
+    const active = this.store.activeMessages(sessionId, ctxBudget.maxHistoryMessages + 40)
+    const msgTokens = active.map(m => (
+      estimateTextTokens(m.content) + (m.toolCalls ? estimateTextTokens(JSON.stringify(m.toolCalls)) : 0) + 12
+    ))
+    const totalTokens = msgTokens.reduce((sum, n) => sum + n, 0)
+    const triggerByCount = active.length >= Math.max(COMPACT_TRIGGER_MESSAGES, ctxBudget.maxHistoryMessages)
+    const triggerByTokens = totalTokens >= ctxBudget.compactTriggerTokens
+    if (!triggerByCount && !triggerByTokens) return
+
+    // 从尾部反向累加 Token 至 compactKeepTokens（且不少于 COMPACT_KEEP_TAIL 条）
+    let keepTokens = 0
+    let keepTail = 0
+    for (let i = active.length - 1; i >= 0; i -= 1) {
+      const mt = msgTokens[i]!
+      if (keepTail >= COMPACT_KEEP_TAIL && keepTokens + mt > ctxBudget.compactKeepTokens) break
+      keepTokens += mt
+      keepTail += 1
+    }
+    const cutIndex = findSafeCompactCutIndex(active, keepTail)
     if (cutIndex <= 4) return
     this.compacting.add(sessionId)
     void (async () => {
@@ -2062,29 +2226,36 @@ export class DirectorService {
         const lastArchiveId = toArchive[toArchive.length - 1]!.id
         const curSession = this.store.getSession(sessionId)
         if (!curSession) return
-        const resolved = this.resolveModel()
-        if (!resolved || !this.checkBudget().ok) return
+        if (!this.checkBudget().ok) return
 
-        const transcript = toArchive
-          .filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'event')
-          .map(m => `${m.role === 'user' ? '用户' : m.role === 'event' ? '事件' : '助手'}：${m.content.slice(0, 400)}`)
-          .join('\n')
+        const maxArchiveChars = Math.max(8_000, Math.floor(ctxBudget.effectiveContextTokens * 0.5))
+        const lines: string[] = []
+        let usedChars = 0
+        for (const m of toArchive) {
+          if (m.role !== 'user' && m.role !== 'assistant' && m.role !== 'event') continue
+          const line = `${m.role === 'user' ? '用户' : m.role === 'event' ? '事件' : '助手'}：${m.content.slice(0, 800)}`
+          if (usedChars + line.length > maxArchiveChars) break
+          lines.push(line)
+          usedChars += line.length + 1
+        }
+        const transcript = lines.join('\n')
         const prompt = [
           curSession.summary ? `已有历史摘要：\n${curSession.summary}\n` : '',
           `新增需归档对话：\n${transcript}`,
         ].join('\n')
 
-        const maxRetries = Math.max(0, Math.min(20, this.deps.options.get().director.maxRetries ?? 5))
+        const targetPromptChars = Math.min(2_000, Math.max(500, Math.floor(ctxBudget.summaryMaxChars * 0.6)))
+        const maxRetries = Math.max(0, Math.min(20, opts.director.maxRetries ?? 5))
         const timeoutMs = Math.min(90_000, 20_000 + maxRetries * 5_000)
         const res = await this.doCallPlain(resolved.target, {
           model: resolved.model,
-          system: '你是对话记忆压缩员。请把已有摘要和新增对话合并为不超过 500 字的精炼中文要点：保留关键工单 ID、项目名、用户偏好、未完事项和关键结论，去掉寒暄和重复内容。',
+          system: `你是对话记忆压缩员。请把已有摘要和新增对话合并为不超过 ${targetPromptChars} 字的精炼中文要点：保留关键工单 ID、项目名、用户偏好、关键文件与技术决策、未完事项和关键结论，去掉寒暄和重复内容。`,
           user: prompt,
-          maxTokens: 600,
+          maxTokens: ctxBudget.summaryMaxTokens,
         }, { timeoutMs, sessionId: `director-compact-${sessionId}`, maxRetries })
         this.recordUsage(resolved.provider, resolved.model, res.status ?? 0, res.usage, res.latencyMs)
         if (res.ok && res.text.trim() && !this.activeTurns.has(sessionId) && !this.closed) {
-          this.store.updateSession(sessionId, { summary: this.deps.redact(res.text.trim()).slice(0, 1500) })
+          this.store.updateSession(sessionId, { summary: this.deps.redact(res.text.trim()).slice(0, ctxBudget.summaryMaxChars) })
           this.store.archiveMessages(sessionId, lastArchiveId)
         }
       } catch (error) {

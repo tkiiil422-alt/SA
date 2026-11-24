@@ -187,6 +187,9 @@ describe('defaultOptions', () => {
         maxRetries: 5,
         stepTimeoutSec: 1800,
         firstByteTimeoutSec: 1500,
+        contextWindowPercent: 80,
+        maxContextTokens: 0,
+        maxOutputTokens: 0,
         dailyUsd: 5,
         extraPrompt: '',
         autoHeal: true,
@@ -603,5 +606,20 @@ describe('OptionsStore change listeners', () => {
     expect(() => options.update('director', { ...base, stepTimeoutSec: 3601 })).toThrow(/3600/)
     expect(() => options.update('director', { ...base, firstByteTimeoutSec: -1 })).toThrow(/0/)
     expect(() => options.update('director', { ...base, firstByteTimeoutSec: 3601 })).toThrow(/3600/)
+  })
+
+  it('validates director contextWindowPercent, maxContextTokens, and maxOutputTokens bounds', () => {
+    const options = store()
+    const base = options.get().director
+    expect(base.contextWindowPercent).toBe(80)
+    expect(base.maxContextTokens).toBe(0)
+    expect(base.maxOutputTokens).toBe(0)
+
+    expect(() => options.update('director', { ...base, contextWindowPercent: 10, maxContextTokens: 0, maxOutputTokens: 0 })).not.toThrow()
+    expect(() => options.update('director', { ...base, contextWindowPercent: 95, maxContextTokens: 10_000_000, maxOutputTokens: 1_000_000 })).not.toThrow()
+    expect(() => options.update('director', { ...base, contextWindowPercent: 99 })).toThrow(/95/)
+    expect(() => options.update('director', { ...base, contextWindowPercent: 5 })).toThrow(/10/)
+    expect(() => options.update('director', { ...base, maxContextTokens: -1 })).toThrow(/0/)
+    expect(() => options.update('director', { ...base, maxOutputTokens: -1 })).toThrow(/0/)
   })
 })

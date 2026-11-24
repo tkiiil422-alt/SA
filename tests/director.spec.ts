@@ -12,7 +12,13 @@ import { DirectorBridge } from '../src/director/bridge.ts'
 import { HostOpsService, isSensitiveHostPath } from '../src/director/host-ops.ts'
 import { isRetryableNetworkError, retryBackoffMs } from '../src/assessor/model-call.ts'
 import { callToolModel, flattenToolHistory, type ToolModelRequest, type ToolModelResult } from '../src/director/llm.ts'
-import { DirectorService, buildConversationWindow, findSafeCompactCutIndex } from '../src/director/service.ts'
+import {
+  DirectorService,
+  buildConversationWindow,
+  computeDirectorContextBudget,
+  estimateTextTokens,
+  findSafeCompactCutIndex,
+} from '../src/director/service.ts'
 import { DirectorStore } from '../src/director/store.ts'
 import { EventLog } from '../src/ledger/events.ts'
 import { Ledger } from '../src/ledger/ledger.ts'
@@ -1606,6 +1612,141 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
       const ms = retryBackoffMs(10, 1000)
       expect(ms).toBeGreaterThanOrEqual(Math.round(15_000 * 0.85))
       expect(ms).toBeLessThanOrEqual(Math.round(15_000 * 1.15))
+    })
+
+    it('computeDirectorContextBudget aligns to 80% of 1M/131k models by default and enforces manual caps & 95% ceiling', () => {
+      const budget1M = computeDirectorContextBudget(
+        { contextWindow: 1_000_000, maxTokens: 131_072 },
+        { contextWindowPercent: 80, maxContextTokens: 0, maxOutputTokens: 0 },
+      )
+      expect(budget1M.modelContextWindow).toBe(1_000_000)
+      expect(budget1M.contextWindowPercent).toBe(80)
+      expect(budget1M.effectiveContextTokens).toBe(800_000)
+      expect(budget1M.effectiveOutputTokens).toBe(104_857)
+      expect(budget1M.maxHistoryMessages).toBe(600)
+      expect(budget1M.toolOutputLiveChars).toBe(96_000)
+      expect(budget1M.toolOutputHistoryChars).toBe(32_000)
+      expect(budget1M.compactTriggerTokens).toBe(680_000)
+      expect(budget1M.compactKeepTokens).toBe(320_000)
+      expect(budget1M.summaryMaxChars).toBe(8_000)
+      expect(budget1M.summaryMaxTokens).toBe(4_000)
+
+      const budget64k = computeDirectorContextBudget(
+        { contextWindow: 64_000, maxTokens: 4_096 },
+        { contextWindowPercent: 80, maxContextTokens: 0, maxOutputTokens: 0 },
+      )
+      expect(budget64k.effectiveContextTokens).toBe(51_200)
+      expect(budget64k.effectiveOutputTokens).toBe(3_276)
+
+      // 手动超配会被限制到模型窗口的 95%，且输出受剩余余量（headroom = 50_000）保护
+      const capped = computeDirectorContextBudget(
+        { contextWindow: 1_000_000, maxTokens: 131_072 },
+        { contextWindowPercent: 80, maxContextTokens: 999_999, maxOutputTokens: 100_000 },
+      )
+      expect(capped.effectiveContextTokens).toBe(950_000)
+      expect(capped.effectiveOutputTokens).toBe(50_000)
+      expect(estimateTextTokens('你好ab')).toBe(3)
+    })
+
+    it('buildConversationWindow trims by token budget without splitting assistant(toolCalls) and tool pairs', () => {
+      const base = { sessionId: 's_tok', archived: false, createdAt: '2026-11-24T00:00:00.000Z' }
+      const messages = [
+        { ...base, id: 1, role: 'user' as const, content: '早期问题' },
+        { ...base, id: 2, role: 'assistant' as const, content: '', toolCalls: [{ id: 'old_tc', name: 'platform_query', arguments: {} }] },
+        { ...base, id: 3, role: 'tool' as const, toolCallId: 'old_tc', toolName: 'platform_query', content: '甲'.repeat(15_000) },
+        { ...base, id: 4, role: 'user' as const, content: '最近问题1' },
+        { ...base, id: 5, role: 'assistant' as const, content: '', toolCalls: [{ id: 'new_tc', name: 'platform_query', arguments: {} }] },
+        { ...base, id: 6, role: 'tool' as const, toolCallId: 'new_tc', toolName: 'platform_query', content: '乙'.repeat(6_000) },
+        { ...base, id: 7, role: 'user' as const, content: '最新追问' },
+      ]
+
+      // 预算足够容纳 最近问题1 + new_tc/tool(不超 10_000 截断) + 最新追问，但放不下早期 15k 的 old_tc 组
+      const win = buildConversationWindow(messages, { maxItems: 50, maxTokens: 8_000, maxToolOutputChars: 10_000 })
+      expect(win[0]?.role).toBe('user')
+      expect(win[0]?.content).toBe('最近问题1')
+      expect(win.map(m => m.role)).toEqual(['user', 'assistant', 'tool', 'user'])
+      const toolMsg = win[2]!
+      expect(toolMsg.role === 'tool' ? toolMsg.content.length : 0).toBe(6_000)
+    })
+
+    it('forwards dynamic effectiveOutputTokens and expanded tool output cap to callTool and /api/director/status', async () => {
+      const env = setup()
+      const wsBigDir = join(env.dir, 'workspaces', 't_alpha', 'output')
+      const bigText = `${`${'大数据块0123456789'.repeat(24)}\n`.repeat(100)}` // ~33,700 字（100 行，超过旧 12,000 字截断但未触及行上限）
+      writeFileSync(join(wsBigDir, 'big.log'), bigText)
+
+      const baseModels = env.options.get().models
+      const p0 = baseModels.providers[0]!
+      const m0 = p0.models[0]!
+      env.options.update('models', {
+        ...baseModels,
+        providers: [{
+          ...p0,
+          id: 'gw1m',
+          enabled: true,
+          models: [{ ...m0, id: 'm1m', contextWindow: 1_000_000, maxTokens: 131_072, autoPick: true }],
+        }],
+        routing: {
+          ...baseModels.routing,
+          worker: { provider: 'gw1m', model: 'm1m' },
+          assessor: { ...baseModels.routing.assessor, provider: 'gw1m', model: 'm1m' },
+        },
+      })
+      env.options.update('director', {
+        ...env.options.get().director,
+        model: { provider: 'gw1m', model: 'm1m' },
+        contextWindowPercent: 80,
+        maxContextTokens: 0,
+        maxOutputTokens: 0,
+      })
+
+      const seenMaxTokens: number[] = []
+      const seenToolOutputs: string[] = []
+      let turn = 0
+      const service = new DirectorService({
+        host: env.fake.host,
+        options: env.options,
+        ledger: env.ledger,
+        events: env.events,
+        store: env.store,
+        redact: env.redact,
+        callTool: async (_target, req) => {
+          turn += 1
+          seenMaxTokens.push(req.maxTokens)
+          for (const m of req.messages) {
+            if (m.role === 'tool') seenToolOutputs.push(m.content)
+          }
+          if (turn === 1) {
+            return {
+              ok: true,
+              status: 200,
+              latencyMs: 5,
+              text: '',
+              toolCalls: [
+                {
+                  id: 'read_big',
+                  name: 'platform_query',
+                  arguments: { action: 'ticket_read_file', params_json: JSON.stringify({ ticketId: 't_alpha', path: 'output/big.log', maxLines: 2000 }) },
+                },
+              ],
+            }
+          }
+          return { ok: true, status: 200, latencyMs: 5, text: '已完整读取大日志。', toolCalls: [] }
+        },
+      })
+
+      const res = await service.chat({ channel: 'web', userId: 'owner', text: '读取 t_alpha/output/big.log 全文' })
+      expect(res.reply).toContain('已完整读取大日志')
+      expect(seenMaxTokens).toEqual([104_857, 104_857])
+      expect(seenToolOutputs[0]?.length).toBeGreaterThan(30_000)
+      expect(seenToolOutputs[0]).not.toContain('内容超过 12000 字上限已截断')
+
+      const st = service.status()
+      expect(st.modelContextWindow).toBe(1_000_000)
+      expect(st.contextWindowPercent).toBe(80)
+      expect(st.effectiveContextTokens).toBe(800_000)
+      expect(st.effectiveOutputTokens).toBe(104_857)
+      service.close()
     })
   })
 })

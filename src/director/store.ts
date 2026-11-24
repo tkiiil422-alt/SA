@@ -192,7 +192,7 @@ CREATE TABLE IF NOT EXISTS director_heal_attempts (
 );
 `
 
-const MAX_MESSAGES_PER_SESSION = 500
+const MAX_MESSAGES_PER_SESSION = 2_000
 const SHORT_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 
 function makeShortCode(): string {

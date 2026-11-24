@@ -686,6 +686,14 @@ export function Director() {
           {st && (
             <span className="dir-bar__meta only-desktop mono">
               {st.model || '未配置模型'}
+              {st.effectiveContextTokens && st.modelContextWindow ? (
+                <>
+                  <span aria-hidden="true"> · </span>
+                  <span title={`有效上下文 ${st.effectiveContextTokens.toLocaleString()} / 模型上限 ${st.modelContextWindow.toLocaleString()} tokens（${st.contextWindowPercent ?? 80}%），单步最大输出 ${(st.effectiveOutputTokens ?? 0).toLocaleString()} tokens`}>
+                    上下文 {Math.round(st.effectiveContextTokens / 1000)}k/{Math.round(st.modelContextWindow / 1000)}k
+                  </span>
+                </>
+              ) : null}
               <span aria-hidden="true"> · </span>
               <span data-ok={st.enabled}>{st.enabled ? '在线' : '已关闭'}</span>
             </span>

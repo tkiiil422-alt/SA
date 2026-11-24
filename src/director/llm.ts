@@ -90,8 +90,9 @@ function looksLikeToolsUnsupported(status: number | undefined, raw: string): boo
   return /(tool|function).*(not\s+support|unsupported|invalid|not\s+allowed)|does\s+not\s+support\s+tools/i.test(raw)
 }
 
-function flattenToolHistory(messages: readonly AgentMessage[]): AgentMessage[] {
+function flattenToolHistory(messages: readonly AgentMessage[], maxToolChars = 12_000): AgentMessage[] {
   const out: AgentMessage[] = []
+  const cap = Math.max(500, Math.floor(maxToolChars))
   for (const msg of messages) {
     if (msg.role === 'user') {
       out.push({ role: 'user', content: msg.content })
@@ -108,7 +109,7 @@ function flattenToolHistory(messages: readonly AgentMessage[]): AgentMessage[] {
       out.push({ role: 'assistant', content: parts.join('\n\n') || ' ' })
     } else {
       const prefix = `[工具返回 ${msg.name}${msg.isError ? '（失败）' : '（成功）'}]`
-      const body = msg.content.length > 3000 ? `${msg.content.slice(0, 2997)}…` : msg.content
+      const body = msg.content.length > cap ? `${msg.content.slice(0, cap - 3)}…` : msg.content
       out.push({ role: 'user', content: `${prefix}\n${body}` })
     }
   }
