@@ -823,13 +823,16 @@ export class DirectorService {
         })
         if (res.reply && this.canDeliver(channel)) {
           try {
-            const replyId = channel === 'feishu' || channel === 'qq' ? messageId : undefined
+            const replyId = (channel === 'feishu' || channel === 'qq') && messageId ? messageId : undefined
             await this.deliverTo(channel, userId, res.reply, replyId, this.createdActionsOf(res))
           } catch (sendErr) {
             const msg = this.deps.redact(sendErr instanceof Error ? sendErr.message : String(sendErr))
             this.logEvent(`director.${channel}_send_failed`, 'warn', `总控回复${label}发送失败：${msg.slice(0, 80)}`, { userId, sessionId: res.sessionId })
             const sess = this.store.getSession(res.sessionId)
-            if (sess) this.store.addUndelivered(sess, res.reply)
+            if (sess) {
+              const cleanReply = res.reply.replace(/^(?:【离线期间补报 \d+ 条】\n[\s\S]*?\n\n---\n\n)+/, '').trim()
+              if (cleanReply) this.store.addUndelivered(sess, cleanReply)
+            }
             this.deps.onError?.(sendErr)
           }
         }
@@ -837,7 +840,7 @@ export class DirectorService {
         this.deps.onError?.(error)
         const errMsg = this.deps.redact(error instanceof Error ? error.message : String(error))
         if (this.canDeliver(channel)) {
-          const replyId = channel === 'feishu' || channel === 'qq' ? messageId : undefined
+          const replyId = (channel === 'feishu' || channel === 'qq') && messageId ? messageId : undefined
           await this.deliverTo(channel, userId, `总控助手处理消息时遇到异常：${errMsg.slice(0, 200)}`, replyId)
             .catch(() => undefined)
         }
@@ -2008,7 +2011,8 @@ export class DirectorService {
     const target = parseQqTarget(targetUserId)
 
     if (action.kind === 'choice' || action.kind === 'command') {
-      this.enqueueTurn('qq', targetUserId, event.chatId, event.messageId ?? event.interactionId, action.text)
+      // 按钮互动回复应使用 QqSource 记录的 event_id，而非把旧消息 messageId 错传成 msg_id
+      this.enqueueTurn('qq', targetUserId, event.chatId, '', action.text)
       return { code: 0 }
     }
 

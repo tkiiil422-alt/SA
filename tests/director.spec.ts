@@ -2049,6 +2049,7 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
     })
     expect(denied.code).toBe(4)
 
+    const countBeforeClick = qqSent.length
     const accepted = await director.handleQqInteraction({
       interactionId: 'int_ok',
       operatorId: 'qq_u1',
@@ -2060,8 +2061,38 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
     })
     expect(accepted.code).toBe(0)
     await director.drain()
-    expect(detail.messages.length).toBeGreaterThanOrEqual(2)
+    expect(qqSent.length).toBe(countBeforeClick + 1)
+    expect(qqSent[countBeforeClick]?.replyTo).toBeUndefined()
+    expect(qqSent[countBeforeClick]?.chatType).toBe('c2c')
+    expect(director.listSessions('qq')).toHaveLength(1)
     expect(director.listSessions('qq')[0]!.messageCount).toBeGreaterThanOrEqual(4)
+
+    // 发送连续失败后再恢复：验证【离线期间补报】不会递归嵌套
+    let failSend = true
+    const nestedSessDirector = new DirectorService({
+      host: env.fake.host,
+      options: env.options,
+      ledger: env.ledger,
+      events: env.events,
+      store: env.store,
+      redact: env.redact,
+      sendQq: async input => {
+        if (failSend) throw new Error('simulated qq error')
+        qqSent.push(input)
+      },
+      callTool: async () => ({ ok: true, status: 200, latencyMs: 5, text: '已收到。', toolCalls: [] }),
+    })
+    nestedSessDirector.handleQqInbound({ from: 'qq_retry', chatId: 'qq_retry', messageId: 'mr_1', text: '第一次' })
+    await nestedSessDirector.drain()
+    nestedSessDirector.handleQqInbound({ from: 'qq_retry', chatId: 'qq_retry', messageId: 'mr_2', text: '第二次' })
+    await nestedSessDirector.drain()
+    failSend = false
+    const idxAfterFail = qqSent.length
+    nestedSessDirector.handleQqInbound({ from: 'qq_retry', chatId: 'qq_retry', messageId: 'mr_3', text: '第三次' })
+    await nestedSessDirector.drain()
+    const recoveredReply = qqSent[idxAfterFail]?.text ?? ''
+    expect((recoveredReply.match(/离线期间补报/g) ?? []).length).toBe(1)
+    nestedSessDirector.close()
 
     // 4. 小说改稿完成事件通过 Bridge 主动推到 QQ 并附带一键撤销按钮
     const beforePushCount = qqSent.length

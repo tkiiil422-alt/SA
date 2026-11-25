@@ -329,20 +329,55 @@ describe('QqSource webhook, websocket, rich fallback and credential redaction', 
     expect(userPosts[1]?.body.msg_seq).toBe(2)
     expect(qq.status().richDisabled).toBe(true)
 
-    // 触发 INTERACTION_CREATE 按钮回调
+    // 触发 C2C 单聊 INTERACTION_CREATE 按钮回调（chat_type=2 为单聊，必须走 /v2/users/... 并使用 event_id）
     emitWs({
       op: 0,
+      id: 'evt_c2c_1',
       s: 3,
       t: 'INTERACTION_CREATE',
       d: {
         id: 'inter_1',
-        data: { tag: 'da:a_rich:1' },
+        chat_type: 2,
+        data: { resolved: { button_data: 'da:a_rich:1' } },
         user_openid: 'mem_77',
       },
     })
     await new Promise(r => setTimeout(r, 30))
-    expect(interactions[0]?.action).toEqual({ kind: 'director_action', actionId: 'a_rich', decision: 'approve' })
+    expect(interactions[0]).toMatchObject({
+      chatType: 'c2c',
+      chatId: 'mem_77',
+      operatorId: 'mem_77',
+      action: { kind: 'director_action', actionId: 'a_rich', decision: 'approve' },
+    })
     expect(sentHttp.some(x => x.url.includes('/interactions/inter_1') && x.body?.code === 0)).toBe(true)
+    const c2cReply = sentHttp.filter(x => x.url.includes('/v2/users/mem_77/messages')).at(-1)
+    expect(c2cReply?.body?.event_id).toBe('evt_c2c_1')
+    expect(c2cReply?.body?.msg_id).toBeUndefined()
+    expect(sentHttp.some(x => x.url.includes('/v2/groups/mem_77/messages'))).toBe(false)
+
+    // 触发群聊 INTERACTION_CREATE 按钮回调（chat_type=1 + group_openid 走 /v2/groups/grp_99/messages）
+    emitWs({
+      op: 0,
+      s: 4,
+      t: 'INTERACTION_CREATE',
+      d: {
+        id: 'inter_2',
+        chat_type: 1,
+        group_openid: 'grp_99',
+        group_member_openid: 'mem_77',
+        data: { tag: 'ch:继续' },
+      },
+    })
+    await new Promise(r => setTimeout(r, 30))
+    expect(interactions[1]).toMatchObject({
+      chatType: 'group',
+      chatId: 'grp_99',
+      operatorId: 'mem_77',
+      action: { kind: 'choice', text: '继续' },
+    })
+    const grpReply = sentHttp.filter(x => x.url.includes('/v2/groups/grp_99/messages')).at(-1)
+    expect(grpReply?.body?.event_id).toBe('inter_2')
+
     expect(JSON.stringify(events) + JSON.stringify(qq.status())).not.toContain(cfg.appSecret)
     expect(JSON.stringify(events) + JSON.stringify(qq.status())).not.toContain('SECRET_QQ_ACCESS_TOKEN_888')
 

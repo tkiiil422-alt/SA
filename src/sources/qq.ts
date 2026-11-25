@@ -215,7 +215,7 @@ export class QqSource {
   private readonly doFetch: typeof fetch
   private readonly tokenUrl: string
   private tokenCache?: { value: string; expiresAtMs: number; key: string }
-  private passiveReplyMap = new Map<string, { msgId: string; expiresAt: number; seq: number }>()
+  private passiveReplyMap = new Map<string, { kind: 'msg_id' | 'event_id'; id: string; expiresAt: number; seq: number }>()
   private ws?: QqWsLike
   private heartbeatTimer?: ReturnType<typeof setInterval>
   private reconnectTimer?: ReturnType<typeof setTimeout>
@@ -436,7 +436,7 @@ export class QqSource {
   }
 
   private async onWsMessage(sock: QqWsLike, rawText: string, token: string, wantResume: boolean, gen: number): Promise<void> {
-    let pkt: { op?: number; s?: number; t?: string; d?: any }
+    let pkt: { op?: number; id?: string; s?: number; t?: string; d?: any }
     try {
       pkt = JSON.parse(rawText) as typeof pkt
     } catch { return }
@@ -485,7 +485,7 @@ export class QqSource {
     }
 
     if (pkt.op === 0 && pkt.t) {
-      await this.dispatchGatewayEvent(pkt.t, pkt.d)
+      await this.dispatchGatewayEvent(pkt.t, pkt.d, typeof pkt.id === 'string' ? pkt.id : undefined)
     }
   }
 
@@ -503,7 +503,7 @@ export class QqSource {
       sendJson(res, 413, { error: 'payload_too_large', message: err instanceof Error ? err.message : 'too large' })
       return
     }
-    let pkt: { op?: number; t?: string; d?: any }
+    let pkt: { op?: number; id?: string; t?: string; d?: any }
     try {
       pkt = JSON.parse(rawBody) as typeof pkt
     } catch {
@@ -540,11 +540,11 @@ export class QqSource {
         mode: 'webhook',
         lastEventAt: new Date().toISOString(),
       }
-      await this.dispatchGatewayEvent(pkt.t, pkt.d)
+      await this.dispatchGatewayEvent(pkt.t, pkt.d, typeof pkt.id === 'string' ? pkt.id : undefined)
     }
   }
 
-  private async dispatchGatewayEvent(eventType: string, d: any): Promise<void> {
+  private async dispatchGatewayEvent(eventType: string, d: any, gatewayEventId?: string): Promise<void> {
     const nowIso = new Date().toISOString()
     this.statusState = { ...this.statusState, lastEventAt: nowIso }
 
@@ -571,7 +571,7 @@ export class QqSource {
       const text = String(d?.content || '').trim()
       if (!from || !text) return
       if (!this.isSenderAllowed(cfg, from)) return
-      if (msgId) this.rememberPassiveMsg(`c2c:${from}`, msgId)
+      if (msgId) this.rememberPassiveRef(`c2c:${from}`, 'msg_id', msgId)
       this.receivedCount += 1
       this.deps.onMessage({
         chatType: 'c2c',
@@ -591,7 +591,7 @@ export class QqSource {
       const text = String(d?.content || '').replace(/<@![^>]+>\s*/g, '').trim()
       if (!from || !groupId || !text) return
       if (!this.isSenderAllowed(cfg, from)) return
-      if (msgId) this.rememberPassiveMsg(`group:${groupId}`, msgId)
+      if (msgId) this.rememberPassiveRef(`group:${groupId}`, 'msg_id', msgId)
       this.receivedCount += 1
       this.deps.onMessage({
         chatType: 'group',
@@ -606,16 +606,21 @@ export class QqSource {
 
     if (eventType === 'INTERACTION_CREATE') {
       const interactionId = String(d?.id || '').trim()
-      const chatType: 'c2c' | 'group' = d?.group_openid || d?.chat_type === 2 ? 'group' : 'c2c'
-      const operatorId = String(d?.data?.resolved?.user_id || d?.user?.id || d?.user_openid || d?.group_member_openid || '').trim()
-      const chatId = String(d?.group_openid || operatorId || '').trim()
+      // QQ 开放平台规范：chat_type=1 为群聊，chat_type=2 为 QQ 单聊（C2C）
+      const chatType: 'c2c' | 'group' = d?.group_openid || d?.chat_type === 1 ? 'group' : 'c2c'
+      const operatorId = String(d?.group_member_openid || d?.user_openid || d?.data?.resolved?.user_id || d?.user?.id || '').trim()
+      const chatId = chatType === 'group'
+        ? String(d?.group_openid || '').trim()
+        : String(d?.user_openid || operatorId).trim()
       const rawTag = String(d?.data?.tag || d?.data?.resolved?.button_data || d?.data?.button_data || '').trim()
       const messageId = typeof d?.data?.message_id === 'string' ? d.data.message_id : undefined
-      if (!interactionId || !operatorId) return
+      if (!interactionId || !operatorId || !chatId) return
       if (!this.isSenderAllowed(cfg, operatorId)) {
         await this.ackInteraction(interactionId, 4).catch(() => undefined)
         return
       }
+      const passiveEventId = String(d?.event_id || gatewayEventId || interactionId).trim()
+      if (passiveEventId) this.rememberPassiveRef(`${chatType}:${chatId}`, 'event_id', passiveEventId)
       this.receivedCount += 1
       const action = decodeQqAction(rawTag)
       // QQ 要求 3 秒内必须回包 PUT /interactions/{id}：先快速调用业务回调，若未主动指定 code 则自动补回 code:0
@@ -661,11 +666,13 @@ export class QqSource {
     return cfg.allowedUsers.some(u => u.trim() === openId)
   }
 
-  private rememberPassiveMsg(targetKey: string, msgId: string): void {
+  private rememberPassiveRef(targetKey: string, kind: 'msg_id' | 'event_id', id: string): void {
+    const existing = this.passiveReplyMap.get(targetKey)
     this.passiveReplyMap.set(targetKey, {
-      msgId,
+      kind,
+      id,
       expiresAt: Date.now() + PASSIVE_MSG_TTL_MS,
-      seq: 1,
+      seq: existing && existing.kind === kind && existing.id === id ? existing.seq : 0,
     })
     if (this.passiveReplyMap.size > 200) {
       const now = Date.now()
@@ -675,16 +682,21 @@ export class QqSource {
     }
   }
 
-  private nextPassiveRef(targetKey: string, explicitReplyTo?: string): { msgId: string; seq: number } | undefined {
+  private nextPassiveRef(
+    targetKey: string,
+    explicitReplyTo?: string,
+  ): { kind: 'msg_id' | 'event_id'; id: string; seq: number } | undefined {
     const existing = this.passiveReplyMap.get(targetKey)
-    if (explicitReplyTo && (!existing || existing.msgId !== explicitReplyTo)) {
-      const next = { msgId: explicitReplyTo, expiresAt: Date.now() + PASSIVE_MSG_TTL_MS, seq: 1 }
-      this.passiveReplyMap.set(targetKey, next)
-      return { msgId: next.msgId, seq: next.seq }
+    if (explicitReplyTo) {
+      if (!existing || existing.kind !== 'msg_id' || existing.id !== explicitReplyTo) {
+        const next = { kind: 'msg_id' as const, id: explicitReplyTo, expiresAt: Date.now() + PASSIVE_MSG_TTL_MS, seq: 1 }
+        this.passiveReplyMap.set(targetKey, next)
+        return { kind: next.kind, id: next.id, seq: next.seq }
+      }
     }
     if (!existing || existing.expiresAt <= Date.now()) return undefined
     existing.seq += 1
-    return { msgId: existing.msgId, seq: existing.seq }
+    return { kind: existing.kind, id: existing.id, seq: existing.seq }
   }
 
   /** 回应 QQ 按钮交互（3 秒内调用 PUT /interactions/{interaction_id} 消除客户端 loading）。 */
@@ -753,7 +765,7 @@ export class QqSource {
             : input.keyboard
         }
         if (passive) {
-          richPayload.msg_id = passive.msgId
+          richPayload[passive.kind] = passive.id
           richPayload.msg_seq = passive.seq
         }
         const okRich = await this.postMessageWithRetry(cfg, path, richPayload, true)
@@ -768,7 +780,7 @@ export class QqSource {
         const plainPayload: Record<string, unknown> = {
           msg_type: 0,
           content: partText,
-          ...(fallbackPassive ? { msg_id: fallbackPassive.msgId, msg_seq: fallbackPassive.seq } : {}),
+          ...(fallbackPassive ? { [fallbackPassive.kind]: fallbackPassive.id, msg_seq: fallbackPassive.seq } : {}),
         }
         await this.postMessageWithRetry(cfg, path, plainPayload, false)
         this.sentCount += 1
@@ -778,7 +790,7 @@ export class QqSource {
       const plainPayload: Record<string, unknown> = {
         msg_type: 0,
         content: partText,
-        ...(passive ? { msg_id: passive.msgId, msg_seq: passive.seq } : {}),
+        ...(passive ? { [passive.kind]: passive.id, msg_seq: passive.seq } : {}),
       }
       await this.postMessageWithRetry(cfg, path, plainPayload, false)
       this.sentCount += 1
