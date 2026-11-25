@@ -2071,3 +2071,18 @@ a.pt-card:hover { border-color: var(--line2); background: var(--elev); opacity: 
 @keyframes fadePop { from { opacity: 0; transform: translateY(4px) scale(.97); } }
 @keyframes skelpulse { 0%, 100% { opacity: .5; } 50% { opacity: .95; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+/* 总控助手顶部实时上下文占用指示 */
+.dir-ctx { display: inline-flex; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
+.dir-ctx__bar { display: inline-block; width: 44px; height: 5px; border-radius: 99px; background: var(--line); overflow: hidden; vertical-align: middle; }
+.dir-ctx__bar b { display: block; height: 100%; border-radius: 99px; background: var(--run); transition: width .2s ease; }
+.dir-ctx[data-tone="warn"] { color: var(--need); }
+.dir-ctx[data-tone="warn"] .dir-ctx__bar b { background: var(--need); }
+.dir-ctx[data-tone="bad"] { color: var(--bad); font-weight: 600; }
+.dir-ctx[data-tone="bad"] .dir-ctx__bar b { background: var(--bad); }
+
+/* 小说章节改稿实时进度卡片 */
+.novel-edit-card { margin: 12px 0; padding: 12px 14px; border-radius: var(--r2); border: 1px solid color-mix(in srgb, var(--run) 35%, var(--line)); background: color-mix(in srgb, var(--run-bg) 35%, var(--surface)); display: flex; flex-direction: column; gap: 6px; }
+.novel-edit-card[data-st="done"] { border-color: color-mix(in srgb, var(--done) 35%, var(--line)); background: var(--surface); }
+.novel-edit-card[data-st="failed"] { border-color: color-mix(in srgb, var(--bad) 38%, var(--line)); background: color-mix(in srgb, var(--bad-bg) 30%, var(--surface)); }
+.novel-edit-card__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }

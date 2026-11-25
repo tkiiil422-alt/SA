@@ -5,7 +5,7 @@
 import { z } from 'zod'
 import { AdminError, type PolicyInput } from '../host.ts'
 import { decodeSegment, duplicates, invalid, issuesOf, parseJsonBody, sendJson } from '../http.ts'
-import { OptionsError, OptionsSchema, SshConnectionSchema as SshConnectionOptionSchema, findModel, formatRef } from '../options.ts'
+import { OptionsError, OptionsSchema, QqSchema, SshConnectionSchema as SshConnectionOptionSchema, findModel, formatRef } from '../options.ts'
 import { LIMITS } from '../../limits.ts'
 import { keySecretName, looksLikeKey, scanHostKeys } from '../../ssh/connections.ts'
 import type { AdminRouteDeps, AdminRouteRequest } from './types.ts'
@@ -38,6 +38,7 @@ const FeishuSettingsSchema = OptionsSchema.shape.feishu
   .omit({ mode: true })
   .partial({ appSecret: true, verificationToken: true, encryptKey: true })
   .extend({ mode: z.enum(['webhook', 'ws']).optional() })
+const QqSettingsSchema = QqSchema.partial()
 const GithubSettingsSchema = OptionsSchema.shape.github.extend({ token: z.string().max(500).optional() })
 const EmailSettingsSchema = OptionsSchema.shape.email.extend({ password: z.string().max(500).optional() })
 const WechatSettingsSchema = OptionsSchema.shape.wechat.partial({
@@ -152,6 +153,35 @@ export async function handleSettingsAndSystemRoutes(deps: AdminRouteDeps, { req,
   if (route === '/settings/feishu/test' && method === 'POST') { sendJson(res, 200, await host.testFeishu()); return true }
   if (route === '/settings/feishu/status' && method === 'GET') { sendJson(res, 200, host.feishuStatus()); return true }
   if (route === '/settings/feishu/reconnect' && method === 'POST') { sendJson(res, 200, await host.reconnectFeishu()); return true }
+
+  if (route === '/settings/qq') {
+    if (method === 'GET') { sendJson(res, 200, store.getPublic().qq); return true }
+    if (method === 'PUT') {
+      const parsed = QqSettingsSchema.safeParse(withoutReadOnlySecrets(await parseJsonBody(req)))
+      if (!parsed.success) { invalid(res, issuesOf(parsed.error)); return true }
+      let updated
+      try { updated = store.updateQq(parsed.data) } catch (error) {
+        if (error instanceof OptionsError) { invalid(res, error.issues); return true }
+        throw error
+      }
+      finishSettings(res, 'qq', updated.changed)
+      return true
+    }
+    sendJson(res, 404, { error: 'not_found', message: '没有这个接口。' })
+    return true
+  }
+  if (route === '/settings/qq/test' && method === 'POST') {
+    sendJson(res, 200, host.testQq ? await host.testQq() : { ok: false, message: '当前运行时未启用 QQ 机器人来源。' })
+    return true
+  }
+  if (route === '/settings/qq/status' && method === 'GET') {
+    sendJson(res, 200, host.qqStatus ? host.qqStatus() : { mode: store.get().qq.mode, state: 'off', received: 0, sent: 0 })
+    return true
+  }
+  if (route === '/settings/qq/reconnect' && method === 'POST') {
+    sendJson(res, 200, host.reconnectQq ? await host.reconnectQq() : { mode: store.get().qq.mode, state: 'off', received: 0, sent: 0 })
+    return true
+  }
 
   if (route === '/settings/github/test' && method === 'POST') { sendJson(res, 200, await host.testGithub()); return true }
   if (route === '/settings/github') {

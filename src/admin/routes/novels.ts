@@ -131,6 +131,13 @@ export async function handleNovelsRoutes(deps: AdminRouteDeps, { req, res, url, 
     return true
   }
 
+  if (route === '/novels/edits' && method === 'GET') {
+    const service = requireNovels(deps)
+    const limit = clampInt(url.searchParams.get('limit'), 12, 1, 50)
+    sendJson(res, 200, { items: await novelCall(() => service.listRecentEdits(limit)) })
+    return true
+  }
+
   const novelMatch = /^\/novels\/([^/]+)(?:\/(arcs|canon|work|export|chapters\/(\d{1,5})(?:\/(edit|undo|read))?))?$/.exec(route)
   if (novelMatch !== null) {
     const service = requireNovels(deps)

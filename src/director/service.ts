@@ -25,6 +25,15 @@ import {
   type FeishuCardActionEvent,
   type FeishuCardCallbackResponse,
 } from '../sources/feishu-cards.ts'
+import {
+  buildQqChoicePayload,
+  buildQqPendingActionPayload,
+  extractQqChoiceButtons,
+  formatTextForQq,
+  type QqKeyboard,
+  type QqMarkdown,
+} from '../sources/qq-cards.ts'
+import type { QqInteractionEvent, QqInteractionResponse } from '../sources/qq.ts'
 import { detectIntentSignals } from './intent-learner.ts'
 
 export interface DirectorServiceDeps extends Omit<DirectorToolsDeps, 'store' | 'onAudit'> {
@@ -44,6 +53,17 @@ export interface DirectorServiceDeps extends Omit<DirectorToolsDeps, 'store' | '
   updateFeishuCard?: (messageId: string, card: Record<string, unknown>) => Promise<void>
   /** 飞书卡片按钮点击鉴权：检查点击人是否在飞书允许操作员白名单中。 */
   feishuAllowCheck?: (openId: string) => boolean
+  /** QQ 官方机器人消息发送（支持单聊/群聊、被动回复 msg_id、原生交互按钮 Keyboard 与 Markdown 降级）。 */
+  sendQq?: (input: {
+    to: string
+    chatType?: 'c2c' | 'group'
+    text: string
+    replyTo?: string
+    keyboard?: QqKeyboard
+    markdown?: QqMarkdown
+  }) => Promise<void>
+  /** QQ 按钮点击鉴权：检查点击人是否在 QQ 允许名单中。 */
+  qqAllowCheck?: (openId: string) => boolean
   /** 审批密钥申请（供飞书卡片按钮直接调用）。 */
   decideSecretRequest?: (requestId: string, decision: 'approve' | 'reject') => Promise<{ ok: boolean; message: string }>
   /** 批准 DAG 人工审批节点（供飞书卡片按钮直接调用）。 */
@@ -102,11 +122,25 @@ export interface DirectorChatResult {
   wechatError?: string
 }
 
+export interface DirectorContextUsage {
+  usedTokens: number
+  historyTokens: number
+  systemTokens: number
+  lastPromptTokens?: number
+  effectiveContextTokens: number
+  modelContextWindow: number
+  compactTriggerTokens: number
+  usedPercent: number
+  activeMessageCount: number
+  activeBytes: number
+}
+
 export interface DirectorSessionDetail {
   session: DirectorSession
   messages: DirectorMessage[]
   pendingActions: PendingAction[]
   followups: DirectorFollowup[]
+  contextUsage?: DirectorContextUsage
 }
 
 export interface DirectorStatus {
@@ -535,8 +569,13 @@ interface PendingInboundBatch {
 }
 
 /** 可以收发对话的即时通讯通道。 */
-type InboundChannel = 'wechat' | 'feishu'
-const CHANNEL_LABEL: Record<InboundChannel, string> = { wechat: '微信', feishu: '飞书' }
+type InboundChannel = 'wechat' | 'feishu' | 'qq'
+const CHANNEL_LABEL: Record<InboundChannel, string> = { wechat: '微信', feishu: '飞书', qq: 'QQ' }
+
+function parseQqTarget(userId: string): { to: string; chatType: 'c2c' | 'group' } {
+  if (userId.startsWith('group:')) return { to: userId.slice(6), chatType: 'group' }
+  return { to: userId, chatType: 'c2c' }
+}
 
 export class DirectorService {
   readonly store: DirectorStore
@@ -587,6 +626,17 @@ export class DirectorService {
     this.handleInbound('feishu', input)
   }
 
+  /** QQ 官方机器人入站入口（单聊使用 openId，群聊使用 `group:<group_openid>` 作为会话身份）。 */
+  handleQqInbound(input: { from: string; chatId: string; messageId: string; text: string; chatType?: 'c2c' | 'group' }): void {
+    const userId = input.chatType === 'group' && input.chatId ? `group:${input.chatId}` : input.from
+    this.handleInbound('qq', {
+      from: userId,
+      chatId: input.chatId,
+      messageId: input.messageId,
+      text: input.text,
+    })
+  }
+
   private handleInbound(channel: InboundChannel, input: { from: string; chatId: string; messageId: string; text: string }): void {
     if (this.closed) return
     const text = input.text.trim()
@@ -635,10 +685,12 @@ export class DirectorService {
 
   /** 该通道是否配置了发送能力。 */
   private canDeliver(channel: string): channel is InboundChannel {
-    return (channel === 'wechat' && Boolean(this.deps.sendWechat)) || (channel === 'feishu' && Boolean(this.deps.sendFeishu))
+    return (channel === 'wechat' && Boolean(this.deps.sendWechat))
+      || (channel === 'feishu' && Boolean(this.deps.sendFeishu))
+      || (channel === 'qq' && Boolean(this.deps.sendQq))
   }
 
-  /** 把一段文字（或在飞书端对新产生的高危待确认操作升级为可点击按钮卡片）发到指定通道的用户。 */
+  /** 把一段文字（或在飞书/QQ端升级为可点击按钮消息）发到指定通道的用户。 */
   private async deliverTo(
     channel: InboundChannel,
     userId: string,
@@ -649,6 +701,62 @@ export class DirectorService {
     if (channel === 'wechat') {
       if (!this.deps.sendWechat) throw new Error('微信发送未配置')
       await this.deps.sendWechat({ to: userId, text })
+      return
+    }
+    if (channel === 'qq') {
+      if (!this.deps.sendQq) throw new Error('QQ 发送未配置')
+      const target = parseQqTarget(userId)
+      const qqCfg = this.deps.options.get().qq
+      const allowButtons = qqCfg?.interactiveButtons !== false
+      if (allowButtons && newPendingActions.length > 0) {
+        const first = newPendingActions[0]!
+        const firstPayload = buildQqPendingActionPayload({
+          actionId: first.id,
+          toolName: first.toolName,
+          summary: first.summary,
+          expiresAt: first.expiresAt,
+          replyBody: text,
+        })
+        await this.deps.sendQq({
+          to: target.to,
+          chatType: target.chatType,
+          ...(replyTo ? { replyTo } : {}),
+          ...firstPayload,
+        })
+        for (const extra of newPendingActions.slice(1, 4)) {
+          const extraPayload = buildQqPendingActionPayload({
+            actionId: extra.id,
+            toolName: extra.toolName,
+            summary: extra.summary,
+            expiresAt: extra.expiresAt,
+          })
+          await this.deps.sendQq({
+            to: target.to,
+            chatType: target.chatType,
+            ...extraPayload,
+          })
+        }
+        return
+      }
+      if (allowButtons) {
+        const choices = extractQqChoiceButtons(text)
+        if (choices.length >= 2) {
+          const choicePayload = buildQqChoicePayload(text, choices)
+          await this.deps.sendQq({
+            to: target.to,
+            chatType: target.chatType,
+            ...(replyTo ? { replyTo } : {}),
+            ...choicePayload,
+          })
+          return
+        }
+      }
+      await this.deps.sendQq({
+        to: target.to,
+        chatType: target.chatType,
+        ...(replyTo ? { replyTo } : {}),
+        text: formatTextForQq(text),
+      })
       return
     }
     const cfg = this.deps.options.get().director
@@ -715,7 +823,8 @@ export class DirectorService {
         })
         if (res.reply && this.canDeliver(channel)) {
           try {
-            await this.deliverTo(channel, userId, res.reply, channel === 'feishu' ? messageId : undefined, this.createdActionsOf(res))
+            const replyId = channel === 'feishu' || channel === 'qq' ? messageId : undefined
+            await this.deliverTo(channel, userId, res.reply, replyId, this.createdActionsOf(res))
           } catch (sendErr) {
             const msg = this.deps.redact(sendErr instanceof Error ? sendErr.message : String(sendErr))
             this.logEvent(`director.${channel}_send_failed`, 'warn', `总控回复${label}发送失败：${msg.slice(0, 80)}`, { userId, sessionId: res.sessionId })
@@ -728,7 +837,8 @@ export class DirectorService {
         this.deps.onError?.(error)
         const errMsg = this.deps.redact(error instanceof Error ? error.message : String(error))
         if (this.canDeliver(channel)) {
-          await this.deliverTo(channel, userId, `总控助手处理消息时遇到异常：${errMsg.slice(0, 200)}`, channel === 'feishu' ? messageId : undefined)
+          const replyId = channel === 'feishu' || channel === 'qq' ? messageId : undefined
+          await this.deliverTo(channel, userId, `总控助手处理消息时遇到异常：${errMsg.slice(0, 200)}`, replyId)
             .catch(() => undefined)
         }
       } finally {
@@ -991,6 +1101,7 @@ export class DirectorService {
     let fallbackUsed = false
     let autoShrunkForTruncation = false
     let startEmitted = false
+    let lastPromptTokens: number | undefined
     let finalReply = ''
     let modelFailed = false
     /** 本轮提前中断原因：超时 / 模型失败，用于决定是否自动续跑。 */
@@ -1121,6 +1232,11 @@ export class DirectorService {
             finalReply = `调用总控模型（${activeModel.ref}）失败：${result.error ?? '未知错误'}。`
           }
           break
+        }
+
+        if (result.usage) {
+          const pt = result.usage.prompt_tokens || ((result.usage.prompt_cache_hit_tokens ?? 0) + (result.usage.prompt_cache_miss_tokens ?? 0))
+          if (pt > 0) lastPromptTokens = pt
         }
 
         // 若模型未发起工具调用，先检查是否遭遇上游网关末尾静默截断，必要时自动缩窗重发；否则收口输出最终回复
@@ -1358,6 +1474,7 @@ export class DirectorService {
           model: activeModel.ref,
           toolsCount: toolsUsed.length,
           tools: toolsUsed.map(t => ({ name: t.name, ok: t.ok, ms: t.ms })),
+          ...(lastPromptTokens ? { promptTokens: lastPromptTokens } : {}),
         },
       })
 
@@ -1865,6 +1982,186 @@ export class DirectorService {
   }
 
   /**
+   * 处理 QQ 官方机器人交互按钮回传（INTERACTION_CREATE，长连接 WS 与 HTTP Webhook 共用）。
+   * - 高危批准等耗时操作立即返 code:0 告知前端已受理，在后台异步执行完毕后发送结果；
+   * - 多选一建议按钮与快捷命令直接注入对应会话队列执行。
+   */
+  async handleQqInteraction(event: QqInteractionEvent): Promise<QqInteractionResponse> {
+    const allowed = !this.deps.qqAllowCheck || this.deps.qqAllowCheck(event.operatorId)
+    const action = event.action
+    this.logEvent(
+      allowed ? 'director.qq_button_click' : 'director.qq_button_denied',
+      allowed ? 'info' : 'warn',
+      allowed
+        ? `QQ 按钮点击：${action?.kind ?? 'raw'}`
+        : `QQ 按钮点击被拒绝（操作人不在允许名单）：${action?.kind ?? 'raw'}`,
+      { kind: action?.kind, rawTag: event.rawTag.slice(0, 80) },
+    )
+    if (!allowed) {
+      return { code: 4, replyText: '你不在 QQ 允许操作员名单中，无权执行此操作。' }
+    }
+    if (!action) {
+      return { code: 1, replyText: '未能识别该按钮指令（可能已过期），请直接发送文字告诉我你的决定。' }
+    }
+
+    const targetUserId = event.chatType === 'group' && event.chatId ? `group:${event.chatId}` : event.operatorId
+    const target = parseQqTarget(targetUserId)
+
+    if (action.kind === 'choice' || action.kind === 'command') {
+      this.enqueueTurn('qq', targetUserId, event.chatId, event.messageId ?? event.interactionId, action.text)
+      return { code: 0 }
+    }
+
+    const lockKey = action.kind === 'director_action'
+      ? `qq:act:${action.actionId}`
+      : action.kind === 'mission_approval'
+        ? `qq:mis:${action.missionId}:${action.nodeKey}:v${action.planVersion}`
+        : action.kind === 'vault_request'
+          ? `qq:sec:${action.requestId}`
+          : action.kind === 'council_commit'
+            ? `qq:cn:${action.councilId}`
+            : action.kind === 'novel_undo'
+              ? `qq:nu:${action.bookId}:${action.n}`
+              : `qq:tk:${action.ticketId}:${action.op}`
+    if (this.cardActionLocks.has(lockKey)) {
+      return { code: 0, replyText: '⏳ 该操作正在处理中，请稍候不要重复点击。' }
+    }
+
+    if (action.kind === 'director_action') {
+      const pending = this.store.getPendingAction(action.actionId)
+      if (!pending) return { code: 1, replyText: `找不到待确认操作 #${action.actionId}。` }
+      if (pending.status !== 'pending') {
+        const stWord = pending.status === 'approved' ? '已批准执行' : pending.status === 'rejected' ? '已拒绝' : '已过期'
+        return { code: 1, replyText: `操作 #${pending.id} ${stWord}，无需重复点击。` }
+      }
+      if (action.decision === 'reject') {
+        const res = await this.decidePendingAction(pending.id, 'reject')
+        return { code: res.ok ? 0 : 1, replyText: `🚫 已拒绝高危操作 #${pending.id}：${res.message}` }
+      }
+
+      this.cardActionLocks.add(lockKey)
+      const session = this.store.getSession(pending.sessionId)
+      void (async () => {
+        try {
+          const decided = await this.decidePendingAction(pending.id, 'approve')
+          if (session) {
+            this.recordEventInSession(session.id, `[QQ 点击批准 #${pending.id}] ${decided.message}`, {
+              actionId: pending.id,
+              ok: decided.ok,
+            })
+          }
+          const cfg = this.deps.options.get().director
+          if (!decided.ok && cfg.autoHeal && session) {
+            const heal = await this.triggerAutoHeal({
+              sessionId: session.id,
+              targetKey: `action:${pending.id}`,
+              incidentKind: 'command_failed',
+              targetId: pending.id,
+              title: `${pending.toolName} (${pending.summary.slice(0, 40)})`,
+              summary: decided.message,
+              pushReply: true,
+            })
+            if (heal.handled) return
+          }
+          if (this.deps.sendQq) {
+            await this.deps.sendQq({
+              to: target.to,
+              chatType: target.chatType,
+              text: formatTextForQq(`${decided.ok ? '✅' : '❌'} 高危指令 #${pending.id} ${decided.ok ? '已执行完成' : '执行失败'}：\n${decided.message}`),
+            }).catch(() => undefined)
+          }
+        } catch (err) {
+          this.deps.onError?.(err)
+        } finally {
+          this.cardActionLocks.delete(lockKey)
+        }
+      })()
+      return { code: 0, replyText: `⏳ 已批准 #${pending.id}（${pending.toolName}），正在后台执行，完成后会第一时间发给你结果。` }
+    }
+
+    this.cardActionLocks.add(lockKey)
+    try {
+      if (action.kind === 'mission_approval') {
+        const res = action.decision === 'approve'
+          ? (this.deps.approveMissionNode
+              ? await this.deps.approveMissionNode(action.missionId, action.nodeKey, {
+                  actorId: `qq:${event.operatorId}`,
+                  planVersion: action.planVersion,
+                  idempotencyKey: `qq:${action.missionId}:${action.nodeKey}:v${action.planVersion}`,
+                  note: 'QQ 按钮一键批准继续',
+                })
+              : { ok: false, message: '未启用 DAG 计划插件' })
+          : (this.deps.cancelMission
+              ? await this.deps.cancelMission(action.missionId)
+              : { ok: false, message: '未启用 DAG 计划插件' })
+        return {
+          code: res.ok ? 0 : 1,
+          replyText: `${res.ok ? '✅' : '❌'} ${res.message}`,
+        }
+      }
+
+      if (action.kind === 'vault_request') {
+        const res = this.deps.decideSecretRequest
+          ? await this.deps.decideSecretRequest(action.requestId, action.decision)
+          : { ok: false, message: '当前运行时未接入密钥审批回调' }
+        return {
+          code: res.ok ? 0 : 1,
+          replyText: `${res.ok ? '✅' : '❌'} ${res.message}`,
+        }
+      }
+
+      if (action.kind === 'council_commit') {
+        const councils = this.deps.councils
+        const rec = councils?.get(action.councilId)
+        if (!councils || !rec) return { code: 1, replyText: `找不到会商 ${action.councilId}。` }
+        if (rec.ticketId) return { code: 0, replyText: `会商已关联工单 ${rec.ticketId}。` }
+        const brief = (rec.brief ?? '').trim()
+        if (!brief) return { code: 1, replyText: '会商尚未生成任务书，无法开工。' }
+        const created = await this.deps.host.createTicket(brief, undefined, undefined, rec.projectId)
+        if (created.ticketId) {
+          councils.attachTicket(rec.id, created.ticketId)
+          const sess = this.store.getOrCreateSession('qq', targetUserId)
+          this.store.linkTicket(created.ticketId, sess)
+        }
+        return {
+          code: 0,
+          replyText: created.ticketId ? `🚀 已按会商结论创建并启动工单 ${created.ticketId}` : '🚀 已提交会商开工请求',
+        }
+      }
+
+      if (action.kind === 'novel_undo') {
+        if (!this.deps.novels) return { code: 1, replyText: '未启用小说模块。' }
+        try {
+          this.deps.novels.undoEdit(action.bookId, action.n)
+          return { code: 0, replyText: `↩️ 已撤销第 ${action.n} 章本次修改，正文已恢复到改稿前版本。` }
+        } catch (err) {
+          const msg = this.deps.redact(err instanceof Error ? err.message : String(err))
+          return { code: 1, replyText: `撤销第 ${action.n} 章修改失败：${msg}` }
+        }
+      }
+
+      // ticket_op
+      let ok = true
+      let msg = ''
+      try {
+        if (action.op === 'retry') {
+          await this.deps.host.retryTicket(action.ticketId)
+          msg = `🔄 已重新启动工单 ${action.ticketId}，总控会继续跟踪直至解决并汇报。`
+        } else {
+          await this.deps.host.stopTicket(action.ticketId, '主人在 QQ 点击停止')
+          msg = `🛑 已停止工单 ${action.ticketId}。`
+        }
+      } catch (err) {
+        ok = false
+        msg = this.deps.redact(err instanceof Error ? err.message : String(err))
+      }
+      return { code: ok ? 0 : 1, replyText: msg }
+    } finally {
+      this.cardActionLocks.delete(lockKey)
+    }
+  }
+
+  /**
    * 主动排障与自愈闭环入口：当工单失败、卡死、阻塞、DAG 节点失败或高危指令执行失败时自动唤醒总控大脑。
    * 遵守 `autoHeal` 开关、`maxAutoHealRounds` 防死循环上限与总控每日预算。
    */
@@ -2059,14 +2356,90 @@ export class DirectorService {
     return this.store.listSessions(channel)
   }
 
+  getSessionContextUsage(sessionId: string): DirectorContextUsage | undefined {
+    const session = this.store.getSession(sessionId)
+    if (!session) return undefined
+    const opts = this.deps.options.get()
+    const resolved = this.resolveModel()
+    const fallbackFound = resolved ? undefined : findModel(opts.models, opts.models.routing.worker)
+    const budgetModel = resolved
+      ? { contextWindow: resolved.contextWindow, maxTokens: resolved.maxTokens, maxPromptKb: resolved.maxPromptKb }
+      : fallbackFound
+        ? { contextWindow: fallbackFound.model.contextWindow, maxTokens: fallbackFound.model.maxTokens, maxPromptKb: fallbackFound.provider.maxPromptKb ?? 0 }
+        : { contextWindow: 128_000, maxTokens: 4_096, maxPromptKb: 0 }
+    const ctxBudget = computeDirectorContextBudget(budgetModel, opts.director)
+    const pendingActions = this.store.listPendingActions(session.id, true)
+    const pendingFollowups = this.store.listFollowups(session.id, true)
+    const pluginSections = this.deps.plugins?.collectDirectorPromptSections({
+      channel: session.channel,
+      userId: session.userId,
+      focusTicketId: session.focusTicketId,
+    })
+    const baseSystem = buildDirectorSystemPrompt({
+      nowIso: this.doNow().toISOString(),
+      channel: session.channel,
+      session,
+      pendingActions,
+      pendingFollowups,
+      extraPrompt: opts.director.extraPrompt,
+      ...(pluginSections && pluginSections.length > 0 ? { pluginSections } : {}),
+    })
+    // 400 tokens 预留给动态 liveSnapshot 态势快照开销
+    const systemTokens = estimateTextTokens(baseSystem) + estimateTextTokens(JSON.stringify(this.tools.definitions())) + 400
+    const active = this.store.activeMessages(session.id, ctxBudget.maxHistoryMessages + 24)
+    const historyTokenBudget = Math.max(2_048, ctxBudget.effectiveContextTokens - systemTokens)
+    const fixedPromptBytes = utf8Bytes(baseSystem) + utf8Bytes(JSON.stringify(this.tools.definitions())) + 4_096
+    const runtimeByteBudget = ctxBudget.maxPromptBytes > 0
+      ? Math.max(8_192, ctxBudget.maxPromptBytes - fixedPromptBytes)
+      : undefined
+    const windowMsgs = buildConversationWindow(active, {
+      maxItems: ctxBudget.maxHistoryMessages,
+      maxTokens: historyTokenBudget,
+      ...(runtimeByteBudget ? { maxBytes: runtimeByteBudget } : {}),
+      maxToolOutputChars: ctxBudget.toolOutputHistoryChars,
+    })
+    let historyTokens = 0
+    let activeBytes = 0
+    for (const m of windowMsgs) {
+      historyTokens += estimateTextTokens(m.content)
+        + ('toolCalls' in m && m.toolCalls ? estimateTextTokens(JSON.stringify(m.toolCalls)) : 0)
+        + 16
+      activeBytes += agentMessageBytes(m)
+    }
+    let lastPromptTokens: number | undefined
+    for (let i = active.length - 1; i >= 0; i -= 1) {
+      const m = active[i]!
+      if (m.role === 'assistant' && typeof m.meta?.promptTokens === 'number' && m.meta.promptTokens > 0) {
+        lastPromptTokens = m.meta.promptTokens
+        break
+      }
+    }
+    const usedTokens = systemTokens + historyTokens
+    const usedPercent = Math.min(100, Number(((usedTokens / Math.max(1, ctxBudget.effectiveContextTokens)) * 100).toFixed(1)))
+    return {
+      usedTokens,
+      historyTokens,
+      systemTokens,
+      ...(lastPromptTokens !== undefined ? { lastPromptTokens } : {}),
+      effectiveContextTokens: ctxBudget.effectiveContextTokens,
+      modelContextWindow: ctxBudget.modelContextWindow,
+      compactTriggerTokens: ctxBudget.compactTriggerTokens,
+      usedPercent,
+      activeMessageCount: windowMsgs.length,
+      activeBytes,
+    }
+  }
+
   getSessionDetail(sessionId: string): DirectorSessionDetail | undefined {
     const session = this.store.getSession(sessionId)
     if (!session) return undefined
+    const contextUsage = this.getSessionContextUsage(sessionId)
     return {
       session,
       messages: this.store.recentMessages(sessionId, 160),
       pendingActions: this.store.listPendingActions(sessionId, false).map(redactPendingAction),
       followups: this.store.listFollowups(sessionId, false),
+      ...(contextUsage ? { contextUsage } : {}),
     }
   }
 
@@ -2155,12 +2528,14 @@ export class DirectorService {
     const budget = this.deps.options.get().budget
     const pendingReqs = this.deps.host.secretRequests().filter(r => r.status === 'pending').length
     const pendingActs = this.store.listPendingActions(sessionId, true)
+    const ctxUsage = this.getSessionContextUsage(sessionId)
     const lines = [
       `📊 SuperAgent 平台实时状态`,
       `• 接单状态：${ov.paused ? '⏸ 已暂停' : '✅ 正常接单'}｜工位 ${ov.slots.used}/${ov.slots.max}`,
       `• 工单概况：运行中 ${ov.tickets.running}｜等你回答 ${ov.tickets.needsPerson}｜开放共 ${ov.tickets.open}｜今日结束 ${ov.tickets.endedToday}`,
       `• 今日花费：$${today.usd.toFixed(4)}${budget.enabled && budget.dailyUsd > 0 ? ` / $${budget.dailyUsd}` : ''}（${today.calls} 次调用）`,
       `• 主机资源：负载 ${ov.host.load1.toFixed(2)}/${ov.host.cpuCount}C｜内存 ${ov.host.memUsedPct}%｜磁盘剩余 ${ov.host.diskFreeGb.toFixed(1)} GB`,
+      ...(ctxUsage ? [`• 当前上下文：已用 ${(ctxUsage.usedTokens / 1000).toFixed(1)}k / ${Math.round(ctxUsage.effectiveContextTokens / 1000)}k tokens（${ctxUsage.usedPercent}%，${ctxUsage.activeMessageCount} 条活跃消息${ctxUsage.lastPromptTokens ? ` · 上轮实测 ${(ctxUsage.lastPromptTokens / 1000).toFixed(1)}k` : ''}）`] : []),
     ]
     if (ov.runningSteps && ov.runningSteps.length > 0) {
       lines.push('', '🔧 正在执行：')

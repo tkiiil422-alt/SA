@@ -5,7 +5,7 @@ import type { DirectorFollowup, DirectorSession, PendingAction } from './store.t
 
 export interface PromptContext {
   nowIso: string
-  channel: 'wechat' | 'web' | 'feishu'
+  channel: 'wechat' | 'web' | 'feishu' | 'qq'
   session: DirectorSession
   pendingActions: readonly PendingAction[]
   pendingFollowups?: readonly DirectorFollowup[]
@@ -50,7 +50,7 @@ export function buildDirectorSystemPrompt(ctx: PromptContext): string {
     '',
     '## 工具速查（共 6 个分组工具，参数使用 JSON 对象字符串）',
     '- `platform_query(action, params_json)` 控制台只读查询（无参传 `"{}"`）：',
-    '  * 全局/设置/连通性：`platform_overview`、`system_status`、`orphans_list`、`settings_get({section?:"all"|"models"|"director"|"executor"|"budget"|"policy"|"feishu"|"email"|"wechat"|"github"|"web"|"collab"|"council"|"novel"|"goal"|"preview"|"projects"|"ssh"})`、`policy_get`、`models_list`、`model_discover({provider?|baseUrl,api?,apiKey?,sessionHeader?})`、`model_test({ref})`、`channel_test({channel:"feishu"|"email"|"wechat"|"github"})`、`wechat_qr_status`、`secrets_overview`、`ssh_list`',
+    '  * 全局/设置/连通性：`platform_overview`、`system_status`、`orphans_list`、`settings_get({section?:"all"|"models"|"director"|"executor"|"budget"|"policy"|"feishu"|"qq"|"email"|"wechat"|"github"|"web"|"collab"|"council"|"novel"|"goal"|"preview"|"projects"|"ssh"})`、`policy_get`、`models_list`、`model_discover({provider?|baseUrl,api?,apiKey?,sessionHeader?})`、`model_test({ref})`、`channel_test({channel:"feishu"|"qq"|"email"|"wechat"|"github"})`、`wechat_qr_status`、`secrets_overview`、`ssh_list`',
     '  * Pi 与开发环境：`pi_status({force?})`、`devenv_status`',
     '  * 工单：`tickets_list({status?,q?,limit?})`、`ticket_detail({ticketId})`、`ticket_diagnose({ticketId})`（一键聚合活动流/报错/验收证据/事件/自愈轮次，排障首选）、`ticket_receipt({ticketId})`（一键读取交付物/验收条件/证据/待办）、`ticket_activity({ticketId,limit?})`、`ticket_files({ticketId,dir?})`、`ticket_read_file({ticketId,path,startLine?,maxLines?})`',
     '  * 账本/日志：`usage_summary({range?:"today"|"7d"|"30d"})`、`usage_calls({ticketId?,limit?})`、`events_list({level?,ticketId?,limit?})`、`decisions_list({limit?})`',
@@ -66,14 +66,14 @@ export function buildDirectorSystemPrompt(ctx: PromptContext): string {
     '  * 环境镜像：`pi_build({version,baseImage?,mirrors?})`（默认自动继承当前开发底座）、`devenv_build({packages?,features?,mirrors?})`、`devenv_repack({devImage,mirrors?})`（约 20 秒复用已有开发镜像封装当前 Pi）',
     '  * 会商/小说/番茄：`council_start`、`council_cancel({councilId})`、`council_commit({councilId,brief?,projectId?,projectMode?,model?})`、`novel_open`、`novel_start_arc`、`novel_edit_chapter({bookId,chapter,note,allowShorten?})`、`novel_chapter_undo({bookId,chapter})`、`novel_mark_read({bookId,chapter})`、`fanqie_check`、`fanqie_bind({bookId,fqBookId})`、`fanqie_sync({bookId,chapters,mode,timerTime?,useAi?})`',
     '  * 防御与渗透工作台：`security_create_engagement({workbench?:"defense"|"pentest",name,targets?,projectId?,defaultModel?,authorizedBy?,intensity?,notes?})`、`security_update_engagement`、`security_start_task({engagementId,kind,url?,args?})`、`security_task_cancel({taskId})`、`security_add_finding`、`security_update_finding`、`security_send_report({engagementId,to?})`、`pentest_scan`、`pentest_launch_playbook({engagementId,playbookId,model?,projectMode?,extraInstruction?})`',
-    '  * 通道/通知/备份：`channel_reconnect({channel:"feishu"|"email"})`、`wechat_qr_start({force?})`、`wechat_qr_verify({code})`、`email_send({to,subject,text})`、`wechat_send({to?,title?,text})`、`system_backup`',
+    '  * 通道/通知/备份：`channel_reconnect({channel:"feishu"|"qq"|"email"})`、`wechat_qr_start({force?})`、`wechat_qr_verify({code})`、`email_send({to,subject,text})`、`wechat_send({to?,title?,text})`、`system_backup`',
     '- `high_risk_action(action, params_json)`（全部触发代码级二次确认）：',
-    '  * 全平台任意设置变更 `settings_update({section, patch})`（支持全部 17 个分区，所有模型引用字段均支持 `"provider/model"` 简写或 `{provider,model}`，`null`/空串表示跟随默认）：',
+    '  * 全平台任意设置变更 `settings_update({section, patch})`（支持全部 18 个分区，所有模型引用字段均支持 `"provider/model"` 简写或 `{provider,model}`，`null`/空串表示跟随默认）：',
     '    - `models`：`providerUpserts:[{id,name?,api?:"openai-completions"|"anthropic-messages",baseUrl?,apiKey?,clearApiKey?,sessionHeader?,maxPromptKb?,enabled?,models?,modelUpserts?,modelDeletes?}]`、`providerDeletes:[id]`、`modelUpserts:[{provider,id,label?,description?,reasoning?,vision?,contextWindow?,maxTokens?,autoPick?,price?:{input,cacheRead,output}}]`、`modelDeletes:["provider/model"]`、`providers:[...]`（整表替换，省略 apiKey 保留原密钥）、`routing:{worker?:"provider/model",assessor?:{enabled?,provider?,model?,ref?,timeoutSec?},autoSelect?}`',
     '    - `director`/`executor`/`budget`/`preview`/`projects`/`novel`/`goal`/`ssh`：直接传需改字段的增量 patch',
     '    - `policy`：支持直接字段 + `ruleUpserts`/`ruleDeletes`/`operatorUpserts`/`operatorDeletes`/`feishuOperatorUpserts`/`feishuOperatorDeletes`',
     '    - `collab`/`council`：支持直接字段 + `roleUpserts`/`roleDeletes`（角色 `model` 可传 `"provider/model"`）',
-    '    - `feishu`/`wechat`/`email`/`github`/`web`：支持直接写入凭据字段（如 `email.password`、`github.token`、`feishu.appSecret`、`wechat.*Secret`、`web.exaKey` / `exaKeyClear:true`，省略或空串保留旧密钥，绝不回显明文）',
+    '    - `feishu`/`qq`/`wechat`/`email`/`github`/`web`：支持直接写入凭据字段（如 `email.password`、`github.token`、`feishu.appSecret`、`qq.appSecret`、`wechat.*Secret`、`web.exaKey` / `exaKeyClear:true`，省略或空串保留旧密钥，绝不回显明文）',
     '  * 其他高危操作：`ssh_manage({op:"upsert"|"delete"|"set_all_tickets",...})`、`wechat_qr_logout`、`secret_request_decide`、`secret_manage({op:"create"|"update"|"delete",name,value?,description?})`、`ticket_secrets_set({ticketId,secrets})`、`ticket_delete`、`tickets_batch_delete({ids,force?,deleteWorkspace?})`、`cleanup_workspaces`、`cleanup_orphans({ids?})`、`platform_set_paused({paused})`、`budget_update`、`pi_apply({image})`、`pi_remove({image})`、`devenv_apply({image})`、`devenv_remove({image})`、`project_delete`、`project_restore`、`project_snapshot_delete`、`novel_delete`、`security_delete_engagement({engagementId})`。',
     '- 拿到所需查询结果后请直接整理答案回复用户，不要重复调用同一个无新信息的查询。',
     '',
@@ -86,7 +86,9 @@ export function buildDirectorSystemPrompt(ctx: PromptContext): string {
     '- 默认使用简体中文，语气专业、干练、像靠谱的全能技术大管家，不堆砌废话和客套。',
     ctx.channel === 'feishu'
       ? '- 飞书端以 Markdown 卡片展示：可使用加粗、列表、短标题与代码块，但避免宽表格；优先清晰分段和具体编号（工单 ID / 金额 / 状态）。'
-      : '- 手机端尽量不用宽 Markdown 表格；优先使用清晰分段、项目符号、简短标题与具体编号（工单 ID / 金额 / 状态）。',
+      : ctx.channel === 'qq'
+        ? '- QQ 端适配窄屏展示：用清晰的【分段标题】和「• 」项目符号，绝不使用宽 Markdown 表格与 HTML 标签；当需要主人二选一/多选一拍板时，优先用简洁的「方案A / 方案B」或「回复「继续」或「暂停」」格式，系统会自动生成可直接点击的按钮。'
+        : '- 手机端尽量不用宽 Markdown 表格；优先使用清晰分段、项目符号、简短标题与具体编号（工单 ID / 金额 / 状态）。',
     '- 回复尽量控制在手机一到两屏内可快速扫完；若内容很长，先给核心结论，再询问是否需要展开细看。',
     '',
     '## 当前会话快照',

@@ -9,7 +9,7 @@ import type { AdminRouteDeps, AdminRouteRequest } from './types.ts'
 
 const DirectorChatSchema = z.object({
   text: z.string().trim().min(1, '请输入对话内容').max(20_000, '对话内容不能超过 20000 字'),
-  channel: z.enum(['web', 'wechat', 'feishu']).default('web'),
+  channel: z.enum(['web', 'wechat', 'feishu', 'qq']).default('web'),
   userId: z.string().trim().min(1).max(200).default('console'),
   deliverToWechat: z.boolean().default(true),
 }).strict()
@@ -19,7 +19,7 @@ const DirectorActionDecideSchema = z.object({
 }).strict()
 
 const DirectorCreateSessionSchema = z.object({
-  channel: z.enum(['web', 'feishu', 'wechat']).default('web'),
+  channel: z.enum(['web', 'feishu', 'wechat', 'qq']).default('web'),
   userId: z.string().trim().min(1).max(200).optional(),
   title: z.string().trim().max(120).optional(),
   resetIfExists: z.boolean().default(false),
@@ -54,9 +54,11 @@ export async function handleDirectorRoutes(deps: AdminRouteDeps, { req, res, url
     const userId = parsed.data.userId || `${channel}-${Date.now().toString(36)}`
     const defaultTitle = channel === 'feishu'
       ? `飞书对话 (${userId.slice(0, 14)})`
-      : channel === 'wechat'
-        ? `微信对话 (${userId.slice(0, 14)})`
-        : `网页对话 ${nowTag}`
+      : channel === 'qq'
+        ? `QQ 对话 (${userId.slice(0, 14)})`
+        : channel === 'wechat'
+          ? `微信对话 (${userId.slice(0, 14)})`
+          : `网页对话 ${nowTag}`
     const title = parsed.data.title || defaultTitle
     const session = svc.store.getOrCreateSession(channel, userId, title)
     if (resetIfExists) svc.resetSession(session.id)
@@ -65,7 +67,7 @@ export async function handleDirectorRoutes(deps: AdminRouteDeps, { req, res, url
   }
   if (route === '/director/sessions' && method === 'GET') {
     const channelRaw = url.searchParams.get('channel')
-    const channel = channelRaw === 'wechat' || channelRaw === 'web' || channelRaw === 'feishu' ? channelRaw : undefined
+    const channel = channelRaw === 'wechat' || channelRaw === 'web' || channelRaw === 'feishu' || channelRaw === 'qq' ? channelRaw : undefined
     const svc = requireDirector(deps)
     sendJson(res, 200, {
       status: svc.status(),

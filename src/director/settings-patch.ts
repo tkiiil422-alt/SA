@@ -29,7 +29,7 @@ import type { PendingAction } from './store.ts'
 
 export const ALL_SETTINGS_SECTIONS = [
   'executor', 'models', 'budget', 'director', 'policy',
-  'feishu', 'email', 'wechat', 'github',
+  'feishu', 'qq', 'email', 'wechat', 'github',
   'preview', 'projects', 'novel', 'collab', 'council', 'goal', 'web', 'ssh',
 ] as const
 
@@ -610,6 +610,22 @@ export async function applySettingsPatch(
     }
     recordAudit(updated.changed)
     return { ok: true, section, changed: updated.changed, current: options.getPublic().feishu }
+  }
+
+  if (section === 'qq') {
+    const clean = stripReadOnlyFlags(patch)
+    const clearFields = Array.isArray(clean.clearFields) ? clean.clearFields.map(str) : []
+    delete clean.clearFields
+    const updated = options.updateQq(clean)
+    let changed = [...updated.changed]
+    if (clearFields.includes('appSecret')) {
+      const curAfter = options.get().qq
+      const cleared = { ...curAfter, appSecret: '' }
+      const u2 = options.updateQq(cleared)
+      changed = [...new Set([...changed, ...u2.changed])]
+    }
+    recordAudit(changed)
+    return { ok: true, section, changed, current: options.getPublic().qq }
   }
 
   if (section === 'wechat') {

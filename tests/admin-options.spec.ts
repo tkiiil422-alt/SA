@@ -111,6 +111,20 @@ describe('defaultOptions', () => {
       },
       budget: { enabled: true, perTicketUsd: 0.5, dailyUsd: 5 },
       feishu: { enabled: false, mode: 'webhook', appId: '', appSecret: '', verificationToken: '', encryptKey: '', apiBase: 'https://open.feishu.cn', groupMode: 'mention', routingMode: 'direct' },
+      qq: {
+        enabled: false,
+        mode: 'ws',
+        appId: '',
+        appSecret: '',
+        sandbox: false,
+        apiBase: 'https://api.sgroup.qq.com',
+        groupMode: 'mention',
+        allowedUsers: [],
+        routingMode: 'director',
+        interactiveButtons: true,
+        markdownTemplateId: '',
+        keyboardTemplateId: '',
+      },
       preview: { enabled: true, portStart: 19000, portEnd: 19199, perTicket: 2, publicBase: '' },
       projects: { maxUploadMb: 4096, maxExtractMb: 12288, maxFiles: 300000 },
       github: { enabled: false, repos: [], defaultBase: 'main', apiBase: 'https://api.github.com' },
@@ -645,5 +659,37 @@ describe('OptionsStore change listeners', () => {
       ...baseModels,
       providers: [{ ...p0, maxPromptKb: -1 }],
     })).toThrow(/0/)
+  })
+
+  it('validates and stores QQ official bot options with secret redaction in public views', () => {
+    const options = store()
+    expect(options.get().qq.enabled).toBe(false)
+    expect(options.get().qq.mode).toBe('ws')
+    expect(options.getPublic().qq.appSecretSet).toBe(false)
+
+    const updated = options.updateQq({
+      enabled: true,
+      mode: 'webhook',
+      appId: '1020999',
+      appSecret: 'qq_super_secret_token',
+      allowedUsers: ['u_qq_1'],
+      interactiveButtons: true,
+    })
+    expect(updated.changed).toContain('qq.enabled')
+    expect(updated.changed).not.toContain('qq_super_secret_token')
+
+    const pub = options.getPublic().qq
+    expect(pub.enabled).toBe(true)
+    expect(pub.appId).toBe('1020999')
+    expect(pub.appSecretSet).toBe(true)
+    expect((pub as Record<string, unknown>).appSecret).toBeUndefined()
+
+    // 空 appSecret 提交时保留已保存密钥
+    options.updateQq({ appSecret: '', sandbox: true })
+    expect(options.get().qq.appSecret).toBe('qq_super_secret_token')
+    expect(options.get().qq.sandbox).toBe(true)
+
+    // 启用 QQ 但缺少 appId / appSecret 时触发中文校验错误
+    expect(() => options.updateQq({ enabled: true, appId: '' })).toThrow(/AppID/)
   })
 })

@@ -287,6 +287,7 @@ export class DirectorToolExecutor {
             channels: {
               wechat: this.deps.host.wechatStatus?.() ?? { state: 'off' },
               feishu: this.deps.host.feishuStatus(),
+              qq: this.deps.host.qqStatus?.() ?? { mode: 'ws', state: 'off', received: 0, sent: 0 },
               email: this.deps.host.emailStatus(),
               githubTokenSet: this.deps.host.githubTokenSet(),
             },
@@ -803,13 +804,17 @@ export class DirectorToolExecutor {
         case 'channel_test': {
           const channel = str(args.channel).toLowerCase()
           if (channel === 'feishu') return out(await this.deps.host.testFeishu())
+          if (channel === 'qq') {
+            if (!this.deps.host.testQq) return fail('未启用 QQ 机器人模块')
+            return out(await this.deps.host.testQq())
+          }
           if (channel === 'email') return out(await this.deps.host.testEmail())
           if (channel === 'github') return out(await this.deps.host.testGithub())
           if (channel === 'wechat') {
             if (!this.deps.host.testWechat) return fail('未启用微信模块')
             return out(await this.deps.host.testWechat())
           }
-          return fail('channel 仅支持 feishu / email / wechat / github')
+          return fail('channel 仅支持 feishu / qq / email / wechat / github')
         }
 
         case 'wechat_qr_status': {
@@ -1527,12 +1532,16 @@ export class DirectorToolExecutor {
         case 'channel_reconnect': {
           const channel = str(args.channel).toLowerCase()
           if (channel === 'feishu') return out({ ok: true, channel, status: await this.deps.host.reconnectFeishu() })
+          if (channel === 'qq') {
+            if (!this.deps.host.reconnectQq) return fail('当前运行时不支持重连 QQ 机器人')
+            return out({ ok: true, channel, status: await this.deps.host.reconnectQq() })
+          }
           if (channel === 'email') {
             if (!this.deps.host.restartEmail) return fail('当前运行时不支持重启邮箱轮询')
             await this.deps.host.restartEmail()
             return out({ ok: true, channel, status: this.deps.host.emailStatus() })
           }
-          return fail('channel 仅支持 feishu 或 email')
+          return fail('channel 仅支持 feishu、qq 或 email')
         }
 
         case 'email_send': {

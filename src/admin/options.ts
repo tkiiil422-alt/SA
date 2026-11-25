@@ -109,6 +109,22 @@ export const FeishuSchema = z.object({
   routingMode: z.enum(['director', 'direct']).default('direct'),
 }).strict()
 
+/** QQ 官方开放平台机器人（q.qq.com API v2）：支持 WebSocket 长连接与 Webhook 回调、可点击交互按钮与自动排版降级。 */
+export const QqSchema = z.object({
+  enabled: z.boolean().default(false),
+  mode: z.enum(['ws', 'webhook']).default('ws'),
+  appId: z.string().trim().max(100).default(''),
+  appSecret: z.string().max(500).default(''),
+  sandbox: z.boolean().default(false),
+  apiBase: z.string().url('必须是有效的 http(s) 地址').refine(u => /^https?:\/\//.test(u), '必须是 http(s) 地址').default('https://api.sgroup.qq.com'),
+  groupMode: z.enum(['mention', 'all']).default('mention'),
+  allowedUsers: z.array(z.string().trim().min(1).max(200)).max(100, '最多 100 个允许的用户').default([]),
+  routingMode: z.enum(['director', 'direct']).default('director'),
+  interactiveButtons: z.boolean().default(true),
+  markdownTemplateId: z.string().trim().max(120).default(''),
+  keyboardTemplateId: z.string().trim().max(120).default(''),
+}).strict()
+
 /** GitHub: a fine-grained PAT lives in the vault; these options only name the API and the repositories it may touch. */
 export const GithubRepoSchema = z.string().trim()
   .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, '仓库格式应为 owner/repo')
@@ -430,6 +446,20 @@ export const OptionsSchema = z.object({
     dailyUsd: z.number().min(0).max(100000),
   }).strict(),
   feishu: FeishuSchema,
+  qq: QqSchema.default({
+    enabled: false,
+    mode: 'ws',
+    appId: '',
+    appSecret: '',
+    sandbox: false,
+    apiBase: 'https://api.sgroup.qq.com',
+    groupMode: 'mention',
+    allowedUsers: [],
+    routingMode: 'director',
+    interactiveButtons: true,
+    markdownTemplateId: '',
+    keyboardTemplateId: '',
+  }),
   preview: PreviewSchema,
   projects: ProjectsSchema,
   github: GithubSchema,
@@ -480,6 +510,8 @@ export type ModelRef = { provider: string; model: string }
 
 export type PublicProvider = Omit<Provider, 'apiKey'> & { apiKeySet: boolean; apiKeyTail: string }
 export type FeishuOptions = z.infer<typeof FeishuSchema>
+export type QqOptions = z.infer<typeof QqSchema>
+export type PublicQq = Omit<QqOptions, 'appSecret'> & { appSecretSet: boolean }
 export type PreviewOptions = z.infer<typeof PreviewSchema>
 export type GithubOptions = z.infer<typeof GithubSchema>
 export type EmailOptions = z.infer<typeof EmailSchema>
@@ -514,6 +546,7 @@ export interface PublicOptions {
   models: { providers: PublicProvider[]; routing: ModelsOptions['routing'] }
   budget: Options['budget']
   feishu: PublicFeishu
+  qq: PublicQq
   preview: Options['preview']
   projects: Options['projects']
   github: Options['github']
@@ -534,6 +567,13 @@ function publicFeishu({ appSecret, verificationToken, encryptKey, ...rest }: Fei
     appSecretSet: appSecret.length > 0,
     verificationTokenSet: verificationToken.length > 0,
     encryptKeySet: encryptKey.length > 0,
+  }
+}
+
+function publicQq({ appSecret, ...rest }: QqOptions): PublicQq {
+  return {
+    ...rest,
+    appSecretSet: appSecret.length > 0,
   }
 }
 
@@ -568,7 +608,7 @@ export class OptionsError extends Error {
 
 type Listener = (section: OptionsSection, next: Options, changed: string[]) => void
 
-const SECTIONS: OptionsSection[] = ['executor', 'models', 'budget', 'feishu', 'preview', 'projects', 'github', 'email', 'wechat', 'council', 'novel', 'collab', 'goal', 'web', 'ssh', 'director']
+const SECTIONS: OptionsSection[] = ['executor', 'models', 'budget', 'feishu', 'qq', 'preview', 'projects', 'github', 'email', 'wechat', 'council', 'novel', 'collab', 'goal', 'web', 'ssh', 'director']
 
 function clone<T>(value: T): T {
   return structuredClone(value)
@@ -779,10 +819,11 @@ export class OptionsStore {
   }
 
   getPublic(): PublicOptions {
-    const { executor, models, budget, feishu, preview, projects, github, email, wechat, council, novel, collab, goal, web, ssh, director } = this.current
+    const { executor, models, budget, feishu, qq, preview, projects, github, email, wechat, council, novel, collab, goal, web, ssh, director } = this.current
     const { exaKey, ...webRest } = web
     return {
       feishu: publicFeishu(feishu),
+      qq: publicQq(qq),
       executor: { ...executor },
       models: {
         providers: models.providers.map(({ apiKey, ...rest }) => ({
@@ -924,6 +965,29 @@ export class OptionsStore {
     return this.update('wechat', next)
   }
 
+  /** Replace the whole qq section. An empty/omitted appSecret keeps the stored value. */
+  updateQq(value: unknown): { changed: string[] } {
+    const input: Record<string, unknown> = isPlainObject(value) ? { ...value } : {}
+    const prior = this.current.qq
+    const incomingSecret = input.appSecret
+    const next: Record<string, unknown> = {
+      ...prior,
+      ...input,
+      appSecret: incomingSecret === undefined || incomingSecret === '' ? prior.appSecret : incomingSecret,
+    }
+    delete next.appSecretSet
+    if (Array.isArray(next.allowedUsers)) {
+      next.allowedUsers = next.allowedUsers
+        .filter((u): u is string => typeof u === 'string')
+        .map(u => u.trim())
+        .filter(u => u !== '')
+    }
+    if (next.enabled === true && (!next.appId || !next.appSecret)) {
+      throw new OptionsError([{ path: 'qq', message: '开启 QQ 机器人前需要填写 AppID 和 AppSecret' }])
+    }
+    return this.update('qq', next)
+  }
+
   /**
    * Replace the whole email section. The vault password is written by the caller, never here; `password` in the body is
    * dropped so a form echo cannot land it in options.json. Sender addresses are stored lower-cased for stable matching.
@@ -1018,6 +1082,20 @@ export function defaultOptions(env: NodeJS.ProcessEnv): Options {
       apiBase: 'https://open.feishu.cn',
       groupMode: 'mention',
       routingMode: 'direct',
+    },
+    qq: {
+      enabled: false,
+      mode: 'ws',
+      appId: '',
+      appSecret: '',
+      sandbox: false,
+      apiBase: 'https://api.sgroup.qq.com',
+      groupMode: 'mention',
+      allowedUsers: [],
+      routingMode: 'director',
+      interactiveButtons: true,
+      markdownTemplateId: '',
+      keyboardTemplateId: '',
     },
     preview: {
       enabled: true,

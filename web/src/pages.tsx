@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { API, get, post, put, del, uploadProject } from './api'
 import { usePoll, ago, money } from './hooks'
+import { useLive } from './useLive'
 import { toast, useAction, Empty, Tabs, bytes, Sheet, Markdown, QrSvg, confirmAction, safeDecode } from './ui'
 import { Icon } from './icons'
 import { GoalFields, emptyGoal, goalPayload } from './goal'
@@ -521,10 +522,14 @@ function NovelList() {
 }
 function Book({ id }: { id: string }) {
   const { d, err, reload } = usePoll<any>(`api/novels/${encodeURIComponent(id)}`, 15000)
+  const { board } = useLive()
   const [note, setNote] = useState('')
   const { busy, run } = useAction()
   const b = d?.book
   const chapters: any[] = d?.chapters || []
+  const editingByChapter = new Map<number, any>(
+    (board?.novelEdits || []).filter(e => e.bookId === id && e.status === 'running').map(e => [e.n, e]),
+  )
   // currentTicket falls back to the newest (possibly ended) ticket, so only the phase says whether an arc is being written.
   const writingNow = b?.phase === 'writing' || b?.phase === 'drafting'
   return <><a className="back" href="#/novels">← 书库</a><h1>{b?.title || '…'}</h1><Loading d={d} err={err} />
@@ -535,25 +540,81 @@ function Book({ id }: { id: string }) {
     <p className="actions"><a className="btn" href={API(`api/novels/${encodeURIComponent(id)}/export`)}>导出 TXT</a>
       <button className="ghost danger" disabled={busy} onClick={() => { if (confirm('删除这本书？')) run(() => del(`api/novels/${encodeURIComponent(id)}`), '已删除', () => { location.hash = '#/novels' }) }}>删除</button></p>
     <h2>章节</h2>
-    {chapters.map(c => <a className="row" key={c.n} href={`#/novels/${encodeURIComponent(id)}/${c.n}`} data-lv={c.status === 'flagged' ? 'warn' : ''}><b>第 {c.n} 章 {c.title}</b><span className="meta">{c.chars} 字{c.score != null ? ` · ${c.score} 分` : ''}{c.status === 'flagged' ? ' · 待查' : ''}</span></a>)}
+    {chapters.map(c => {
+      const liveEd = editingByChapter.get(c.n)
+      return <a className="row" key={c.n} href={`#/novels/${encodeURIComponent(id)}/${c.n}`} data-lv={c.status === 'flagged' ? 'warn' : ''}>
+        <b>第 {c.n} 章 {c.title}{liveEd ? <span className="pill" data-tone="run" style={{ marginLeft: 8 }}>改稿中 · {liveEd.progressPct ?? 25}%</span> : null}</b>
+        <span className="meta">{c.chars} 字{c.score != null ? ` · ${c.score} 分` : ''}{c.status === 'flagged' ? ' · 待查' : ''}{liveEd?.stageLabel ? ` · ${liveEd.stageLabel}` : ''}</span>
+      </a>
+    })}
     {d && !chapters.length && <Empty>还没有章节。</Empty>}</>
 }
 function Chapter({ bookId, n }: { bookId: string; n: number }) {
   const { d, err, reload } = usePoll<any>(`api/novels/${encodeURIComponent(bookId)}/chapters/${n}`, 600000)
+  const { board } = useLive()
   const [note, setNote] = useState('')
   const { busy, run } = useAction()
   const base = `api/novels/${encodeURIComponent(bookId)}/chapters/${n}`
   useEffect(() => { post(`${base}/read`, {}).catch(() => {}) }, [base])
+
+  const liveEdit = (board?.novelEdits || []).find(e => e.bookId === bookId && e.n === n)
+  const curEdit = liveEdit && (!d?.edit || liveEdit.id === d.edit.id || liveEdit.updatedAt >= d.edit.updatedAt) ? liveEdit : d?.edit
+  const isEditing = curEdit?.status === 'running'
+
+  useEffect(() => {
+    if (!isEditing) return
+    const timer = setInterval(() => reload(), 2500)
+    return () => clearInterval(timer)
+  }, [isEditing, reload])
+
+  useEffect(() => {
+    if (d?.edit?.status === 'running' && liveEdit && liveEdit.id === d.edit.id && liveEdit.status !== 'running') {
+      reload()
+    }
+  }, [d?.edit?.id, d?.edit?.status, liveEdit?.id, liveEdit?.status, reload])
+
   const last = d?.lastChapter || n
   const nav = (k: number) => `#/novels/${encodeURIComponent(bookId)}/${k}`
+  const pct = curEdit?.status === 'running' ? Math.max(8, Math.min(100, curEdit.progressPct ?? 25)) : 100
   return <div className="reader"><a className="back" href={`#/novels/${encodeURIComponent(bookId)}`}>← 目录</a>
     <h1>第 {n} 章 {d?.row?.title || ''}</h1><Loading d={d} err={err} />
+    {curEdit && (
+      <div className="novel-edit-card" data-st={curEdit.status} role="status" aria-live="polite">
+        <div className="novel-edit-card__head">
+          <b>
+            {curEdit.status === 'running' && '⏳ 正在按你的修改意见重写本章…'}
+            {curEdit.status === 'done' && '✅ 本章改稿已完成（已更新正文）'}
+            {curEdit.status === 'failed' && '❌ 本章改稿未通过（已保留原稿）'}
+            {curEdit.status === 'undone' && '↩️ 已撤销最近一次修改'}
+          </b>
+          <span className="meta mono">
+            {curEdit.status === 'running' ? `${pct}%` : ago(curEdit.updatedAt)}
+            {curEdit.costUsd > 0 ? ` · $${curEdit.costUsd.toFixed(4)}` : ''}
+          </span>
+        </div>
+        {curEdit.status === 'running' && (
+          <div className="lp__track" aria-hidden="true">
+            <span className="lp__bar" style={{ width: `${pct}%` }} />
+          </div>
+        )}
+        <div className="meta">
+          {curEdit.stageLabel || (curEdit.status === 'done' ? '改稿已完成' : curEdit.status === 'failed' ? '改稿未通过' : '等待开始')}
+          {curEdit.attempt && curEdit.maxAttempts && curEdit.status === 'running' ? `（第 ${curEdit.attempt}/${curEdit.maxAttempts} 轮）` : ''}
+          {curEdit.model ? ` · 模型 ${curEdit.model}` : ''}
+          {curEdit.status === 'done' && curEdit.charsBefore != null && curEdit.charsAfter != null
+            ? ` · 字数 ${curEdit.charsBefore} → ${curEdit.charsAfter}`
+            : ''}
+        </div>
+        <div className="meta">修改意见：{curEdit.note}</div>
+        {curEdit.error && <p className="warn" style={{ margin: '2px 0 0' }}>原因：{curEdit.error}</p>}
+      </div>
+    )}
     {d && <article>{String(d.text || '').split(/\n+/).filter(Boolean).map((p, i) => <p key={i}>{p}</p>)}</article>}
     <p className="actions">{n > 1 && <a className="btn" href={nav(n - 1)}>上一章</a>}{n < last && <a className="btn" href={nav(n + 1)}>下一章</a>}</p>
-    <details className="card"><summary>提修改意见</summary>
-      <textarea className="big" rows={3} value={note} onChange={e => setNote(e.target.value)} placeholder="哪里要怎么改？" />
-      <p className="actions"><button className="primary" disabled={busy || !note.trim()} onClick={() => run(() => post(`${base}/edit`, { note }), '已提交修改', () => { setNote(''); reload() })}>按意见改</button>
-        {d?.edit && <button disabled={busy} onClick={() => run(() => post(`${base}/undo`, {}), '已撤销', reload)}>撤销上次修改</button>}</p>
+    <details className="card" open={isEditing}><summary>提修改意见</summary>
+      <textarea className="big" rows={3} value={note} onChange={e => setNote(e.target.value)} placeholder="哪里要怎么改？" disabled={isEditing} />
+      <p className="actions"><button className="primary" disabled={busy || isEditing || !note.trim()} onClick={() => run(() => post(`${base}/edit`, { note }), '已提交修改，正在后台重写本章…', () => { setNote(''); reload() })}>{isEditing ? '正在改稿中…' : '按意见改'}</button>
+        {d?.edit?.status === 'done' && <button disabled={busy || isEditing} onClick={() => run(() => post(`${base}/undo`, {}), '已撤销', reload)}>撤销上次修改</button>}</p>
     </details></div>
 }
 

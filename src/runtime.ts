@@ -72,6 +72,7 @@ import { FEISHU_SOURCE, FeishuSource } from './sources/feishu.ts'
 import { EmailSource, type EmailConfig, type EmailEvent } from './sources/email.ts'
 import { WECHAT_SOURCE, WechatSource, type WechatEvent } from './sources/wechat.ts'
 import { SqliteVaultIlinkStore } from './sources/wechat-ilink.ts'
+import { QQ_SOURCE, QqSource, type QqEvent } from './sources/qq.ts'
 import { PentestService } from './pentest/service.ts'
 import { DirectorStore } from './director/store.ts'
 import { DirectorService } from './director/service.ts'
@@ -621,6 +622,54 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       },
     })
     const composite = new CompositeScope([source, feishu, email, wechat])
+    const recordQq = (event: QqEvent): void => {
+      try {
+        events.add({ kind: event.kind, level: event.level, text: event.text, ...(event.data === undefined ? {} : { data: event.data }) })
+      } catch { /* best effort */ }
+    }
+    const qq = new QqSource({
+      config: () => optionsStore.get().qq,
+      onMessage: msg => {
+        const opts = optionsStore.get()
+        if (director && opts.director.enabled && opts.qq.routingMode === 'director') {
+          recordQq({
+            kind: 'qq.ws',
+            level: 'info',
+            text: `收到 QQ ${msg.chatType === 'group' ? '群聊' : '单聊'}消息（已交由总控助手）`,
+            data: { chatType: msg.chatType, route: 'director' },
+          })
+          director.handleQqInbound({
+            from: msg.from,
+            chatId: msg.chatId,
+            messageId: msg.messageId,
+            text: msg.text,
+            chatType: msg.chatType,
+          })
+          return
+        }
+        recordQq({
+          kind: 'qq.ws',
+          level: 'info',
+          text: '收到 QQ 消息（直通建单模式）',
+          data: { chatType: msg.chatType, route: 'direct' },
+        })
+        void ask(msg.text).then(async result => {
+          const target = msg.chatType === 'group' ? msg.chatId : msg.from
+          const tip = result.ticketId
+            ? `已为你创建工单 ${result.ticketId}，完成后可通过总控助手或控制台查看交付。`
+            : '消息已受理。'
+          await qq.send({ to: target, chatType: msg.chatType, replyTo: msg.messageId, text: tip })
+        }).catch(err => {
+          console.error(`superagentd: qq direct ask failed: ${err instanceof Error ? err.message : String(err)}`)
+        })
+      },
+      onInteraction: async ev => {
+        if (!director) return { code: 1, replyText: '总控助手尚未就绪，请稍后再试。' }
+        return director.handleQqInteraction(ev)
+      },
+      onEvent: recordQq,
+      onError: error => console.error(`superagentd: qq: ${error.message}`),
+    })
     outbox.registerChannel('feishu', message => feishu.deliver(message))
     outbox.registerChannel('email', message => email.deliver(message))
     outbox.registerChannel(WECHAT_SOURCE, message => wechat.deliver(message))
@@ -1664,6 +1713,23 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       writing: bookId => novelExecutor.writing(bookId),
       dayUsd: () => NovelService.dayUsd(repo.db, new Date()),
       dailyUsd: () => optionsStore.get().novel.dailyUsd,
+      onEditSettled: edit => {
+        if (edit.status !== 'done' && edit.status !== 'failed') return
+        void directorBridge?.notify({
+          kind: 'novel.edit_settled',
+          editId: edit.id,
+          bookId: edit.bookId ?? '',
+          bookTitle: edit.bookTitle ?? '未命名小说',
+          chapter: edit.n,
+          ...(edit.chapterTitle ? { chapterTitle: edit.chapterTitle } : {}),
+          status: edit.status,
+          note: edit.note,
+          ...(edit.charsBefore !== undefined ? { charsBefore: edit.charsBefore } : {}),
+          ...(edit.charsAfter !== undefined ? { charsAfter: edit.charsAfter } : {}),
+          costUsd: edit.costUsd,
+          ...(edit.error ? { error: edit.error } : {}),
+        })
+      },
       onError: error => console.error(`superagentd: novel setup: ${error instanceof Error ? error.message : String(error)}`),
     })
     const fanqie = new FanqieService({
@@ -1777,6 +1843,21 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     })
     cleanup.push(offWechat)
     cleanup.push(() => wechat.stop())
+
+    const syncQq = (restart = false): void => {
+      const cfg = optionsStore.get().qq
+      if (!cfg.enabled) {
+        qq.stop()
+        return
+      }
+      if (restart) void qq.restart()
+      else void qq.start()
+    }
+    const offQq = optionsStore.onChange(section => {
+      if (section === 'qq') syncQq(true)
+    })
+    cleanup.push(offQq)
+    cleanup.push(() => qq.stop())
 
     const sleep = (ms: number): Promise<void> => new Promise(resolveSleep => setTimeout(resolveSleep, ms))
     const ask = async (text: string, opts: { model?: string; secrets?: string[]; projectId?: string; projectMode?: ProjectMode; collab?: boolean; goal?: GoalSpec; novel?: { bookId: string; arc: number }; runner?: TicketRunnerSelection } = {}): Promise<AskResult> => {
@@ -2053,6 +2134,9 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       wechatQrStatus: () => wechat.qrStatus(),
       verifyWechatQr: code => wechat.submitQrVerifyCode(code),
       logoutWechatIlink: () => wechat.logoutIlink(),
+      testQq: () => qq.test(),
+      qqStatus: () => qq.status(),
+      reconnectQq: () => qq.restart(),
       novelsDir: novelRoot,
       reconnectFeishu: async () => {
         const cfg = optionsStore.get().feishu
@@ -2128,6 +2212,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       onSettingsChanged: async (section, changed) => {
         if (changed && changed.length > 0) return
         if (section === 'wechat') syncWechat()
+        if (section === 'qq') syncQq()
       },
       sendWechat: input => wechat.sendNew(input),
       sendWechatTyping: (to, status) => wechat.sendTyping(to, status),
@@ -2135,6 +2220,11 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       sendFeishuCard: input => feishu.sendCard({ openId: input.to, ...(input.replyTo ? { replyTo: input.replyTo } : {}), card: input.card, ...(input.fallbackText ? { fallbackText: input.fallbackText } : {}) }),
       updateFeishuCard: (messageId, card) => feishu.updateCard(messageId, card),
       feishuAllowCheck: openId => Boolean(allowedSender(settings, { source: FEISHU_SOURCE, id: openId })),
+      sendQq: input => qq.send(input),
+      qqAllowCheck: openId => {
+        const list = optionsStore.get().qq.allowedUsers
+        return list.length === 0 || list.includes(openId)
+      },
       decideSecretRequest: async (requestId, decision) => {
         try {
           adminHost.decideSecretRequest(requestId, decision === 'approve' ? 'grant' : 'deny')
@@ -2191,6 +2281,8 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       sendFeishu: input => feishu.sendMarkdown({ openId: input.to, text: input.text }),
       sendFeishuCard: input => feishu.sendCard({ openId: input.to, card: input.card, ...(input.fallbackText ? { fallbackText: input.fallbackText } : {}) }),
       feishuRecipients: () => (settings.policy.sources[FEISHU_SOURCE]?.allowed ?? []).map(entry => entry.id),
+      sendQq: input => qq.send(input),
+      qqRecipients: () => optionsStore.get().qq.allowedUsers,
       onError: error => console.error(`superagentd: director bridge failed: ${error instanceof Error ? error.message : String(error)}`),
     })
     const directorWatchdog = new DirectorWatchdog({
@@ -2205,6 +2297,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     directorWatchdog.start()
     cleanup.push(() => directorWatchdog.stop())
     syncWechat()
+    syncQq()
     const adminApi = createAdminApi({ host: adminHost, auth, options: optionsStore, ledger, events, cliToken, projects, councils, activity, novels, fanqie, piVersions, goals, contracts, createTicketPr, devEnv, pentest, director, plugins })
     const adminServer = createConsoleServer({
       api: adminApi,
@@ -2213,6 +2306,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       workspaceRoot,
       feishu,
       wechat,
+      qq,
       host: config.adminHost,
       port: config.adminPort,
     })

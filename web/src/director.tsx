@@ -53,7 +53,7 @@ interface PendingAct {
 
 interface SessionItem {
   id: string
-  channel: 'wechat' | 'web' | 'feishu'
+  channel: 'wechat' | 'web' | 'feishu' | 'qq'
   userId: string
   title: string
   summary: string
@@ -62,6 +62,19 @@ interface SessionItem {
   pendingActions: number
   lastMessage?: string
   updatedAt: string
+}
+
+interface DirectorContextUsageView {
+  usedTokens: number
+  historyTokens: number
+  systemTokens: number
+  lastPromptTokens?: number
+  effectiveContextTokens: number
+  modelContextWindow: number
+  compactTriggerTokens: number
+  usedPercent: number
+  activeMessageCount: number
+  activeBytes: number
 }
 
 interface PendingFollowup {
@@ -74,7 +87,14 @@ interface PendingFollowup {
   createdAt: string
 }
 
-const CHANNEL_LABEL: Record<string, string> = { wechat: '微信', web: '网页', feishu: '飞书' }
+const CHANNEL_LABEL: Record<string, string> = { wechat: '微信', web: '网页', feishu: '飞书', qq: 'QQ' }
+
+function fmtTok(n: number): string {
+  if (n >= 100_000) return `${Math.round(n / 1000)}k`
+  if (n >= 10_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}
 
 const STARTER_CARDS: { title: string; desc: string; tag: string; prompt: string; sendNow?: boolean }[] = [
   {
@@ -119,7 +139,13 @@ export function Director() {
   useTick()
 
   const [selectedId, setSelectedId] = useState<string>('')
-  const [detail, setDetail] = useState<{ session: SessionItem; messages: DirMessage[]; pendingActions: PendingAct[]; followups?: PendingFollowup[] } | null>(null)
+  const [detail, setDetail] = useState<{
+    session: SessionItem
+    messages: DirMessage[]
+    pendingActions: PendingAct[]
+    followups?: PendingFollowup[]
+    contextUsage?: DirectorContextUsageView
+  } | null>(null)
   const [detailErr, setDetailErr] = useState('')
   const [input, setInput] = useState('')
   const [syncChannel, setSyncChannel] = useState(true)
@@ -131,7 +157,7 @@ export function Director() {
   const [mobileProgressOpen, setMobileProgressOpen] = useState(false)
   const [sessionsOpen, setSessionsOpen] = useState(false)
   const [newChatOpen, setNewChatOpen] = useState(false)
-  const [newChatChannel, setNewChatChannel] = useState<'web' | 'feishu'>('web')
+  const [newChatChannel, setNewChatChannel] = useState<'web' | 'feishu' | 'qq'>('web')
   const [newChatTitle, setNewChatTitle] = useState('')
   const [feishuTarget, setFeishuTarget] = useState('')
   const [feishuReset, setFeishuReset] = useState(false)
@@ -187,6 +213,7 @@ export function Director() {
     ? rawItems.filter(s => !removedSessionIds.includes(s.id))
     : rawItems
   const feishuSessions = items.filter(s => s.channel === 'feishu')
+  const qqSessions = items.filter(s => s.channel === 'qq')
   const st = sessionsPoll.d?.status
   const globalPending = sessionsPoll.d?.pendingActions ?? []
   const missions = missionsPoll.d?.items ?? []
@@ -377,23 +404,33 @@ export function Director() {
       toast('请选择已有飞书会话，或输入飞书接收者 ID（open_id / chat_id）', true)
       return
     }
+    if (newChatChannel === 'qq' && !feishuTarget.trim()) {
+      toast('请选择已有 QQ 会话，或输入 QQ 用户 openid（群聊填 group:<group_openid>）', true)
+      return
+    }
     await run(async () => {
       const body: Record<string, unknown> = {
         channel: newChatChannel,
         ...(newChatTitle.trim() ? { title: newChatTitle.trim() } : {}),
-        ...(newChatChannel === 'feishu' ? { userId: feishuTarget.trim(), resetIfExists: feishuReset } : {}),
+        ...(newChatChannel === 'feishu' || newChatChannel === 'qq'
+          ? { userId: feishuTarget.trim(), resetIfExists: feishuReset }
+          : {}),
       }
       const res = await post<{ ok: boolean; session: SessionItem }>('api/director/sessions', body)
       if (res?.session?.id) {
         setSelectedId(res.session.id)
-        if (newChatChannel === 'feishu') setSyncChannel(true)
+        if (newChatChannel === 'feishu' || newChatChannel === 'qq') setSyncChannel(true)
         await loadDetail(res.session.id)
       }
       setNewChatOpen(false)
       setSessionsOpen(false)
       sessionsPoll.reload()
       setTimeout(() => textareaRef.current?.focus(), 60)
-    }, newChatChannel === 'feishu' ? '已开启飞书总控对话（回复将自动同步飞书）' : '已开启全新网页对话')
+    }, newChatChannel === 'feishu'
+      ? '已开启飞书总控对话（回复将自动同步飞书）'
+      : newChatChannel === 'qq'
+        ? '已开启 QQ 总控对话（回复将自动同步推送至 QQ）'
+        : '已开启全新网页对话')
   }
 
   const stopSending = () => {
@@ -418,7 +455,7 @@ export function Director() {
 
     const targetChannel = activeSession?.channel ?? 'web'
     const targetUserId = activeSession?.userId ?? 'console'
-    const imChannel = targetChannel === 'wechat' || targetChannel === 'feishu'
+    const imChannel = targetChannel === 'wechat' || targetChannel === 'feishu' || targetChannel === 'qq'
     const payload = {
       text,
       channel: targetChannel,
@@ -683,25 +720,42 @@ export function Director() {
             <b>{activeSession ? (activeSession.title || activeSession.userId) : '新网页对话'}</b>
             <Icon name="chevronDown" size={14} />
           </button>
-          {st && (
-            <span className="dir-bar__meta only-desktop mono">
-              {st.model || '未配置模型'}
-              {st.effectiveContextTokens && st.modelContextWindow ? (
-                <>
-                  <span aria-hidden="true"> · </span>
-                  <span title={`有效上下文 ${st.effectiveContextTokens.toLocaleString()} / 模型上限 ${st.modelContextWindow.toLocaleString()} tokens（${st.contextWindowPercent ?? 80}%），单步最大输出 ${(st.effectiveOutputTokens ?? 0).toLocaleString()} tokens${st.maxPromptKb ? `，网关单次请求上限 ${st.maxPromptKb} KB` : ''}`}>
-                    上下文 {Math.round(st.effectiveContextTokens / 1000)}k/{Math.round(st.modelContextWindow / 1000)}k{st.maxPromptKb ? ` · 网关上限 ${st.maxPromptKb}KB` : ''}
-                  </span>
-                </>
-              ) : null}
-              <span aria-hidden="true"> · </span>
-              <span data-ok={st.enabled}>{st.enabled ? '在线' : '已关闭'}</span>
-            </span>
-          )}
+          {st && (() => {
+            const cu = detail?.contextUsage
+            const ctxPct = cu ? cu.usedPercent : 0
+            const ctxTone = ctxPct >= 92 ? 'bad' : ctxPct >= 75 ? 'warn' : 'ok'
+            const ctxTip = cu
+              ? `当前对话上下文已用 ${cu.usedTokens.toLocaleString()} / ${cu.effectiveContextTokens.toLocaleString()} tokens（${cu.usedPercent}%）\n• 系统提示词：~${cu.systemTokens.toLocaleString()} tokens\n• 活跃对话历史：~${cu.historyTokens.toLocaleString()} tokens（${cu.activeMessageCount} 条，${Math.round(cu.activeBytes / 1024)} KB）${cu.lastPromptTokens ? `\n• 上次网关实测输入：${cu.lastPromptTokens.toLocaleString()} tokens` : ''}\n• 自动压缩阈值：${cu.compactTriggerTokens.toLocaleString()} tokens（模型窗口 ${cu.modelContextWindow.toLocaleString()}）`
+              : `有效上下文 ${(st.effectiveContextTokens ?? 0).toLocaleString()} / 模型上限 ${(st.modelContextWindow ?? 0).toLocaleString()} tokens（${st.contextWindowPercent ?? 80}%），单步最大输出 ${(st.effectiveOutputTokens ?? 0).toLocaleString()} tokens`
+            return (
+              <span className="dir-bar__meta only-desktop mono">
+                {st.model || '未配置模型'}
+                {cu ? (
+                  <>
+                    <span aria-hidden="true"> · </span>
+                    <span className="dir-ctx" data-tone={ctxTone} title={ctxTip}>
+                      <span>上下文 {fmtTok(cu.usedTokens)}/{fmtTok(cu.effectiveContextTokens)} ({cu.usedPercent}%)</span>
+                      <i className="dir-ctx__bar" aria-hidden="true"><b style={{ width: `${Math.min(100, cu.usedPercent)}%` }} /></i>
+                    </span>
+                  </>
+                ) : st.effectiveContextTokens && st.modelContextWindow ? (
+                  <>
+                    <span aria-hidden="true"> · </span>
+                    <span title={ctxTip}>
+                      上下文 {Math.round(st.effectiveContextTokens / 1000)}k/{Math.round(st.modelContextWindow / 1000)}k
+                    </span>
+                  </>
+                ) : null}
+                {st.maxPromptKb ? <><span aria-hidden="true"> · </span><span>网关上限 {st.maxPromptKb}KB</span></> : null}
+                <span aria-hidden="true"> · </span>
+                <span data-ok={st.enabled}>{st.enabled ? '在线' : '已关闭'}</span>
+              </span>
+            )
+          })()}
         </div>
 
         <div className="dir-bar__right">
-          {activeSession && (activeSession.channel === 'wechat' || activeSession.channel === 'feishu') && (
+          {activeSession && (activeSession.channel === 'wechat' || activeSession.channel === 'feishu' || activeSession.channel === 'qq') && (
             <label className="dir-sync only-desktop">
               <input type="checkbox" checked={syncChannel} onChange={e => setSyncChannel(e.target.checked)} />
               <span>同步{CHANNEL_LABEL[activeSession.channel]}</span>
@@ -736,7 +790,13 @@ export function Director() {
       {/* 会话更多操作下拉条 */}
       {chatMenuOpen && (
         <div className="dir-menu" role="region" aria-label="会话操作">
-          {activeSession && (activeSession.channel === 'wechat' || activeSession.channel === 'feishu') && (
+          {detail?.contextUsage && (
+            <div className="dir-ctx only-mobile mono" data-tone={detail.contextUsage.usedPercent >= 92 ? 'bad' : detail.contextUsage.usedPercent >= 75 ? 'warn' : 'ok'}>
+              <span>已用上下文 {fmtTok(detail.contextUsage.usedTokens)} / {fmtTok(detail.contextUsage.effectiveContextTokens)} ({detail.contextUsage.usedPercent}%) · {detail.contextUsage.activeMessageCount} 条</span>
+              <i className="dir-ctx__bar" aria-hidden="true"><b style={{ width: `${Math.min(100, detail.contextUsage.usedPercent)}%` }} /></i>
+            </div>
+          )}
+          {activeSession && (activeSession.channel === 'wechat' || activeSession.channel === 'feishu' || activeSession.channel === 'qq') && (
             <label className="dir-sync only-mobile">
               <input type="checkbox" checked={syncChannel} onChange={e => setSyncChannel(e.target.checked)} />
               <span>同步{CHANNEL_LABEL[activeSession.channel]}</span>
@@ -1195,7 +1255,7 @@ export function Director() {
               role="radio"
               aria-checked={newChatChannel === 'feishu'}
               className={newChatChannel === 'feishu' ? 'dir-chancard is-on' : 'dir-chancard'}
-              onClick={() => setNewChatChannel('feishu')}
+              onClick={() => { setNewChatChannel('feishu'); setFeishuTarget(feishuSessions[0]?.userId || '') }}
             >
               <Icon name="feishu" size={18} />
               <div className="dir-chancard__body">
@@ -1206,6 +1266,22 @@ export function Director() {
                 <span className="meta">绑定飞书会话，总控回复与任务战报实时同步推送至飞书</span>
               </div>
             </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={newChatChannel === 'qq'}
+              className={newChatChannel === 'qq' ? 'dir-chancard is-on' : 'dir-chancard'}
+              onClick={() => { setNewChatChannel('qq'); setFeishuTarget(qqSessions[0]?.userId || '') }}
+            >
+              <Icon name="qq" size={18} />
+              <div className="dir-chancard__body">
+                <div className="dir-chancard__top">
+                  <b>QQ 对话</b>
+                  <span className="dir-chancard__dot" aria-hidden="true">{newChatChannel === 'qq' && <Icon name="check" size={11} stroke={2.8} />}</span>
+                </div>
+                <span className="meta">绑定 QQ 官方机器人，回复自动排版并在支持时附带可点击选项按钮</span>
+              </div>
+            </button>
           </div>
 
           <label className="field">
@@ -1213,7 +1289,7 @@ export function Director() {
             <input
               value={newChatTitle}
               onChange={e => setNewChatTitle(e.target.value)}
-              placeholder={newChatChannel === 'feishu' ? '例如：飞书日常调度' : '例如：前端重设计与测试'}
+              placeholder={newChatChannel === 'feishu' ? '例如：飞书日常调度' : newChatChannel === 'qq' ? '例如：QQ 日常调度' : '例如：前端重设计与测试'}
             />
           </label>
 
@@ -1252,10 +1328,45 @@ export function Director() {
             </>
           )}
 
+          {newChatChannel === 'qq' && (
+            <>
+              {qqSessions.length > 0 && (
+                <div className="field">
+                  <span>选择已有 QQ 接收对象</span>
+                  <div className="dir-fspicks">
+                    {qqSessions.map(qs => (
+                      <button
+                        key={qs.id}
+                        type="button"
+                        className={feishuTarget === qs.userId ? 'dir-chip is-on' : 'dir-chip'}
+                        onClick={() => setFeishuTarget(qs.userId)}
+                      >
+                        {qs.title || qs.userId}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <label className="field">
+                <span>QQ 接收 ID（用户 openid，群聊填 group:&lt;group_openid&gt;）</span>
+                <input
+                  value={feishuTarget}
+                  onChange={e => setFeishuTarget(e.target.value)}
+                  placeholder="例如：B1C2D3... 或 group:9A8B7C..."
+                />
+                <small className="hint">若不知道 openid，可先在 QQ 给机器人发送一条「/状态」，系统会自动创建会话。</small>
+              </label>
+              <label className="check">
+                <input type="checkbox" checked={feishuReset} onChange={e => setFeishuReset(e.target.checked)} />
+                <span><b>清空该 QQ 会话短期上下文</b><small className="hint">若该 QQ 会话已存在，开启后从全新话题开始</small></span>
+              </label>
+            </>
+          )}
+
           <div className="actions dialog__actions">
             <button type="button" onClick={() => setNewChatOpen(false)}>取消</button>
             <button type="button" className="primary" disabled={busy} onClick={() => void createNewConversation()}>
-              {busy ? '创建中…' : (newChatChannel === 'feishu' ? '开启飞书对话' : '开启网页对话')}
+              {busy ? '创建中…' : (newChatChannel === 'feishu' ? '开启飞书对话' : newChatChannel === 'qq' ? '开启 QQ 对话' : '开启网页对话')}
             </button>
           </div>
         </div>

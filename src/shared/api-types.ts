@@ -223,6 +223,28 @@ export interface LiveBoardTicket {
   [key: string]: any
 }
 
+export interface LiveNovelEdit {
+  id: string
+  bookId?: string
+  bookTitle?: string
+  n: number
+  chapterTitle?: string
+  status: 'running' | 'done' | 'failed' | 'undone'
+  stage?: string
+  stageLabel?: string
+  attempt?: number
+  maxAttempts?: number
+  progressPct?: number
+  model?: string
+  charsBefore?: number
+  charsAfter?: number
+  note: string
+  error?: string
+  costUsd: number
+  createdAt: string
+  updatedAt: string
+}
+
 export interface LiveBoardSnapshot {
   now: string
   paused: boolean
@@ -231,6 +253,7 @@ export interface LiveBoardSnapshot {
   usage: { todayUsd: number; todayCalls?: number; dailyBudgetUsd?: number }
   upstream?: { ok: boolean; model?: string; provider?: string }
   runningSteps: LiveRunningStep[]
+  novelEdits?: LiveNovelEdit[]
   open: LiveBoardTicket[]
   ended: LiveBoardTicket[]
   alerts: { level: string; text: string; link?: string }[]

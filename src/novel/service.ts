@@ -23,11 +23,25 @@ import type { Role } from './pipeline.ts'
 import { CHAPTER_EDIT_SYSTEM, chapterEditUser } from './prompts.ts'
 import { countChars } from './lint.ts'
 
+/** 章节改稿的细粒度执行阶段。 */
+export type ChapterEditStage = 'queued' | 'calling_model' | 'retrying' | 'validating' | 'applying' | 'done' | 'failed' | 'undone'
+
 /** One person-requested edit of a committed chapter; the old text is kept so it can be undone. */
 export interface ChapterEdit {
   id: string
+  bookId?: string
+  bookTitle?: string
   n: number
+  chapterTitle?: string
   status: 'running' | 'done' | 'failed' | 'undone'
+  stage?: ChapterEditStage
+  stageLabel?: string
+  attempt?: number
+  maxAttempts?: number
+  progressPct?: number
+  model?: string
+  charsBefore?: number
+  charsAfter?: number
   note: string
   error?: string
   costUsd: number
@@ -37,17 +51,35 @@ export interface ChapterEdit {
 
 interface EditRow {
   id: string
+  book_id?: string
   n: number
   status: string
   note: string
+  old_text?: string
+  new_text?: string | null
   error: string | null
   cost_usd: number
   created_at: string
   updated_at: string
 }
 
+interface EditProgressState {
+  bookId: string
+  bookTitle?: string
+  chapterTitle?: string
+  stage: ChapterEditStage
+  stageLabel: string
+  attempt: number
+  maxAttempts: number
+  progressPct: number
+  model?: string
+  charsBefore: number
+  charsAfter?: number
+}
+
 const toEdit = (row: EditRow): ChapterEdit => ({
   id: row.id,
+  ...(row.book_id ? { bookId: row.book_id } : {}),
   n: row.n,
   status: row.status as ChapterEdit['status'],
   note: row.note,
@@ -103,6 +135,8 @@ export interface NovelServiceOptions {
   /** Base delay before retrying a transient upstream error; multiplied by the retry count. Default 15s. */
   retryMs?: number
   sleep?: (ms: number) => Promise<void>
+  /** 章节意见改稿结束（成功或失败）时的回调，用于主动通知总控与推送通道。 */
+  onEditSettled?: (edit: ChapterEdit) => void
   onError?: (error: unknown) => void
 }
 
@@ -156,6 +190,7 @@ export class NovelService {
   private readonly now: () => Date
   private readonly idFactory: () => string
   private readonly drafting = new Set<string>()
+  private readonly editProgress = new Map<string, EditProgressState>()
 
   constructor(private readonly options: NovelServiceOptions) {
     this.call = options.call ?? callModel
@@ -424,7 +459,85 @@ export class NovelService {
   lastEdit(bookId: string, n: number): ChapterEdit | undefined {
     const row = this.options.db.prepare('SELECT * FROM novel_edits WHERE book_id = ? AND n = ? ORDER BY created_at DESC, rowid DESC LIMIT 1')
       .get(bookId, n) as EditRow | undefined
-    return row ? toEdit(row) : undefined
+    return row ? this.enrichEdit({ ...row, book_id: bookId }) : undefined
+  }
+
+  /** 返回所有正在执行的改稿任务，以及最近 2 小时内刚结束的改稿记录（供实时进度面板与总控查询）。 */
+  listRecentEdits(limit = 12): ChapterEdit[] {
+    const cap = Math.max(1, Math.min(50, Math.floor(limit)))
+    const sinceIso = new Date(this.now().getTime() - 2 * 3600_000).toISOString()
+    const rows = this.options.db.prepare(`
+      SELECT * FROM novel_edits
+      WHERE status = 'running' OR updated_at >= ?
+      ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END, updated_at DESC, rowid DESC
+      LIMIT ?
+    `).all(sinceIso, cap) as unknown as EditRow[]
+    return rows.map(r => this.enrichEdit(r))
+  }
+
+  private setEditProgress(id: string, state: EditProgressState): void {
+    this.editProgress.set(id, state)
+    if (this.editProgress.size > 60) {
+      for (const [k, v] of this.editProgress) {
+        if (this.editProgress.size <= 40) break
+        if (v.stage === 'done' || v.stage === 'failed' || v.stage === 'undone') {
+          this.editProgress.delete(k)
+        }
+      }
+    }
+  }
+
+  private enrichEdit(row: EditRow): ChapterEdit {
+    const base = toEdit(row)
+    const prog = this.editProgress.get(row.id)
+    const bookId = prog?.bookId ?? row.book_id
+    let bookTitle = prog?.bookTitle
+    let chapterTitle = prog?.chapterTitle
+    if (bookId && (!bookTitle || !chapterTitle)) {
+      try {
+        if (!bookTitle) {
+          const bf = this.files(bookId)
+          if (bf.exists()) bookTitle = bf.readBook().title
+        }
+        if (!chapterTitle) {
+          chapterTitle = this.options.store.chapters(bookId).find(c => c.n === row.n)?.title
+        }
+      } catch { /* 删书竞态忽略 */ }
+    }
+    const charsBefore = prog?.charsBefore ?? (typeof row.old_text === 'string' && row.old_text ? countChars(row.old_text) : undefined)
+    const charsAfter = prog?.charsAfter ?? (typeof row.new_text === 'string' && row.new_text ? countChars(row.new_text) : undefined)
+    const stage: ChapterEditStage = prog?.stage ?? (
+      base.status === 'running'
+        ? 'calling_model'
+        : base.status === 'done'
+          ? 'done'
+          : base.status === 'undone'
+            ? 'undone'
+            : 'failed'
+    )
+    const stageLabel = prog?.stageLabel ?? (
+      base.status === 'running'
+        ? '正在重写本章节正文…'
+        : base.status === 'done'
+          ? '改稿完成，已应用新正文'
+          : base.status === 'undone'
+            ? '已撤销本次修改'
+            : (base.error || '改稿失败，原稿未改动')
+    )
+    const progressPct = prog?.progressPct ?? (base.status === 'running' ? 40 : 100)
+    return {
+      ...base,
+      ...(bookId ? { bookId } : {}),
+      ...(bookTitle ? { bookTitle } : {}),
+      ...(chapterTitle ? { chapterTitle } : {}),
+      stage,
+      stageLabel,
+      ...(prog ? { attempt: prog.attempt, maxAttempts: prog.maxAttempts } : {}),
+      progressPct,
+      ...(prog?.model ? { model: prog.model } : {}),
+      ...(charsBefore !== undefined ? { charsBefore } : {}),
+      ...(charsAfter !== undefined ? { charsAfter } : {}),
+    }
   }
 
   /**
@@ -439,11 +552,26 @@ export class NovelService {
     const clean = Array.from(note.trim()).slice(0, 1000).join('')
     if (!clean) throw new NovelError('invalid', '请写一句要怎么改。')
     if (this.lastEdit(bookId, n)?.status === 'running') throw new NovelError('conflict', '这一章正在修改，等它改完再提新的意见。')
-    if (!this.options.resolve('writer', bookId)) throw new NovelError('invalid', '没有可用的写手模型。')
+    const resolved = this.options.resolve('writer', bookId)
+    if (!resolved) throw new NovelError('invalid', '没有可用的写手模型。')
     const id = `e_${randomBytes(6).toString('hex')}`
     const at = this.now().toISOString()
+    const book = files.readBook()
+    const chapterTitle = this.options.store.chapters(bookId).find(c => c.n === n)?.title ?? `第 ${n} 章`
     this.options.db.prepare(`INSERT INTO novel_edits (id, book_id, n, status, note, old_text, created_at, updated_at)
       VALUES (?, ?, ?, 'running', ?, ?, ?, ?)`).run(id, bookId, n, clean, text, at, at)
+    this.setEditProgress(id, {
+      bookId,
+      bookTitle: book.title,
+      chapterTitle,
+      stage: 'queued',
+      stageLabel: '已提交修改意见，准备调用写手模型…',
+      attempt: 0,
+      maxAttempts: 4,
+      progressPct: 10,
+      model: `${resolved.provider}/${resolved.model}`,
+      charsBefore: countChars(text),
+    })
     this.drafting.add(id)
     void this.runEdit(id, bookId, n, clean, text, opts).finally(() => this.drafting.delete(id))
     return this.lastEdit(bookId, n)!
@@ -454,16 +582,55 @@ export class NovelService {
     const book = files.readBook()
     const summary = files.readSummary<ChapterSummary>(n)
     const ticketId = this.options.store.bindings(bookId).find(b => b.ticketId)?.ticketId ?? ''
+    const chapterTitle = this.options.store.chapters(bookId).find(c => c.n === n)?.title ?? summary?.title ?? `第 ${n} 章`
+    const charsBefore = countChars(text)
     let cost = 0
-    const fail = (why: string) => {
+    const emitSettled = (stage: 'done' | 'failed', stageLabel: string, charsAfter?: number, modelRef?: string): void => {
+      const prev = this.editProgress.get(id)
+      this.setEditProgress(id, {
+        bookId,
+        bookTitle: book.title,
+        chapterTitle,
+        stage,
+        stageLabel,
+        attempt: prev?.attempt ?? 1,
+        maxAttempts: prev?.maxAttempts ?? 4,
+        progressPct: 100,
+        ...(modelRef || prev?.model ? { model: modelRef || prev?.model } : {}),
+        charsBefore,
+        ...(charsAfter !== undefined ? { charsAfter } : {}),
+      })
+      const row = this.options.db.prepare('SELECT * FROM novel_edits WHERE id = ?').get(id) as EditRow | undefined
+      if (row) {
+        try { this.options.onEditSettled?.(this.enrichEdit(row)) } catch { /* best effort */ }
+      }
+    }
+    const fail = (why: string, modelRef?: string) => {
       this.options.db.prepare("UPDATE novel_edits SET status = 'failed', error = ?, cost_usd = ?, updated_at = ? WHERE id = ?")
         .run(why.slice(0, 500), cost, this.now().toISOString(), id)
+      emitSettled('failed', why.slice(0, 120), undefined, modelRef)
     }
+    let resolvedRef: string | undefined
     try {
       const resolved = this.options.resolve('writer', bookId)
       if (!resolved) { fail('没有可用的写手模型'); return }
+      resolvedRef = `${resolved.provider}/${resolved.model}`
       let result: Awaited<ReturnType<typeof callModel>> | undefined
       for (let attempt = 0; attempt < 4; attempt++) {
+        this.setEditProgress(id, {
+          bookId,
+          bookTitle: book.title,
+          chapterTitle,
+          stage: attempt === 0 ? 'calling_model' : 'retrying',
+          stageLabel: attempt === 0
+            ? `正在由 ${resolvedRef} 重写章节正文…`
+            : `第 ${attempt} 次上游波动重试，继续重写章节（第 ${attempt + 1}/4 轮）…`,
+          attempt: attempt + 1,
+          maxAttempts: 4,
+          progressPct: attempt === 0 ? 35 : Math.min(70, 40 + attempt * 10),
+          model: resolvedRef,
+          charsBefore,
+        })
         result = await this.call(resolved.target, {
           model: resolved.model,
           system: CHAPTER_EDIT_SYSTEM,
@@ -478,19 +645,47 @@ export class NovelService {
         if (result.ok || !(status === undefined || status === 408 || status === 429 || status >= 500)) break
         await (this.options.sleep ?? (ms => new Promise<void>(r => setTimeout(r, ms))))((this.options.retryMs ?? 15_000) * (attempt + 1))
       }
-      if (!result?.ok || !result.text.trim()) { fail(`模型调用失败：${result?.error ?? result?.status ?? ''}`); return }
-      if (result.truncated) { fail('改稿被截断，原稿没有动。'); return }
+      if (!result?.ok || !result.text.trim()) { fail(`模型调用失败：${result?.error ?? result?.status ?? ''}`, resolvedRef); return }
+      if (result.truncated) { fail('改稿被截断，原稿没有动。', resolvedRef); return }
       const after = countChars(result.text)
+      this.setEditProgress(id, {
+        bookId,
+        bookTitle: book.title,
+        chapterTitle,
+        stage: 'validating',
+        stageLabel: `模型已返回 ${after} 字，正在校验篇幅与正文格式…`,
+        attempt: this.editProgress.get(id)?.attempt ?? 1,
+        maxAttempts: 4,
+        progressPct: 80,
+        model: resolvedRef,
+        charsBefore,
+        charsAfter: after,
+      })
       const minAllowed = Math.floor(book.chapterChars[0] * 0.75)
-      const effectiveBefore = Math.min(countChars(text), Math.round(book.chapterChars[1] * 1.15))
+      const effectiveBefore = Math.min(charsBefore, Math.round(book.chapterChars[1] * 1.15))
       const minFromOriginal = opts?.allowShorten ? minAllowed : Math.floor(effectiveBefore * 0.75)
-      if (after < minAllowed || after < minFromOriginal) { fail(`改稿只有 ${after} 字，比原稿短太多，原稿没有动。`); return }
+      if (after < minAllowed || after < minFromOriginal) { fail(`改稿只有 ${after} 字，比原稿短太多，原稿没有动。`, resolvedRef); return }
       const fresh = normalizeDraft(result.text, summary?.title ?? `第${n}章`).text
+      const finalChars = countChars(fresh)
+      this.setEditProgress(id, {
+        bookId,
+        bookTitle: book.title,
+        chapterTitle,
+        stage: 'applying',
+        stageLabel: `校验通过（${finalChars} 字），正在写回章节并更新检索索引…`,
+        attempt: this.editProgress.get(id)?.attempt ?? 1,
+        maxAttempts: 4,
+        progressPct: 92,
+        model: resolvedRef,
+        charsBefore,
+        charsAfter: finalChars,
+      })
       this.applyText(bookId, n, fresh)
       this.options.db.prepare("UPDATE novel_edits SET status = 'done', new_text = ?, cost_usd = ?, error = NULL, updated_at = ? WHERE id = ?")
         .run(fresh, cost, this.now().toISOString(), id)
+      emitSettled('done', `改稿完成：${charsBefore} 字 → ${finalChars} 字`, finalChars, resolvedRef)
     } catch (error) {
-      fail(describe(error))
+      fail(describe(error), resolvedRef)
       this.options.onError?.(error)
     }
   }
@@ -526,6 +721,7 @@ export class NovelService {
     const row = this.options.db.prepare('SELECT old_text FROM novel_edits WHERE id = ?').get(last.id) as { old_text: string }
     this.applyText(bookId, n, row.old_text)
     this.options.db.prepare("UPDATE novel_edits SET status = 'undone', updated_at = ? WHERE id = ?").run(this.now().toISOString(), last.id)
+    this.editProgress.delete(last.id)
     return this.lastEdit(bookId, n)!
   }
 

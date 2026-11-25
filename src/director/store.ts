@@ -12,7 +12,7 @@ import { randomBytes } from 'node:crypto'
 import type { DatabaseSync } from 'node:sqlite'
 import type { ToolCall } from './llm.ts'
 
-export type DirectorChannel = 'wechat' | 'web' | 'feishu'
+export type DirectorChannel = 'wechat' | 'web' | 'feishu' | 'qq'
 
 export interface DirectorSession {
   id: string

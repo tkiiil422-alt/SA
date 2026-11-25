@@ -33,14 +33,14 @@ export interface PluginRouteContext {
 /** Director 调用插件工具时透传的会话上下文。 */
 export interface DirectorPluginContext {
   sessionId: string
-  channel: 'wechat' | 'web' | 'feishu'
+  channel: 'wechat' | 'web' | 'feishu' | 'qq'
   userId: string
   focusTicketId?: string | null
 }
 
 /** 构建 Director 系统提示词时提供给插件的动态上下文。 */
 export interface DirectorPromptInjectionContext {
-  channel: 'wechat' | 'web' | 'feishu'
+  channel: 'wechat' | 'web' | 'feishu' | 'qq'
   userId: string
   userMessage?: string
   focusTicketId?: string | null

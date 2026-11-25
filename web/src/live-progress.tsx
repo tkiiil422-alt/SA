@@ -12,7 +12,7 @@ import { ago, money } from './hooks'
 import { useLive, useTick, clock, secondsSince, type RunningStep } from './useLive'
 import { Icon } from './icons'
 import { useAction } from './ui'
-import type { MissionNodeRecord, MissionRecord } from '../../src/shared/api-types.ts'
+import type { LiveNovelEdit, MissionNodeRecord, MissionRecord } from '../../src/shared/api-types.ts'
 
 const STATUS_WORD: Record<string, string> = {
   completed: '已完成',
@@ -123,6 +123,9 @@ export function LiveProgressPanel({
   const need = open.filter(t => t.needsPerson)
   const running = open.filter(t => !t.needsPerson && steps.has(t.id))
   const queued = open.filter(t => !t.needsPerson && !steps.has(t.id))
+  const novelEdits: LiveNovelEdit[] = b?.novelEdits ?? []
+  const runningEdits = novelEdits.filter(e => e.status === 'running')
+  const recentEdits = novelEdits.filter(e => e.status !== 'running').slice(0, 4)
   const ended = b?.ended ?? []
   const slotsMax = b?.slots.max ?? 0
   const todayUsd = b?.usage.todayUsd ?? 0
@@ -249,6 +252,72 @@ export function LiveProgressPanel({
           </div>
         )}
       </section>
+
+      {/* 2.5 小说章节改稿进度 */}
+      {novelEdits.length > 0 && (
+        <section className="lp__card" aria-label="小说改稿进度">
+          <div className="lp__cardhead">
+            <span className="lp__seclabel">
+              <i className={runningEdits.length > 0 ? 'lp__dot is-run' : 'lp__dot'} />
+              小说改稿进度 {runningEdits.length > 0 ? `(${runningEdits.length} 进行中)` : `(${recentEdits.length})`}
+            </span>
+            <a className="lp__more" href="#/novels">书库</a>
+          </div>
+          {runningEdits.length > 0 && (
+            <div className="lp__lanes">
+              {runningEdits.map(ed => {
+                const pct = Math.max(8, Math.min(100, ed.progressPct ?? 25))
+                return (
+                  <div key={ed.id} className="lp__lane">
+                    <div className="lp__lanetop">
+                      <a className="lp__lanetitle" href={`#/novels/${encodeURIComponent(ed.bookId)}/${ed.n}`}>
+                        <b>《{ed.bookTitle}》第 {ed.n} 章{ed.chapterTitle ? ` · ${ed.chapterTitle}` : ''}</b>
+                      </a>
+                      <span className="lp__lanetime mono">
+                        {clock(ed.createdAt, skew)} · {pct}%
+                      </span>
+                    </div>
+                    <div className="lp__lanestep">
+                      <span className="lp__tool">改稿</span>
+                      <span className="lp__cmd">{ed.stageLabel || '正在按意见修改章节…'}</span>
+                    </div>
+                    <div className="lp__track" aria-hidden="true">
+                      <span className="lp__bar" style={{ width: `${pct}%` }} />
+                    </div>
+                    <div className="lp__lanefoot">
+                      <span className="meta">
+                        意见：{ed.note.slice(0, 48)}{ed.note.length > 48 ? '…' : ''}
+                        {ed.attempt && ed.maxAttempts ? ` · 第 ${ed.attempt}/${ed.maxAttempts} 轮` : ''}
+                      </span>
+                      {ed.model && <span className="meta mono">{ed.model}</span>}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+          {recentEdits.length > 0 && (
+            <ul className="lp__ended" style={runningEdits.length > 0 ? { marginTop: 8 } : undefined}>
+              {recentEdits.map(ed => (
+                <li key={ed.id}>
+                  <a href={`#/novels/${encodeURIComponent(ed.bookId)}/${ed.n}`}>
+                    <span className="lp__endedtitle">
+                      《{ed.bookTitle}》第 {ed.n} 章 · {ed.note.slice(0, 26)}
+                    </span>
+                    <span className="lp__endedmeta">
+                      <span data-tone={ed.status === 'failed' ? 'bad' : 'done'}>
+                        {ed.status === 'done' ? '改稿完成' : ed.status === 'failed' ? '未通过' : '已撤销'}
+                      </span>
+                      <span>·</span>
+                      <span>{ago(ed.updatedAt)}</span>
+                    </span>
+                  </a>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
 
       {/* 3. DAG 任务计划（有计划时展示） */}
       {shownMissions.length > 0 && (

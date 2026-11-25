@@ -64,6 +64,7 @@ import {
   type HostMetrics,
   type PolicyInput,
   type PolicyView,
+  type QqStatusView,
   type SecretListItemView,
   type SecretRequestView,
   type SystemExtras,
@@ -119,6 +120,12 @@ export interface RuntimeAdminDeps {
   feishuStatus?: () => { state: 'off' | 'connecting' | 'connected' | 'error'; since?: string; lastEventAt?: string; lastError?: string }
   /** Restart the long connection when the current settings select it; the runtime decides whether it applies. */
   reconnectFeishu?: () => void | Promise<void>
+  /** QQ connection test; absent when the runtime has no QQ source. */
+  testQq?: () => Promise<{ ok: boolean; message: string }>
+  /** Live QQ connector status; absent when the runtime has no QQ source. */
+  qqStatus?: () => QqStatusView
+  /** Restart the QQ connector and return latest state. */
+  reconnectQq?: () => void | Promise<void>
   /** Email connection test; absent when the runtime has no email source. */
   testEmail?: () => Promise<{ ok: boolean; message: string; imap: { ok: boolean; message: string }; smtp: { ok: boolean; message: string } }>
   /** The live email poller state; absent when the runtime has no email source. */
@@ -612,6 +619,15 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
     }
   }
 
+  const qqStatus = (): QqStatusView => {
+    const mode = deps.options.get().qq.mode
+    const live = deps.qqStatus?.() ?? { mode, state: 'off' as const, received: 0, sent: 0 }
+    return {
+      ...live,
+      mode,
+    }
+  }
+
   return {
     info(): SystemInfo {
       const moment = now()
@@ -961,6 +977,21 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
         // The transport records its own failure; the status below reports it.
       }
       return feishuStatus()
+    },
+
+    testQq(): Promise<{ ok: boolean; message: string }> {
+      return deps.testQq ? deps.testQq() : Promise.resolve({ ok: false, message: 'QQ 机器人来源未启用。' })
+    },
+
+    qqStatus,
+
+    async reconnectQq(): Promise<QqStatusView> {
+      try {
+        await deps.reconnectQq?.()
+      } catch {
+        // 状态由 QQ 连接器自行记录并在 qqStatus() 中返回
+      }
+      return qqStatus()
     },
 
     githubTokenSet(): boolean {

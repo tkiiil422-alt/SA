@@ -19,6 +19,19 @@ import {
   buildTicketDecisionCard,
   buildVaultRequestCard,
 } from '../sources/feishu-cards.ts'
+import {
+  buildQqChoicePayload,
+  buildQqCouncilCompletedPayload,
+  buildQqMissionApprovalPayload,
+  buildQqNovelEditPayload,
+  buildQqTicketDecisionPayload,
+  buildQqVaultRequestPayload,
+  extractQqChoiceButtons,
+  formatTextForQq,
+  type QqKeyboard,
+  type QqMarkdown,
+  type QqRichMessagePayload,
+} from '../sources/qq-cards.ts'
 
 export type PlatformNoticeEvent =
   | {
@@ -103,6 +116,20 @@ export type PlatformNoticeEvent =
     conclusion?: string
     ticketId?: string
   }
+  | {
+    kind: 'novel.edit_settled'
+    editId: string
+    bookId: string
+    bookTitle: string
+    chapter: number
+    chapterTitle?: string
+    status: 'done' | 'failed'
+    note: string
+    charsBefore?: number
+    charsAfter?: number
+    costUsd: number
+    error?: string
+  }
 
 export interface DirectorBridgeDeps {
   director: DirectorService
@@ -116,12 +143,27 @@ export interface DirectorBridgeDeps {
   sendFeishuCard?: (input: { to: string; card: Record<string, unknown>; fallbackText?: string }) => Promise<{ messageId?: string }>
   /** 飞书默认汇报对象（通常为飞书允许名单里的 open_id）。 */
   feishuRecipients?: () => string[]
+  /** QQ 官方机器人主动推送（支持原生可点击 Keyboard 按钮与纯文本自动排版降级）。 */
+  sendQq?: (input: {
+    to: string
+    chatType?: 'c2c' | 'group'
+    text: string
+    keyboard?: QqKeyboard
+    markdown?: QqMarkdown
+  }) => Promise<void>
+  /** QQ 默认汇报对象（用户 openId 或 `group:<group_openid>`）。 */
+  qqRecipients?: () => string[]
   now?: () => Date
   onError?: (error: unknown) => void
 }
 
-type PushChannel = 'wechat' | 'feishu'
-const PUSH_LABEL: Record<PushChannel, string> = { wechat: '微信', feishu: '飞书' }
+type PushChannel = 'wechat' | 'feishu' | 'qq'
+const PUSH_LABEL: Record<PushChannel, string> = { wechat: '微信', feishu: '飞书', qq: 'QQ' }
+
+function parseQqTarget(userId: string): { to: string; chatType: 'c2c' | 'group' } {
+  if (userId.startsWith('group:')) return { to: userId.slice(6), chatType: 'group' }
+  return { to: userId, chatType: 'c2c' }
+}
 
 const DEDUPE_TTL_MS = 10 * 60_000
 /**
@@ -266,14 +308,24 @@ export class DirectorBridge {
         ...(ticketId ? { ticketId } : {}),
       })
       if (!target.push) continue
-      if (target.session.channel !== 'wechat' && target.session.channel !== 'feishu') continue
+      if (target.session.channel !== 'wechat' && target.session.channel !== 'feishu' && target.session.channel !== 'qq') continue
       const channel = target.session.channel as PushChannel
       try {
         const card = channel === 'feishu' && opts.director.feishuInteractiveCards !== false
           ? this.buildInteractiveCardForEvent(event, message, healExhaustedAttempts)
           : undefined
+        const qqPayload = channel === 'qq' && opts.qq?.interactiveButtons !== false
+          ? this.buildQqPayloadForEvent(event, message, healExhaustedAttempts)
+          : undefined
         if (card && this.deps.sendFeishuCard) {
           await this.deps.sendFeishuCard({ to: target.session.userId, card, fallbackText: message })
+        } else if (qqPayload && this.deps.sendQq) {
+          const qqTarget = parseQqTarget(target.session.userId)
+          await this.deps.sendQq({
+            to: qqTarget.to,
+            chatType: qqTarget.chatType,
+            ...qqPayload,
+          })
         } else {
           await this.send(channel, target.session.userId, message)
         }
@@ -283,7 +335,7 @@ export class DirectorBridge {
             level: 'info',
             ...(ticketId ? { ticketId } : {}),
             text: `总控主动向${PUSH_LABEL[channel]}汇报（${event.kind}）`,
-            data: { userId: target.session.userId, kind: event.kind, channel, interactiveCard: Boolean(card) },
+            data: { userId: target.session.userId, kind: event.kind, channel, interactiveCard: Boolean(card || qqPayload?.keyboard) },
           })
         } catch { /* best effort */ }
       } catch (error) {
@@ -433,7 +485,100 @@ export class DirectorBridge {
         markdown: event.lastStep ? `**当前步骤**\n${event.lastStep}` : '任务持续推进中，完成后自动发送交付战报。',
       })
     }
+    if (event.kind === 'novel.edit_settled') {
+      const ok = event.status === 'done'
+      const title = ok
+        ? `《${event.bookTitle}》第 ${event.chapter} 章改稿完成`
+        : `《${event.bookTitle}》第 ${event.chapter} 章改稿未通过`
+      const lenLine = ok && event.charsBefore !== undefined && event.charsAfter !== undefined
+        ? `\n**篇幅变化**：${event.charsBefore} 字 → ${event.charsAfter} 字`
+        : ''
+      const errLine = event.error ? `\n**失败原因**：${event.error}` : ''
+      return buildNoticeCard({
+        title,
+        subtitle: event.chapterTitle || `第 ${event.chapter} 章`,
+        template: ok ? 'green' : 'red',
+        meta: [
+          { label: '状态', value: ok ? '已完成（原稿已更新）' : '未通过（原稿未改动）' },
+          ...(event.costUsd > 0 ? [{ label: '花费', value: `$${event.costUsd.toFixed(4)}` }] : []),
+        ],
+        markdown: `**修改意见**：${event.note.slice(0, 200)}${lenLine}${errLine}`,
+        footnote: ok ? '如需撤销本次修改，可在小说阅读页点击「撤销上次修改」。' : '请调整修改意见后重新提交。',
+      })
+    }
     return undefined
+  }
+
+  /** 为 QQ 通道构造优化排版 + 可点击按钮交互消息（无按钮场景则按纯文本排版 + 智能选择按钮提取）。 */
+  private buildQqPayloadForEvent(
+    event: PlatformNoticeEvent,
+    fallbackBody: string,
+    exhaustedAttempts: number,
+  ): QqRichMessagePayload {
+    if (event.kind === 'mission.waiting_approval') {
+      return buildQqMissionApprovalPayload({
+        missionId: event.missionId,
+        missionTitle: event.missionTitle,
+        nodeKey: event.nodeKey,
+        nodeTitle: event.nodeTitle,
+        planVersion: event.planVersion,
+        ...(event.prompt ? { prompt: event.prompt } : {}),
+        ...(event.artifacts ? { artifacts: event.artifacts } : {}),
+      })
+    }
+    if (event.kind === 'vault.request' && event.requestId) {
+      return buildQqVaultRequestPayload({
+        requestId: event.requestId,
+        ticketId: event.ticketId,
+        ticketTitle: event.ticketTitle,
+        secretName: event.name,
+        why: event.why,
+      })
+    }
+    if (
+      (event.kind === 'ticket.ended' && (event.outcome === 'failed' || event.outcome === 'dropped'))
+      || (event.kind === 'ticket.attention' && (event.state === 'failed' || event.state === 'blocked'))
+      || event.kind === 'ticket.stalled'
+    ) {
+      const reason = event.kind === 'ticket.stalled'
+        ? `工单已停滞 ${event.idleMinutes} 分钟`
+        : event.kind === 'ticket.ended' ? `执行${OUTCOME_LABEL[event.outcome] ?? event.outcome}` : '执行报错/阻塞'
+      return buildQqTicketDecisionPayload({
+        ticketId: event.ticketId,
+        title: event.title,
+        reason,
+        diagnosis: fallbackBody,
+        ...(exhaustedAttempts > 0 ? { attempts: exhaustedAttempts } : {}),
+      })
+    }
+    if (event.kind === 'council.ended') {
+      return buildQqCouncilCompletedPayload({
+        councilId: event.councilId,
+        topic: event.topic,
+        status: event.status,
+        brief: event.conclusion || fallbackBody,
+        canCommit: event.status === 'done' && !event.ticketId,
+      })
+    }
+    if (event.kind === 'novel.edit_settled') {
+      return buildQqNovelEditPayload({
+        bookId: event.bookId,
+        bookTitle: event.bookTitle,
+        n: event.chapter,
+        ...(event.chapterTitle ? { chapterTitle: event.chapterTitle } : {}),
+        status: event.status,
+        note: event.note,
+        ...(event.charsBefore !== undefined ? { charsBefore: event.charsBefore } : {}),
+        ...(event.charsAfter !== undefined ? { charsAfter: event.charsAfter } : {}),
+        costUsd: event.costUsd,
+        ...(event.error ? { error: event.error } : {}),
+      })
+    }
+    const choices = extractQqChoiceButtons(fallbackBody)
+    if (choices.length >= 2) {
+      return buildQqChoicePayload(fallbackBody, choices)
+    }
+    return { text: formatTextForQq(fallbackBody) }
   }
 
   /** 检查该会话最近 6 条活跃对话是否包含明确的「任务完成后继续执行下一步」承诺。 */
@@ -450,6 +595,7 @@ export class DirectorBridge {
     const out: PushChannel[] = []
     if (opts.wechat.enabled && opts.wechat.routingMode === 'director') out.push('wechat')
     if (opts.feishu.enabled && opts.feishu.routingMode === 'director' && this.deps.sendFeishu) out.push('feishu')
+    if (opts.qq?.enabled && opts.qq.routingMode === 'director' && this.deps.sendQq) out.push('qq')
     return out
   }
 
@@ -457,6 +603,16 @@ export class DirectorBridge {
     if (channel === 'feishu') {
       if (!this.deps.sendFeishu) throw new Error('飞书发送未配置')
       await this.deps.sendFeishu({ to: userId, text })
+      return
+    }
+    if (channel === 'qq') {
+      if (!this.deps.sendQq) throw new Error('QQ 发送未配置')
+      const target = parseQqTarget(userId)
+      await this.deps.sendQq({
+        to: target.to,
+        chatType: target.chatType,
+        text: formatTextForQq(text),
+      })
       return
     }
     await this.deps.sendWechat({ to: userId, text })
@@ -514,7 +670,11 @@ export class DirectorBridge {
     // 若设为全平台汇报（all），补充各通道默认主人会话
     if (scope === 'all' && map.size === 0) {
       for (const channel of channels) {
-        const users = channel === 'wechat' ? this.wechatRecipientUsers() : this.feishuRecipientUsers()
+        const users = channel === 'wechat'
+          ? this.wechatRecipientUsers()
+          : channel === 'feishu'
+            ? this.feishuRecipientUsers()
+            : this.qqRecipientUsers()
         for (const userId of users) {
           const session = store.getOrCreateSession(channel, userId)
           map.set(session.id, { session, push: true })
@@ -547,6 +707,22 @@ export class DirectorBridge {
     }
     if (out.size === 0) {
       for (const s of this.deps.director.store.listSessions('feishu')) {
+        if (s.userId) out.add(s.userId)
+      }
+    }
+    return [...out].slice(0, 5)
+  }
+
+  private qqRecipientUsers(): string[] {
+    const out = new Set<string>()
+    for (const u of this.deps.qqRecipients?.() ?? []) {
+      if (u.trim()) out.add(u.trim())
+    }
+    for (const u of this.deps.options.get().qq?.allowedUsers ?? []) {
+      if (u.trim()) out.add(u.trim())
+    }
+    if (out.size === 0) {
+      for (const s of this.deps.director.store.listSessions('qq')) {
         if (s.userId) out.add(s.userId)
       }
     }
@@ -679,15 +855,33 @@ export class DirectorBridge {
       ].join('\n')
     }
 
-    // council.ended
+    if (event.kind === 'council.ended') {
+      // council.ended
+      const ok = event.status === 'done'
+      return [
+        `${ok ? '🏛️' : '⚠️'} 多角色会商${ok ? '已完成' : `已结束（${event.status}）`}`,
+        `会商编号：${event.councilId}`,
+        `议题：${event.topic.slice(0, 100)}`,
+        ...(event.conclusion ? ['', event.conclusion.slice(0, 700)] : []),
+        ...(event.ticketId ? ['', `已关联/派发工单：${event.ticketId}`] : ['', '如需按会商结论正式派单，直接回复我「按结论开工」。']),
+      ].join('\n')
+    }
+
+    // novel.edit_settled
     const ok = event.status === 'done'
-    return [
-      `${ok ? '🏛️' : '⚠️'} 多角色会商${ok ? '已完成' : `已结束（${event.status}）`}`,
-      `会商编号：${event.councilId}`,
-      `议题：${event.topic.slice(0, 100)}`,
-      ...(event.conclusion ? ['', event.conclusion.slice(0, 700)] : []),
-      ...(event.ticketId ? ['', `已关联/派发工单：${event.ticketId}`] : ['', '如需按会商结论正式派单，直接回复我「按结论开工」。']),
-    ].join('\n')
+    const lines = [
+      ok
+        ? `✅ 《${event.bookTitle}》第 ${event.chapter} 章${event.chapterTitle ? `「${event.chapterTitle}」` : ''}改稿完成`
+        : `❌ 《${event.bookTitle}》第 ${event.chapter} 章改稿未通过（原稿未改动）`,
+      `修改意见：${event.note.slice(0, 160)}`,
+      ...(ok && event.charsBefore !== undefined && event.charsAfter !== undefined
+        ? [`篇幅变化：${event.charsBefore} 字 → ${event.charsAfter} 字`]
+        : []),
+      ...(event.costUsd > 0 ? [`本次花费：$${event.costUsd.toFixed(4)}`] : []),
+      ...(event.error ? [`失败原因：${event.error}`] : []),
+    ]
+    if (ok) lines.push('', '可在小说阅读页点击「撤销上次修改」恢复原稿。')
+    return lines.join('\n')
   }
 
   private keyOf(event: PlatformNoticeEvent): string {
@@ -702,6 +896,7 @@ export class DirectorBridge {
       case 'budget.blocked': return `budget:${event.ticketId}:${event.reason.slice(0, 60)}`
       case 'vault.request': return `vault:${event.ticketId}:${event.name}:${event.requestId ?? ''}`
       case 'council.ended': return `council:${event.councilId}:${event.status}`
+      case 'novel.edit_settled': return `novel_edit:${event.editId}:${event.status}`
     }
   }
 

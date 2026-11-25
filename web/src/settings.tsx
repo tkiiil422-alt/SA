@@ -236,7 +236,53 @@ function FeishuForm({ f, set }: FormProps) {
     <Group title="凭据">
       <Secret label="App Secret" isSet={f.appSecretSet} v={f.appSecret} set={v => set({ appSecret: v })} />
       <Secret label="Verification Token" isSet={f.verificationTokenSet} v={f.verificationToken} set={v => set({ verificationToken: v })} />
-      <Secret label="Encrypt Key" isSet={f.encryptKeySet} v={f.encryptKey} set={v => set({ encryptKey: v })} />
+      <Secret label="Encryption Key" isSet={f.encryptKeySet} v={f.encryptKey} set={v => set({ encryptKey: v })} />
+    </Group>
+  </>
+}
+function QqForm({ f, set }: FormProps) {
+  const { d: st, reload: reloadSt } = usePoll<any>('api/settings/qq/status', 5000)
+  const { busy, run } = useAction()
+  const stateLabel: Record<string, string> = { off: '未连接', connecting: '连接中…', connected: '已连接', error: '连接异常' }
+  return <>
+    <Group title="QQ 官方机器人（q.qq.com API v2）" hint="在 QQ 开放平台创建机器人并拿到 AppID / AppSecret 即可接入，原生支持按钮点击确认与选择、自动优化手机端阅读排版。">
+      {st && (
+        <div className="alert" data-lv={st.state === 'error' ? 'error' : st.state === 'connected' ? 'info' : 'warn'}>
+          <b>实时状态：{stateLabel[st.state] || st.state}</b>（{st.mode === 'webhook' ? 'HTTP Webhook' : 'WebSocket 长连接'} · 收 {st.received ?? 0} / 发 {st.sent ?? 0} 条{st.richDisabled ? ' · 高阶按钮未授权，已自动切换纯文本优化排版' : ''}）
+          {st.lastError && <div style={{ marginTop: 4 }}>{st.lastError}</div>}
+          <div style={{ marginTop: 6 }}>
+            <button type="button" className="ghost small" disabled={busy} onClick={() => run(async () => { await post('api/settings/qq/reconnect', {}); reloadSt() }, '已重建 QQ 连接')}>重建连接</button>
+          </div>
+        </div>
+      )}
+      <Check label="启用 QQ 机器人" v={f.enabled} set={v => set({ enabled: v })} />
+      <Select
+        label="接入方式"
+        hint={f.mode === 'webhook'
+          ? '请在 QQ 开放平台「开发设置 → 事件订阅」配置 Webhook 地址：https://你的公网域名/qq/events（已内置 Ed25519 op=13 验证与签名校验）。'
+          : '长连接模式下程序主动连向 QQ 官方网关，无需公网域名与 HTTPS 证书，开箱即用。'}
+        v={f.mode || 'ws'}
+        set={v => set({ mode: v })}
+        options={[['ws', 'WebSocket 长连接（推荐，免公网地址）'], ['webhook', 'HTTP Webhook 回调（/qq/events）']]}
+      />
+      <div className="cols">
+        <Text label="App ID" mono placeholder="例如：102123456" v={f.appId} set={v => set({ appId: v })} />
+        <Secret label="App Secret（clientSecret）" isSet={f.appSecretSet} v={f.appSecret} set={v => set({ appSecret: v })} />
+      </div>
+      <div className="cols">
+        <Select label="消息处理方式" v={f.routingMode || 'director'} set={v => set({ routingMode: v })} options={[['director', '总控 AI 助手（对话、按钮审批、主动汇报）'], ['direct', '直接建工单']]} />
+        <Select label="QQ 群里触发方式" v={f.groupMode || 'mention'} set={v => set({ groupMode: v })} options={[['mention', '@机器人时触发（推荐）'], ['all', '读取群内全部消息']]} />
+      </div>
+      <Check label="启用原生可点击交互按钮与智能选项按钮" hint="发送高危确认、DAG 审批或识别到多选一提问时，自动附带可点击 QQ 按钮；若机器人尚未获官方按钮权限，网关拒绝后会自动降级为纯文本优化排版重发，绝不丢消息。" v={f.interactiveButtons !== false} set={v => set({ interactiveButtons: v })} />
+      <Check label="沙箱环境" hint="仅用于 QQ 开放平台沙箱联调；正式上线请关闭" v={f.sandbox} set={v => set({ sandbox: v })} />
+      <Lines label="允许访问的用户 openid 白名单（可选）" hint="一行一个 user_openid；留空表示允许所有收到消息的用户。私聊机器人发 /状态 后可在总控会话列表查看对应 openid。" mono v={f.allowedUsers || []} set={v => set({ allowedUsers: v })} />
+    </Group>
+    <Group title="高阶模板与网关参数（可选）" hint="仅当你在 QQ 开放平台申请并审核通过了自定义 Markdown/Keyboard 模板时填写；留空将使用内置动态按钮与无感纯文本降级。">
+      <div className="cols">
+        <Text label="Markdown 模板 ID（可选）" mono v={f.markdownTemplateId} set={v => set({ markdownTemplateId: v })} />
+        <Text label="Keyboard 按钮模板 ID（可选）" mono v={f.keyboardTemplateId} set={v => set({ keyboardTemplateId: v })} />
+      </div>
+      <Text label="接口地址" mono v={f.apiBase} set={v => set({ apiBase: v })} />
     </Group>
   </>
 }
@@ -684,6 +730,7 @@ const SECTIONS: { key: string; label: string; desc: string; form?: (p: FormProps
   { key: 'email', label: '邮箱', desc: '支持 Gmail / QQ / 163 / Outlook / 自定义邮箱', form: EmailForm, test: true },
   { key: 'wechat', label: '微信', desc: '个人微信扫码直连、企业微信、公众号与群机器人', form: WechatForm, test: true },
   { key: 'feishu', label: '飞书', desc: '在飞书里下指令、收结果', form: FeishuForm, test: true },
+  { key: 'qq', label: 'QQ 机器人', desc: 'QQ 官方机器人对话、按钮直接确认与智能排版推送', form: QqForm, test: true },
   { key: 'github', label: 'GitHub', desc: '拉代码、推分支、开 PR', form: GithubForm, test: true },
   { key: 'preview', label: '网页预览', desc: '把容器里的网页发布成链接', form: PreviewForm },
   { key: 'projects', label: '项目', desc: '上传压缩包的大小限制', form: ProjectsForm },

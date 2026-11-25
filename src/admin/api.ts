@@ -109,6 +109,7 @@ const SECTION_NAMES: Record<SettingsSection, string> = {
   budget: '预算设置',
   pause: '接单开关',
   feishu: '飞书设置',
+  qq: 'QQ 机器人设置',
   preview: '预览设置',
   projects: '项目设置',
   github: 'GitHub 设置',
@@ -132,6 +133,7 @@ function noteFor(section: SettingsSection, changed: string[], paused?: boolean):
     case 'models': return '模型设置已保存，新的调用立即使用新设置。'
     case 'budget': return '预算设置已保存并立即生效。'
     case 'feishu': return '飞书设置已保存，新收到的消息立即按新设置处理。'
+    case 'qq': return 'QQ 机器人设置已保存，长连接与推送按钮策略立即按新设置生效。'
     case 'preview': return '预览设置已保存；已有的预览链接不会变，新启动的任务按新端口池分配。'
     case 'projects': return '项目设置已保存；下一次上传和解压按新上限执行，正在进行的任务不受影响。'
     case 'github': return 'GitHub 设置已保存；下一次启动任务时，启用的令牌会自动授权给新票。'
@@ -205,7 +207,7 @@ const ROUTE_MODULES: readonly AdminRouteHandler[] = [
 ]
 
 export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
-  const { host, auth, options: store, ledger, events, cliToken, onPolicyOrSettingsChange, goals, plugins } = options
+  const { host, auth, options: store, ledger, events, cliToken, onPolicyOrSettingsChange, goals, plugins, novels } = options
 
   /** 短 TTL 共享看板快照，防止多个并发 SSE 标签页重复查库。 */
   let cachedBoard: { at: number; body: string } | undefined
@@ -220,6 +222,10 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
       return goal ? { ...item, goal } : item
     })
     const ended = host.listTickets({ status: 'ended', limit: 8, offset: 0 }).items.map(labelSummary)
+    let novelEdits: unknown[] | undefined
+    if (novels && store.get().novel.enabled) {
+      try { novelEdits = novels.listRecentEdits(10) } catch { /* ignore */ }
+    }
     const body = JSON.stringify({
       paused: facts.paused,
       slots: facts.slots,
@@ -227,6 +233,7 @@ export function createAdminApi(options: CreateAdminApiOptions): AdminApi {
       usage: { todayUsd: totals.usd, todayCalls: totals.calls, dailyBudgetUsd: budget.dailyUsd },
       upstream: facts.upstream,
       runningSteps: facts.runningSteps ?? [],
+      ...(novelEdits && novelEdits.length > 0 ? { novelEdits } : {}),
       open,
       ended,
       alerts: buildAlerts(facts, budget, totals.usd, !devAutoAuthEnabled() && auth.usingGeneratedPassword),

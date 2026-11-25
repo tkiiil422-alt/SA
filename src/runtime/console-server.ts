@@ -16,6 +16,7 @@ import { createPreviewProxy, type PreviewStore } from '../admin/preview.ts'
 import type { AdminApi } from '../admin/api.ts'
 import type { OptionsStore } from '../admin/options.ts'
 import type { FeishuSource } from '../sources/feishu.ts'
+import type { QqSource } from '../sources/qq.ts'
 import type { WechatSource } from '../sources/wechat.ts'
 import type { PluginRegistry } from '../plugins/registry.ts'
 
@@ -26,13 +27,14 @@ export interface CreateConsoleServerOptions {
   workspaceRoot: string
   feishu: FeishuSource
   wechat: WechatSource
+  qq?: QqSource
   port: number
   host?: string
 }
 
 /** 创建并装配控制台 HTTP 服务器（API + React 静态资源 + Preview + 通道回调）。 */
 export function createConsoleServer(opts: CreateConsoleServerOptions): AdminServer {
-  const { api, previews, optionsStore, workspaceRoot, feishu, wechat, port, host = '127.0.0.1' } = opts
+  const { api, previews, optionsStore, workspaceRoot, feishu, wechat, qq, port, host = '127.0.0.1' } = opts
   const consoleRoot = join(dirname(fileURLToPath(import.meta.url)), '..', 'admin', 'web-next')
   const previewProxy = createPreviewProxy({
     store: previews,
@@ -68,6 +70,10 @@ export function createConsoleServer(opts: CreateConsoleServerOptions): AdminServ
       }
       if (url.pathname === '/wechat/events') {
         await wechat.handleHttp(req, res)
+        return true
+      }
+      if (url.pathname === '/qq/events' && qq) {
+        await qq.handleHttp(req, res)
         return true
       }
       return false

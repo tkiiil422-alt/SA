@@ -377,6 +377,18 @@ export interface FeishuStatusView {
   lastError?: string
 }
 
+/** QQ 官方机器人通道状态与统计；不包含任何凭据。 */
+export interface QqStatusView {
+  mode: 'ws' | 'webhook'
+  state: 'off' | 'connecting' | 'connected' | 'error'
+  since?: string
+  lastEventAt?: string
+  lastError?: string
+  received: number
+  sent: number
+  richDisabled?: boolean
+}
+
 export interface ContainerInfo {
   name: string
   ticketId?: string
@@ -547,7 +559,7 @@ export interface BackupsResult {
   items: BackupItemView[]
 }
 
-export type SettingsSection = 'policy' | 'executor' | 'models' | 'budget' | 'pause' | 'feishu' | 'preview' | 'projects' | 'github' | 'email' | 'wechat' | 'council' | 'novel' | 'collab' | 'goal' | 'web' | 'ssh' | 'director'
+export type SettingsSection = 'policy' | 'executor' | 'models' | 'budget' | 'pause' | 'feishu' | 'qq' | 'preview' | 'projects' | 'github' | 'email' | 'wechat' | 'council' | 'novel' | 'collab' | 'goal' | 'web' | 'ssh' | 'director'
 
 /** Extra notification after a settings write succeeded and was persisted. */
 export interface AdminSettingsChange {
@@ -641,6 +653,15 @@ export interface AdminHost {
 
   /** Restart the Feishu long connection when it is selected, then return the new state; never reports secrets. */
   reconnectFeishu(): Promise<FeishuStatusView>
+
+  /** 测试 QQ 开放平台凭据与网关连通性（不泄露密钥）。 */
+  testQq?(): Promise<{ ok: boolean; message: string }>
+
+  /** 返回 QQ 机器人连接状态与收发计数。 */
+  qqStatus?(): QqStatusView
+
+  /** 重建/重启 QQ 机器人长连接并返回最新状态。 */
+  reconnectQq?(): Promise<QqStatusView>
 
   /** Whether the vault holds `GITHUB_TOKEN`; the token itself is never returned. */
   githubTokenSet(): boolean

@@ -1972,4 +1972,116 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
       healService.close()
     })
   })
+
+  it('computes live context usage in getSessionDetail and /状态, handles QQ inbound & interaction buttons, and formats novel.edit_settled', async () => {
+    const env = setup()
+    const baseModels = env.options.get().models
+    const p0 = baseModels.providers[0]!
+    const m0 = p0.models[0]!
+    env.options.update('models', {
+      ...baseModels,
+      providers: [{ ...p0, id: 'gw1m', enabled: true, models: [{ ...m0, id: 'm1m', contextWindow: 1_000_000, maxTokens: 65_536, autoPick: true }] }],
+      routing: { ...baseModels.routing, worker: { provider: 'gw1m', model: 'm1m' }, assessor: { ...baseModels.routing.assessor, provider: 'gw1m', model: 'm1m' } },
+    })
+    env.options.update('director', { ...env.options.get().director, model: { provider: 'gw1m', model: 'm1m' }, debounceMs: 0, notifyScope: 'all' })
+    env.options.updateQq({ enabled: true, mode: 'ws', appId: '1020', appSecret: 'sec_qq_1', allowedUsers: ['qq_u1'], interactiveButtons: true })
+
+    const qqSent: { to: string; chatType?: 'c2c' | 'group'; text: string; replyTo?: string; keyboard?: unknown }[] = []
+    const director = new DirectorService({
+      host: env.fake.host,
+      options: env.options,
+      ledger: env.ledger,
+      events: env.events,
+      store: env.store,
+      redact: env.redact,
+      sendQq: async input => { qqSent.push(input) },
+      qqAllowCheck: id => id === 'qq_u1',
+      callTool: async () => ({
+        ok: true,
+        status: 200,
+        latencyMs: 5,
+        text: '## 调度建议\n**当前完成**两项检查。\n请回复「继续执行」或「先暂停」。',
+        usage: { prompt_tokens: 12345, completion_tokens: 88, prompt_cache_hit_tokens: 0, prompt_cache_miss_tokens: 12345 },
+        toolCalls: [],
+      }),
+    })
+    const bridge = new DirectorBridge({
+      director,
+      options: env.options,
+      host: env.fake.host,
+      events: env.events,
+      sendWechat: async () => {},
+      sendQq: async input => { qqSent.push(input) },
+      qqRecipients: () => ['qq_u1'],
+    })
+
+    // 1. QQ 入站触发，校验排版清洗 + 多选一可点击按钮提取
+    director.handleQqInbound({ from: 'qq_u1', chatId: 'qq_u1', messageId: 'm_qq_1', text: '帮我看下调度' })
+    await director.drain()
+    expect(qqSent.length).toBeGreaterThanOrEqual(1)
+    expect(qqSent[0]?.text).toContain('【调度建议】')
+    expect(qqSent[0]?.text).not.toContain('**')
+    expect(qqSent[0]?.replyTo).toBe('m_qq_1')
+    expect(qqSent[0]?.keyboard).toBeDefined()
+
+    // 2. 验证 getSessionDetail().contextUsage 与 /状态 输出包含当前上下文消耗与实测 lastPromptTokens
+    const sessions = director.listSessions('qq')
+    expect(sessions).toHaveLength(1)
+    const detail = director.getSessionDetail(sessions[0]!.id)!
+    expect(detail.contextUsage).toBeDefined()
+    expect(detail.contextUsage!.effectiveContextTokens).toBe(800_000)
+    expect(detail.contextUsage!.lastPromptTokens).toBe(12345)
+    expect(detail.contextUsage!.usedTokens).toBeGreaterThan(0)
+    expect(detail.contextUsage!.activeMessageCount).toBeGreaterThanOrEqual(2)
+
+    const statusRes = await director.chat({ channel: 'qq', userId: 'qq_u1', text: '/状态' })
+    expect(statusRes.reply).toContain('当前上下文')
+    expect(statusRes.reply).toContain('800k')
+
+    // 3. 点击 QQ 按钮交互（choice 按钮）直接触发下一轮对话；非白名单拒绝
+    const denied = await director.handleQqInteraction({
+      interactionId: 'int_bad',
+      operatorId: 'stranger',
+      chatId: 'qq_u1',
+      chatType: 'c2c',
+      rawTag: 'ch:继续执行',
+      action: { kind: 'choice', text: '继续执行' },
+    })
+    expect(denied.code).toBe(4)
+
+    const accepted = await director.handleQqInteraction({
+      interactionId: 'int_ok',
+      operatorId: 'qq_u1',
+      chatId: 'qq_u1',
+      chatType: 'c2c',
+      messageId: 'm_btn_1',
+      rawTag: 'ch:继续执行',
+      action: { kind: 'choice', text: '继续执行' },
+    })
+    expect(accepted.code).toBe(0)
+    await director.drain()
+    expect(detail.messages.length).toBeGreaterThanOrEqual(2)
+    expect(director.listSessions('qq')[0]!.messageCount).toBeGreaterThanOrEqual(4)
+
+    // 4. 小说改稿完成事件通过 Bridge 主动推到 QQ 并附带一键撤销按钮
+    const beforePushCount = qqSent.length
+    await bridge.notify({
+      kind: 'novel.edit_settled',
+      editId: 'ed_1',
+      bookId: 'b_7',
+      bookTitle: '太初剑录',
+      chapter: 5,
+      chapterTitle: '风起青萍',
+      status: 'done',
+      note: '精简旁白节奏',
+      charsBefore: 2500,
+      charsAfter: 2300,
+      costUsd: 0.02,
+    })
+    expect(qqSent.length).toBe(beforePushCount + 1)
+    expect(qqSent[beforePushCount]?.text).toContain('第 5 章')
+    expect(qqSent[beforePushCount]?.keyboard).toBeDefined()
+
+    director.close()
+  })
 })
