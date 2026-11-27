@@ -692,4 +692,15 @@ describe('OptionsStore change listeners', () => {
     // 启用 QQ 但缺少 appId / appSecret 时触发中文校验错误
     expect(() => options.updateQq({ enabled: true, appId: '' })).toThrow(/AppID/)
   })
+
+  it('validates director.maxToolSteps up to 50 steps', () => {
+    const options = store()
+    const base = options.get().director
+    expect(base.maxToolSteps).toBe(8)
+
+    expect(() => options.update('director', { ...base, maxToolSteps: 50 })).not.toThrow()
+    expect(options.get().director.maxToolSteps).toBe(50)
+    expect(() => options.update('director', { ...base, maxToolSteps: 51 })).toThrow(/50/)
+    expect(() => options.update('director', { ...base, maxToolSteps: 0 })).toThrow(/1/)
+  })
 })

@@ -1099,7 +1099,7 @@ export class DirectorService {
       : Math.max(5_000, Math.min(3_600_000, (cfg.firstByteTimeoutSec ?? 1500) * 1000))
     const turnTimeoutMs = Math.max(TURN_TIMEOUT_MS, stepTimeoutMs + 180_000)
     let deadline = Date.now() + turnTimeoutMs
-    const maxSteps = Math.max(1, Math.min(15, cfg.maxToolSteps))
+    const maxSteps = Math.max(1, Math.min(50, cfg.maxToolSteps))
     const sessionKey = `director-${input.channel}-${input.userId}`
     let fallbackUsed = false
     let autoShrunkForTruncation = false

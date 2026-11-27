@@ -403,7 +403,7 @@ export const DirectorSchema = z.object({
   /** Coalesce burst WeChat messages from the same user within this window (ms). */
   debounceMs: z.number().int('必须是整数').min(0, '不能小于 0').max(10_000, '最多 10000 毫秒').default(1500),
   /** Max tool-calling rounds per user turn. */
-  maxToolSteps: z.number().int('必须是整数').min(1, '至少 1 步').max(15, '最多 15 步').default(8),
+  maxToolSteps: z.number().int('必须是整数').min(1, '至少 1 步').max(50, '最多 50 步').default(8),
   /** Max automatic retries on transient model/network failures (0 = disable retry). */
   maxRetries: z.number().int('必须是整数').min(0, '不能小于 0').max(20, '最多 20 次').default(5),
   /** Max single-step model request timeout in seconds (30..3600, default 1800 = 30 min). */

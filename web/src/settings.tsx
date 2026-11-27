@@ -690,7 +690,7 @@ function DirectorForm({ f, set }: FormProps) {
     <Group title="对话与成本护栏">
       <div className="cols">
         <Num label="微信连发聚合窗口（毫秒）" hint="0–10000，默认 1500ms（自动合并连续短消息）" step={100} min={0} max={10000} v={f.debounceMs ?? 1500} set={v => set({ debounceMs: v })} />
-        <Num label="单轮最多工具调用步数" hint="1–15，默认 8" step={1} min={1} max={15} v={f.maxToolSteps ?? 8} set={v => set({ maxToolSteps: v })} />
+        <Num label="单轮最多工具调用步数" hint="1–50，默认 8" step={1} min={1} max={50} v={f.maxToolSteps ?? 8} set={v => set({ maxToolSteps: v })} />
         <Num label="模型请求失败最多重试次数" hint="0–20 次，默认 5（遇断连 / 5xx 自动新建连接重试）" step={1} min={0} max={20} v={f.maxRetries ?? 5} set={v => set({ maxRetries: v })} />
         <Num label="单步模型请求超时（秒）" hint="30–3600 秒，默认 1800（30 分钟，适配高推理长时间思考）" step={30} min={30} max={3600} v={f.stepTimeoutSec ?? 1800} set={v => set({ stepTimeoutSec: v })} />
         <Num label="流式首包看门狗超时（秒）" hint="0–3600 秒，默认 1500（25 分钟；0 表示关闭，等待上游思考完再吐字）" step={15} min={0} max={3600} v={f.firstByteTimeoutSec ?? 1500} set={v => set({ firstByteTimeoutSec: v })} />
