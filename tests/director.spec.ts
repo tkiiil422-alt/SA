@@ -25,6 +25,9 @@ import { DirectorStore } from '../src/director/store.ts'
 import { EventLog } from '../src/ledger/events.ts'
 import { Ledger } from '../src/ledger/ledger.ts'
 import type { NovelService } from '../src/novel/service.ts'
+import { createSchedulerPlugin } from '../src/scheduler/plugin.ts'
+import { SchedulerService } from '../src/scheduler/service.ts'
+import { SchedulerStore } from '../src/scheduler/store.ts'
 
 const dirs: string[] = []
 const dbs: DatabaseSync[] = []
@@ -1542,10 +1545,10 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
 
     it('supports instruction alias + allowShorten on novel_edit_chapter and exposes novel_mark_read tool', async () => {
       const env = setup()
-      const editCalls: Array<{ bookId: string; n: number; note: string; opts?: { allowShorten?: boolean } }> = []
+      const editCalls: Array<{ bookId: string; n: number; note: string; opts?: { allowShorten?: boolean; source?: 'person' | 'director' } }> = []
       const markReadCalls: Array<{ bookId: string; n: number }> = []
       const fakeNovels = {
-        editChapter: (bookId: string, n: number, note: string, opts?: { allowShorten?: boolean }) => {
+        editChapter: (bookId: string, n: number, note: string, opts?: { allowShorten?: boolean; source?: 'person' | 'director' }) => {
           editCalls.push({ bookId, n, note, opts })
           return { id: 'e_1', n, status: 'running', note, costUsd: 0, createdAt: '2026-11-24T00:00:00Z', updatedAt: '2026-11-24T00:00:00Z' }
         },
@@ -1601,7 +1604,7 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
 
       const res = await service.chat({ channel: 'web', userId: 'owner', text: '精修第12章并标记已阅' })
       expect(res.reply).toContain('已触发精修')
-      expect(editCalls).toEqual([{ bookId: 'b_novel_1', n: 12, note: '删除重复段落', opts: { allowShorten: true } }])
+      expect(editCalls).toEqual([{ bookId: 'b_novel_1', n: 12, note: '删除重复段落', opts: { allowShorten: true, source: 'director' } }])
       expect(markReadCalls).toEqual([{ bookId: 'b_novel_1', n: 12 }])
       expect(toolOutputs.some(t => t.includes('请勿在本轮连续轮询 novel_chapter'))).toBe(true)
       expect(toolOutputs.some(t => t.includes('已标记为已阅'))).toBe(true)
@@ -2113,6 +2116,89 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
     expect(qqSent[beforePushCount]?.text).toContain('第 5 章')
     expect(qqSent[beforePushCount]?.keyboard).toBeDefined()
 
+    // 总控巡检主动触发的修稿成功事件不再推送到 QQ 刷屏，但失败仍需告警
+    await bridge.notify({
+      kind: 'novel.edit_settled',
+      editId: 'ed_dir_ok',
+      bookId: 'b_7',
+      bookTitle: '太初剑录',
+      chapter: 6,
+      status: 'done',
+      source: 'director',
+      note: '巡检清理格式',
+      costUsd: 0.01,
+    })
+    expect(qqSent.length).toBe(beforePushCount + 1)
+
+    await bridge.notify({
+      kind: 'novel.edit_settled',
+      editId: 'ed_dir_fail',
+      bookId: 'b_7',
+      bookTitle: '太初剑录',
+      chapter: 7,
+      status: 'failed',
+      source: 'director',
+      note: '巡检清理格式',
+      costUsd: 0.01,
+      error: '模型返回超时',
+    })
+    expect(qqSent.length).toBe(beforePushCount + 2)
+
     director.close()
+  })
+
+  it('preserves qq channel in scheduler, deduplicates recurring schedules, and compacts schedules_list', async () => {
+    const db = new DatabaseSync(':memory:')
+    dbs.push(db)
+    const events = new EventLog(db)
+    const ranChannels: string[] = []
+    const scheduler = new SchedulerService({
+      store: new SchedulerStore(db),
+      events,
+      isPaused: () => false,
+      runDirectorPrompt: async input => {
+        ranChannels.push(input.channel)
+        return { reply: '巡检完成', sessionId: 'ds_qq_test' }
+      },
+      dispatchTicket: async () => ({ triggerId: 'tr_dummy', ticketId: 't_dummy' }),
+    })
+    const plugin = createSchedulerPlugin(scheduler)
+    const longPrompt = '逐项巡检小说设定与正文质量：'.repeat(30)
+    const ctx = { channel: 'qq' as const, userId: 'OPENID_1', sessionId: 'ds_qq_test' }
+
+    const c1 = plugin.directorActions!.schedule_create!({
+      name: '每小时小说巡检',
+      triggerKind: 'interval',
+      intervalSec: 3600,
+      actionKind: 'director_prompt',
+      prompt: longPrompt,
+    }, ctx) as { ok: boolean; item: { id: string; actionConfig: { channel?: string } }; deduplicated?: boolean }
+    expect(c1.ok).toBe(true)
+    expect(c1.item.actionConfig.channel).toBe('qq')
+    expect(c1.deduplicated).toBeUndefined()
+
+    // 再次以同名周期任务创建应就地去重复用，不产生双份定时任务
+    const c2 = plugin.directorActions!.schedule_create!({
+      name: '每小时小说巡检',
+      triggerKind: 'interval',
+      intervalSec: 1800,
+      actionKind: 'director_prompt',
+      prompt: `${longPrompt}（更新版）`,
+    }, ctx) as { ok: boolean; item: { id: string; intervalSec: number | null }; deduplicated?: boolean }
+    expect(c2.deduplicated).toBe(true)
+    expect(c2.item.id).toBe(c1.item.id)
+    expect(c2.item.intervalSec).toBe(1800)
+
+    const listed = plugin.directorQueries!.schedules_list!({}, ctx) as {
+      items: Array<{ actionConfig: { prompt?: string; promptLength?: number } }>
+      total: number
+    }
+    expect(listed.total).toBe(1)
+    expect(listed.items[0]?.actionConfig.prompt?.length).toBeLessThan(260)
+    expect(listed.items[0]?.actionConfig.promptLength).toBeGreaterThan(300)
+
+    const run = await scheduler.runNow(c1.item.id)
+    expect(run.status).toBe('ok')
+    expect(ranChannels).toEqual(['qq'])
   })
 })

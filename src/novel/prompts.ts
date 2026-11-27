@@ -26,8 +26,8 @@ export const WRITER_SYSTEM = [
   '5. 战斗写清双方境界、手段、代价和胜负原因；越级取胜必须写出凭什么。不写合同之外的境界突破。',
   '6. 已死的人物不能出场（回忆除外）；人物只能知道人物卡里写明他知道的秘密。',
   '7. 短段落，一段一般不超过一百五十字，适合手机阅读。',
-  '8. 禁止：总结式结尾、说教、“仿佛”“缓缓”“微微”“不禁”“一丝”“眼中闪过”“嘴角勾起”“深吸一口气”这类套话的堆叠；禁止出现“本章”“第X章”“作者”“AI”等元文字。',
-  '输出格式：第一行是“# 章节标题”（只写标题，不写第几章），空一行后是正文。正文之外不写任何东西。',
+  '8. 禁止：总结式结尾、说教、“仿佛”“缓缓”“微微”“不禁”“一丝”“眼中闪过”“嘴角勾起”“深吸一口气”这类套话的堆叠；禁止出现“本章”“第X章”“作者”“AI”、WAIT:、</thought>、</turn>、Markdown加粗 ** 符号或重复把同一章写第二遍。',
+  '输出格式：第一行是“# 章节标题”（只写标题，不写第几章），空一行后是正文。正文写完即止，不要输出任何尾注或附加说明。',
 ].join('\n')
 
 export function writerUser(input: { book: string; arc: string; cast: string; threads: string; items: string; pacing: string; handoff: string; recall: string; contract: string; steer?: string; targetChars: [number, number] }): string {

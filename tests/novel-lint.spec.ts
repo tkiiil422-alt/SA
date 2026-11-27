@@ -166,4 +166,18 @@ describe('lintChapter', () => {
   it('meta: clean prose and a first-line heading with a chapter number are fine', () => {
     expect(byCode(lintChapter('# 第3章 启程\n\n' + prose(600), OPTS).issues, 'meta')).toEqual([])
   })
+
+  it('meta & repeat: flags leaked thought tags, bold markdown, WAIT lines and intra-chapter double drafts', () => {
+    const polluted = '# 试炼\n\n<thought>check</thought>\nWAIT: verify outline\n**林尘**持剑而立。' + prose(600)
+    const metaHits = byCode(lintChapter(polluted, WIDE).issues, 'meta')
+    expect(metaHits.length).toBeGreaterThanOrEqual(3)
+
+    const s1 = '青石巷口的冷风卷起枯叶掠过青砖石阶，林尘握紧袖中残剑。'
+    const s2 = '远处钟楼传来低沉的三声长鸣，檐角铜铃在暮色中晃动。'
+    const s3 = '他顺着墙根的阴影缓步退入竹林深处，收敛全身灵力气息。'
+    const s4 = '竹叶摩擦发出细碎声响，几名外门执事举着火把擦肩而过。'
+    const body = [s1, s2, s3, s4, prose(600, '剑'), s1, s2, s3, s4, prose(600, '风')].join('\n\n')
+    const dupHits = byCode(lintChapter(body, WIDE).issues, 'repeat')
+    expect(dupHits.some(i => i.severity === 'fix' && i.message.includes('重复草稿'))).toBe(true)
+  })
 })

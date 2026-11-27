@@ -24,7 +24,7 @@ const BASE_QUERY_ACTIONS = [
 const BASE_SUBSYSTEM_ACTIONS = [
   'pi_build', 'devenv_build', 'devenv_repack',
   'council_start', 'council_cancel', 'council_commit',
-  'novel_open', 'novel_start_arc', 'novel_edit_chapter', 'novel_chapter_undo', 'novel_mark_read',
+  'novel_open', 'novel_start_arc', 'novel_edit_chapter', 'novel_canon_patch', 'novel_chapter_undo', 'novel_mark_read',
   'fanqie_check', 'fanqie_bind', 'fanqie_sync',
   'pentest_scan', 'pentest_launch_playbook',
   'security_create_engagement', 'security_update_engagement', 'security_start_task', 'security_task_cancel',

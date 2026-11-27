@@ -196,9 +196,116 @@ function zodReason(error: z.ZodError): string {
   return error.issues.slice(0, 6).map(issue => `${issue.path.join('.') || '(根)'}：${issue.message}`).join('；')
 }
 
+/** 判断一行是否为模型泄漏的英文自检、思维标记或尾注。 */
+function isMetaNoiseLine(line: string): boolean {
+  const trimmed = line.trim()
+  if (!trimmed) return false
+  if (/^(?:WAIT\s*:|Okay,\s*let's|Let(?:'s| us)\s+\w+|Here is\b|Below is\b|Check\b|Note\s*:|Review\b|Revision\b|Word count\b|Character count\b)/i.test(trimmed)) {
+    return true
+  }
+  if (/^[（(【\[]?\s*(?:注|备注|作者注|AI\s*注|说明|字数统计?|校验|本章完|全章完|本集完|未完待续)\s*(?:[：:].{0,180})?[】\]）)]?$/i.test(trimmed) && Array.from(trimmed).length <= 200) {
+    return true
+  }
+  const asciiLetters = (trimmed.match(/[A-Za-z]/g) ?? []).length
+  const cjkChars = (trimmed.match(/[\u4e00-\u9fff]/g) ?? []).length
+  if (asciiLetters >= 20 && cjkChars <= 2) return true
+  return false
+}
+
+/** 清理正文中的思维链标签、Markdown 加粗残留及英文自检噪声行。 */
+export function sanitizeNovelProse(raw: string): string {
+  let text = raw
+    .replace(/```[a-z]*\n?/gi, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/<(thought|thinking|scratchpad)>[\s\S]*?<\/\1>/gi, '\n')
+  const openTagClose = /^[\s\S]{0,1800}<\/(?:thought|thinking|scratchpad)>/i.exec(text)
+  if (openTagClose) text = text.slice(openTagClose[0].length)
+  text = text
+    .replace(/<\/?(?:thought|thinking|turn|scratchpad)>/gi, '')
+    .replace(/<\|[^|>\n]{1,40}\|>/g, '')
+
+  const lines = text.split('\n').map(line => {
+    const clean = line
+      .replace(/\*\*([^*\n]{1,120})\*\*/g, '$1')
+      .replace(/__([^_\n]{1,120})__/g, '$1')
+      .replace(/\*\*/g, '')
+      .replace(/^>\s+/, '')
+    if (/^\s*[-*_]{3,}\s*$/.test(clean)) return ''
+    if (isMetaNoiseLine(clean)) return ''
+    return clean
+  })
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+function dedupeScore(part: string): number {
+  const chars = countChars(part)
+  const metaPenalty = (part.match(/WAIT:|<\/?(?:thought|turn)|【?本章完|（注：/gi) ?? []).length * 400
+  return chars - metaPenalty
+}
+
+/** 检测并剥离同一章内部拼接两遍草稿或中途重启重写的重复内容，仅保留完整干净的一版。 */
+function dedupeDoubleDraft(body: string): string {
+  const trimmed = body.trim()
+  if (trimmed.length < 900) return trimmed
+
+  const headingRe = /\n+(?:#{1,3}\s*第[0-9零一二三四五六七八九十百千万两〇]+章[^\n]*|第[0-9零一二三四五六七八九十百千万两〇]+章[\s:：][^\n]{1,36}|#{1,2}\s+[^\n]{2,36})\n+/g
+  let match: RegExpExecArray | null
+  while ((match = headingRe.exec(trimmed)) !== null) {
+    const idx = match.index
+    const before = trimmed.slice(0, idx).trim()
+    const after = trimmed.slice(idx + match[0].length).trim()
+    if (countChars(before) < 250 || countChars(after) < 250) continue
+    const compactBefore = before.replace(/\s+/g, '')
+    const compactAfter = after.replace(/\s+/g, '')
+    let shared = 0
+    for (const seg of compactBefore.split(/[。！？]/)) {
+      if (seg.length >= 16 && new Set([...seg]).size >= 6 && compactAfter.includes(seg)) {
+        shared++
+        if (shared >= 2) break
+      }
+    }
+    const midRewrite = shared >= 2 || (countChars(before) < 700 && countChars(after) >= 900)
+    if (midRewrite) {
+      if (countChars(after) >= Math.min(900, countChars(before) * 0.8)) return dedupeDoubleDraft(after)
+      return dedupeScore(after) > dedupeScore(before) ? dedupeDoubleDraft(after) : before
+    }
+  }
+
+  const paras = trimmed.split(/\n{2,}/)
+  if (paras.length >= 6) {
+    const headAnchors = paras
+      .slice(0, Math.min(4, Math.floor(paras.length / 2)))
+      .flatMap(p => p.split(/[。！？\n]/))
+      .map(s => s.trim())
+      .filter(s => s.length >= 18 && new Set([...s]).size >= 8)
+    for (let i = Math.floor(paras.length * 0.35); i < paras.length - 1; i++) {
+      const p = paras[i] ?? ''
+      if (headAnchors.some(anchor => p.includes(anchor))) {
+        const before = paras.slice(0, i).join('\n\n').trim()
+        const after = paras.slice(i).join('\n\n').trim()
+        if (countChars(before) >= 500 && countChars(after) >= 500) {
+          return dedupeScore(after) >= Math.min(1000, dedupeScore(before) * 0.8) ? after : before
+        }
+      }
+    }
+  }
+
+  return trimmed
+}
+
+/** 根据最新设定卡重建人类可读视图（人物/伏笔/物品）。 */
+export function projectCanonViews(files: BookFiles, canon: Canon): void {
+  const people = canon.characters.map(c => `| ${c.name} | ${c.role} | ${realmText(canon.power, c.realm)} | ${c.status} | ${c.location ?? ''} | ${c.firstCh}–${c.lastSeenCh} |`)
+  files.writeView('人物', ['| 名字 | 定位 | 境界 | 状态 | 位置 | 出场 |', '|---|---|---|---|---|---|', ...people].join('\n'))
+  const threads = canon.foreshadow.map(f => `| ${f.id} | ${f.kind} | ${f.content} | ${f.plantedCh} | ${f.dueBy ?? ''} | ${f.status} |`)
+  files.writeView('伏笔', ['| id | 类型 | 内容 | 埋设 | 应收 | 状态 |', '|---|---|---|---|---|---|', ...threads].join('\n'))
+  const items = canon.items.map(i => `| ${i.name} | ${i.kind} | ${i.qty} | ${canon.characters.find(c => c.id === i.owner)?.name ?? i.owner} | ${i.state} |`)
+  files.writeView('物品', ['| 名称 | 类型 | 数量 | 持有人 | 状态 |', '|---|---|---|---|---|', ...items].join('\n'))
+}
+
 /** Normalise a draft to `# 标题\n\n正文`. */
 export function normalizeDraft(raw: string, fallbackTitle: string): { title: string; text: string } {
-  let text = raw.replace(/```[a-z]*\n?/gi, '').replace(/\r\n/g, '\n').trim()
+  let text = sanitizeNovelProse(raw)
   let title = fallbackTitle
   const first = /^#+\s*(.+)\n/.exec(text + '\n')
   if (first?.[1]) {
@@ -208,6 +315,7 @@ export function normalizeDraft(raw: string, fallbackTitle: string): { title: str
     const plain = /^第[0-9零一二三四五六七八九十百千]+章[\s:：]*([^\n]{1,30})\n/.exec(text + '\n')
     if (plain) { title = plain[1]?.trim() || fallbackTitle; text = text.slice(plain[0].length) }
   }
+  text = dedupeDoubleDraft(sanitizeNovelProse(text))
   title = Array.from(title).slice(0, 30).join('')
   return { title, text: `# ${title}\n\n${text.trim()}\n` }
 }
@@ -399,37 +507,43 @@ export class NovelWriter {
 
     // 2. Draft
     let draftIndex = 0
-    let draft = this.files.readWork(n, 'draft-0.md')
-    if (draft && corruptedDraftReason(draft, book.chapterChars[0])) draft = undefined
+    const resumedDraft = this.files.readWork(n, 'draft-0.md')
+    let draft = resumedDraft && !corruptedDraftReason(resumedDraft, book.chapterChars[0]) ? resumedDraft : ''
     if (!draft) {
       const castIds = [...new Set([...contract.appearing, ...this.namedIn(canon, contract.beats.join(''))])]
-      const result = await this.ask('writer', WRITER_SYSTEM, writerUser({
-        book: '',
-        arc: arcBlock(canon, arc, n, this.files),
-        cast: castBlock(canon, castIds),
-        threads: threadsBlock(canon, n, 8),
-        items: itemsBlock(canon, castIds),
-        pacing: '',
-        handoff: handoffBlock(this.files, n),
-        recall: recallBlock(this.store, book.id, recallTerms(canon, contract), n),
-        contract: contractBlock(canon, contract),
-        ...(steer ? { steer } : {}),
-        targetChars: book.chapterChars,
-      }), 8192, bookBlock(book, canon))
-      cost += result.costUsd
-      let raw = result.text
-      if (result.truncated) {
-        const more = await this.ask('writer', WRITER_SYSTEM, [
-          contractBlock(canon, contract),
-          `【本章已写部分的结尾】\n${tail(raw, 1500)}`,
-          '上面这一章写到一半被截断了。请从断处直接接着写完本章，不重复已写内容，不写标题，只输出续写的正文。',
-        ].join('\n\n'), 6000)
-        cost += more.costUsd
-        raw = `${raw}${more.text}`
+      let badDraft: string | undefined
+      let candidate = ''
+      for (let draftTry = 0; draftTry < 3; draftTry++) {
+        const result = await this.ask('writer', WRITER_SYSTEM, writerUser({
+          book: '',
+          arc: arcBlock(canon, arc, n, this.files),
+          cast: castBlock(canon, castIds),
+          threads: threadsBlock(canon, n, 8),
+          items: itemsBlock(canon, castIds),
+          pacing: '',
+          handoff: handoffBlock(this.files, n),
+          recall: recallBlock(this.store, book.id, recallTerms(canon, contract), n),
+          contract: contractBlock(canon, contract),
+          ...(steer ? { steer } : {}),
+          targetChars: book.chapterChars,
+        }), 8192, bookBlock(book, canon))
+        cost += result.costUsd
+        let raw = result.text
+        if (result.truncated) {
+          const more = await this.ask('writer', WRITER_SYSTEM, [
+            contractBlock(canon, contract),
+            `【本章已写部分的结尾】\n${tail(raw, 1500)}`,
+            '上面这一章写到一半被截断了。请从断处直接接着写完本章，不重复已写内容，不写标题，只输出续写的正文。',
+          ].join('\n\n'), 6000)
+          cost += more.costUsd
+          raw = `${raw}${more.text}`
+        }
+        candidate = normalizeDraft(raw, contract.title).text
+        badDraft = corruptedDraftReason(candidate, book.chapterChars[0])
+        if (!badDraft) break
       }
-      draft = normalizeDraft(raw, contract.title).text
-      const badDraft = corruptedDraftReason(draft, book.chapterChars[0])
-      if (badDraft) throw new ModelFailure(`写作产出异常：${badDraft}`)
+      if (badDraft || !candidate) throw new ModelFailure(`写作产出异常：${badDraft ?? '正文为空'}`)
+      draft = candidate
       this.files.writeWork(n, 'draft-0.md', draft)
       mark('draft', 1)
     } else {
@@ -629,12 +743,14 @@ export class NovelWriter {
     }), 8192)
     addCost(result.costUsd)
     if (detectDisguisedUpstreamError(stripTitle(result.text))) return draft
-    // A truncated revision, or one that lost a quarter of the chapter, is worse than the draft it replaces: rewrites
-    // tend to compress, and a shrinking chapter drifts out of the target range after two rounds.
-    const before = countChars(draft)
-    const after = countChars(result.text)
-    if (result.truncated || after < book.chapterChars[0] * 0.75 || after < before * 0.75) return draft
-    return normalizeDraft(result.text, contract.title).text
+    // 先规范化洗稿再比较有效篇幅，若原稿是臃肿超长（>上限135%）的双倍重复稿则放宽下限以允许正常去重瘦身
+    const cleanInput = normalizeDraft(draft, contract.title).text
+    const cleanOutput = normalizeDraft(result.text, contract.title).text
+    const before = countChars(cleanInput)
+    const after = countChars(cleanOutput)
+    const effectiveBefore = before > book.chapterChars[1] * 1.35 ? book.chapterChars[1] : before
+    if (result.truncated || after < book.chapterChars[0] * 0.75 || after < effectiveBefore * 0.75) return cleanInput
+    return cleanOutput
   }
 
   private sanitizeContract(canon: Canon, raw: Contract, n: number): Contract {
@@ -793,12 +909,7 @@ export class NovelWriter {
 
   /** Human-readable projections of the canon, rebuilt from it at every arc end. */
   writeViews(canon: Canon): void {
-    const people = canon.characters.map(c => `| ${c.name} | ${c.role} | ${realmText(canon.power, c.realm)} | ${c.status} | ${c.location ?? ''} | ${c.firstCh}–${c.lastSeenCh} |`)
-    this.files.writeView('人物', ['| 名字 | 定位 | 境界 | 状态 | 位置 | 出场 |', '|---|---|---|---|---|---|', ...people].join('\n'))
-    const threads = canon.foreshadow.map(f => `| ${f.id} | ${f.kind} | ${f.content} | ${f.plantedCh} | ${f.dueBy ?? ''} | ${f.status} |`)
-    this.files.writeView('伏笔', ['| id | 类型 | 内容 | 埋设 | 应收 | 状态 |', '|---|---|---|---|---|---|', ...threads].join('\n'))
-    const items = canon.items.map(i => `| ${i.name} | ${i.kind} | ${i.qty} | ${canon.characters.find(c => c.id === i.owner)?.name ?? i.owner} | ${i.state} |`)
-    this.files.writeView('物品', ['| 名称 | 类型 | 数量 | 持有人 | 状态 |', '|---|---|---|---|---|', ...items].join('\n'))
+    projectCanonViews(this.files, canon)
   }
 
   // --- Rewrite ------------------------------------------------------------------------------------------------------

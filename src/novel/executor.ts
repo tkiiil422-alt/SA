@@ -188,12 +188,12 @@ export class NovelExecutor implements Executor {
     const note = this.requestNote(ticket)
     if (note && !this.steers.has(ticketId)) {
       const files = new BookFiles(this.options.root, book.bookId)
-      this.steers.set(ticketId, { note, untilCh: files.readBook().lastChapter + 5 })
+      this.steers.set(ticketId, { note: note.slice(0, 1500), untilCh: files.readBook().lastChapter + this.steerSpan(note) })
     }
     const started = this.options.tickets.get(ticketId)
     const initialInstrs = (started?.undelivered ?? [])
       .map(id => started?.inputs.find(inp => inp.id === id))
-      .filter((inp): inp is TicketInput => inp?.kind === 'text')
+      .filter((inp): inp is TicketInput => inp?.kind === 'text' || inp?.kind === 'note')
       .map(inp => ({ id: inp.id, text: this.personText(inp) }))
       .filter((item): item is { id: string; text: string } => Boolean(item.text))
     if (initialInstrs.length > 0) {
@@ -236,10 +236,19 @@ export class NovelExecutor implements Executor {
     this.begin(ticketId, assignmentId, book.bookId, book.arc)
   }
 
+  /** 根据指令关键词推断后续持续生效的章数（默认 5 章，本弧/全弧设为 25 章，支持“接下来 N 章”上限 30 章）。 */
+  private steerSpan(text: string): number {
+    if (/(?:本弧|整弧|全弧|这一弧)/.test(text)) return 25
+    const m = /(?:接下来|后续|后面)\s*(\d+)\s*章/.exec(text)
+    if (m?.[1]) return Math.max(1, Math.min(30, Number(m[1])))
+    return 5
+  }
+
   /** The text of a person's message carried by an Input, or undefined for anything automatic. */
   private personText(input: TicketInput | undefined): string | undefined {
     if (!input) return undefined
     if (input.kind === 'trigger' && input.human && !input.context) return this.options.triggers.get(input.triggerId)?.text?.trim() || undefined
+    if (input.kind === 'note') return input.text.trim() || undefined
     if (input.kind === 'text') {
       const at = input.text.lastIndexOf(INSTRUCTION_MARK)
       if (at >= 0) return input.text.slice(at + INSTRUCTION_MARK.length).trim() || undefined
@@ -387,14 +396,17 @@ export class NovelExecutor implements Executor {
         case 'steer':
         case 'answer': {
           const note = triage.kind === 'steer' ? triage.note : triage.note || text
-          this.steers.set(ticketId, { note: note.slice(0, 500), untilCh: book.lastChapter + (triage.kind === 'steer' ? triage.chapters : 5) })
+          const span = triage.kind === 'steer'
+            ? Math.max(triage.chapters, this.steerSpan(note))
+            : this.steerSpan(note)
+          this.steers.set(ticketId, { note: note.slice(0, 1500), untilCh: book.lastChapter + span })
           break
         }
         case 'rewrite': {
           try {
             const moved = this.writer(ticketId, bookId, run).rewriteFrom(triage.from)
             this.sessions.resetBook(bookId)
-            if (triage.note) this.steers.set(ticketId, { note: triage.note, untilCh: triage.from + 4 })
+            if (triage.note) this.steers.set(ticketId, { note: triage.note.slice(0, 1500), untilCh: triage.from + 4 })
             this.report(ticketId, { state: 'progress', summary: `已回滚到第${triage.from}章之前，移走 ${moved} 章，从第${triage.from}章重写。` })
           } catch (error) {
             this.report(ticketId, { state: 'blocked', summary: `无法重写：${describe(error)}`, question: `${describe(error)}。要从更晚的一章开始重写吗？默认：不重写，继续往下写。` })
@@ -421,11 +433,11 @@ export class NovelExecutor implements Executor {
     if (/^(暂停|停一下|先停)/.test(plain)) return { kind: 'pause' }
     if (/^(继续|接着写|resume)\s*$/i.test(plain)) return { kind: 'resume' }
     const rewrite = /^从第\s*(\d+)\s*章(?:开始)?重写[，,。:：\s]*(.*)$/s.exec(plain)
-    if (rewrite?.[1]) return { kind: 'rewrite', from: Number(rewrite[1]), note: (rewrite[2] ?? '').slice(0, 500) }
+    if (rewrite?.[1]) return { kind: 'rewrite', from: Number(rewrite[1]), note: (rewrite[2] ?? '').slice(0, 1500) }
     const question = this.options.tickets.get(ticketId)?.attention?.question
     const result = await this.asker(ticketId, bookId, run)('planner', TRIAGE_SYSTEM, triageUser({ title, lastChapter, ...(question ? { question } : {}), text: plain }), 600)
     const parsed = TriageSchema.safeParse(extractJson(result.text))
-    return parsed.success ? parsed.data : { kind: 'steer', note: plain.slice(0, 500), chapters: 5 }
+    return parsed.success ? parsed.data : { kind: 'steer', note: plain.slice(0, 1500), chapters: this.steerSpan(plain) }
   }
 
   // --- Model calls ----------------------------------------------------------------------------------------------------

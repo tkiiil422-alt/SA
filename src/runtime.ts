@@ -1723,6 +1723,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
           chapter: edit.n,
           ...(edit.chapterTitle ? { chapterTitle: edit.chapterTitle } : {}),
           status: edit.status,
+          ...(edit.source ? { source: edit.source } : {}),
           note: edit.note,
           ...(edit.charsBefore !== undefined ? { charsBefore: edit.charsBefore } : {}),
           ...(edit.charsAfter !== undefined ? { charsAfter: edit.charsAfter } : {}),

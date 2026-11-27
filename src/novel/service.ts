@@ -14,11 +14,11 @@ import type { Usage } from '../gateway/usage.ts'
 import { BookFiles } from './files.ts'
 import type { NovelStore, ChapterRow } from './store.ts'
 import { BookSchema, SetupSchema, GENRE_LABELS } from './schemas.ts'
-import type { Book, Genre, Setup, Contract, Delta, Review } from './schemas.ts'
+import type { Book, Canon, Character, Genre, Setup, Contract, Delta, Review } from './schemas.ts'
 import { SETUP_SYSTEM, parseSetup, setupUser } from './setup.ts'
 import { bookBlock, currentArc, stripTitle } from './context.ts'
 import type { ChapterSummary } from './context.ts'
-import { normalizeDraft } from './pipeline.ts'
+import { normalizeDraft, projectCanonViews } from './pipeline.ts'
 import type { Role } from './pipeline.ts'
 import { CHAPTER_EDIT_SYSTEM, chapterEditUser } from './prompts.ts'
 import { countChars } from './lint.ts'
@@ -42,6 +42,7 @@ export interface ChapterEdit {
   model?: string
   charsBefore?: number
   charsAfter?: number
+  source?: 'person' | 'director'
   note: string
   error?: string
   costUsd: number
@@ -54,6 +55,7 @@ interface EditRow {
   book_id?: string
   n: number
   status: string
+  source?: string | null
   note: string
   old_text?: string
   new_text?: string | null
@@ -82,6 +84,7 @@ const toEdit = (row: EditRow): ChapterEdit => ({
   ...(row.book_id ? { bookId: row.book_id } : {}),
   n: row.n,
   status: row.status as ChapterEdit['status'],
+  ...(row.source === 'director' || row.source === 'person' ? { source: row.source } : {}),
   note: row.note,
   ...(row.error ? { error: row.error } : {}),
   costUsd: Number(row.cost_usd ?? 0),
@@ -95,6 +98,7 @@ CREATE TABLE IF NOT EXISTS novel_edits (
   book_id TEXT NOT NULL,
   n INTEGER NOT NULL,
   status TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'person',
   note TEXT NOT NULL,
   old_text TEXT NOT NULL,
   new_text TEXT,
@@ -198,6 +202,13 @@ export class NovelService {
     this.idFactory = options.idFactory ?? (() => `b_${randomBytes(6).toString('hex')}`)
     options.db.exec(SETUP_TABLE)
     options.db.exec(EDITS_TABLE)
+    // 兼容存量库：为 novel_edits 补充 source 字段以区分人工意见与总控巡检修稿
+    try {
+      const cols = options.db.prepare('PRAGMA table_info(novel_edits)').all() as Array<{ name?: string }>
+      if (!cols.some(c => c.name === 'source')) {
+        options.db.exec("ALTER TABLE novel_edits ADD COLUMN source TEXT NOT NULL DEFAULT 'person'")
+      }
+    } catch { /* 忽略并发/重复列迁移 */ }
     // A setup or an edit that was running when the daemon stopped has lost its call.
     options.db.prepare("UPDATE novel_setups SET status = 'failed', error = '守护进程重启，开书中断', updated_at = ? WHERE status = 'drafting'")
       .run(this.now().toISOString())
@@ -442,6 +453,172 @@ export class NovelService {
     return this.requireBook(bookId).readCanon()
   }
 
+  /** 结构化修正小说设定卡（人物/物品/伏笔/禁用词/风格规则），校验全套设定后原子写回并刷新视图。 */
+  patchCanon(bookId: string, patch: {
+    characters?: Array<{
+      id?: string
+      name?: string
+      create?: boolean
+      aliases?: string[]
+      role?: Character['role']
+      faction?: string | null
+      realm?: { id: string; stage: number } | null
+      status?: Character['status']
+      location?: string | null
+      anchors?: string[]
+      addAnchors?: string[]
+      speech?: string | null
+    }>
+    items?: Array<{
+      id?: string
+      name?: string
+      owner?: string
+      qty?: number
+      state?: Canon['items'][number]['state']
+      grade?: string | null
+    }>
+    foreshadow?: Array<{
+      id: string
+      status?: Canon['foreshadow'][number]['status']
+      content?: string
+      dueBy?: number | null
+      resolvedCh?: number | null
+      lastAdvancedCh?: number
+    }>
+    style?: {
+      addBanned?: string[]
+      removeBanned?: string[]
+      banned?: string[]
+      addRules?: string[]
+      removeRules?: string[]
+      rules?: string[]
+    }
+    taboos?: string[]
+  }): { ok: true; bookId: string; changedCount: number; changed: string[] } {
+    this.requireEnabled()
+    const files = this.requireBook(bookId)
+    const book = files.readBook()
+    const canon = structuredClone(files.readCanon())
+    const changed: string[] = []
+
+    const resolveRealm = (spec: { id: string; stage: number }): { id: string; stage: number } => {
+      const target = canon.power.realms.find(r => r.id === spec.id || r.name === spec.id)
+      if (!target) throw new NovelError('invalid', `未知境界「${spec.id}」，可用境界：${canon.power.realms.map(r => `${r.id}(${r.name})`).join('、')}`)
+      const stage = Math.max(0, Math.min(target.stages.length - 1, Math.floor(spec.stage ?? 0)))
+      return { id: target.id, stage }
+    }
+
+    for (const cp of patch.characters ?? []) {
+      let c = canon.characters.find(x =>
+        (cp.id && x.id === cp.id)
+        || (cp.name && (x.name === cp.name || x.aliases.includes(cp.name))),
+      )
+      if (!c) {
+        if (!cp.create || !cp.id || !cp.name) {
+          throw new NovelError('not_found', `找不到要修改的人物（id=${cp.id ?? ''} name=${cp.name ?? ''}）；如需新增请同时传 create=true、id 与 name。`)
+        }
+        c = {
+          id: cp.id,
+          name: cp.name,
+          aliases: cp.aliases ?? [],
+          role: cp.role ?? 'minor',
+          status: cp.status ?? 'alive',
+          anchors: cp.anchors ?? [],
+          relations: [],
+          knows: [],
+          firstCh: Math.max(1, book.lastChapter),
+          lastSeenCh: Math.max(1, book.lastChapter),
+        }
+        canon.characters.push(c)
+        changed.push(`新增人物:${c.name}(${c.id})`)
+      } else {
+        if (cp.name) c.name = cp.name
+        if (cp.aliases) c.aliases = cp.aliases
+        if (cp.role) c.role = cp.role
+      }
+      if (cp.faction === null) delete c.faction
+      else if (cp.faction !== undefined) c.faction = cp.faction
+      if (cp.realm === null) delete c.realm
+      else if (cp.realm !== undefined) c.realm = resolveRealm(cp.realm)
+      if (cp.status !== undefined) c.status = cp.status
+      if (cp.location === null) delete c.location
+      else if (cp.location !== undefined) c.location = cp.location
+      if (cp.speech === null) delete c.speech
+      else if (cp.speech !== undefined) c.speech = cp.speech
+      if (cp.anchors !== undefined) c.anchors = cp.anchors
+      if (cp.addAnchors?.length) {
+        const merged = new Set(c.anchors)
+        for (const a of cp.addAnchors) if (a.trim()) merged.add(a.trim())
+        c.anchors = [...merged].slice(0, 8)
+      }
+      changed.push(`人物:${c.name}(${c.id})`)
+    }
+
+    for (const ip of patch.items ?? []) {
+      const item = canon.items.find(x => (ip.id && x.id === ip.id) || (ip.name && x.name === ip.name))
+      if (!item) throw new NovelError('not_found', `找不到物品（id=${ip.id ?? ''} name=${ip.name ?? ''}）`)
+      if (ip.owner !== undefined) item.owner = ip.owner
+      if (ip.qty !== undefined) item.qty = Math.max(0, Math.floor(ip.qty))
+      if (ip.state !== undefined) item.state = ip.state
+      if (ip.grade === null) delete item.grade
+      else if (ip.grade !== undefined) item.grade = ip.grade
+      changed.push(`物品:${item.name}(${item.id})`)
+    }
+
+    for (const fp of patch.foreshadow ?? []) {
+      const fs = canon.foreshadow.find(x => x.id === fp.id)
+      if (!fs) throw new NovelError('not_found', `找不到伏笔 ${fp.id}`)
+      if (fp.status !== undefined) fs.status = fp.status
+      if (fp.content !== undefined) fs.content = fp.content
+      if (fp.dueBy === null) delete fs.dueBy
+      else if (fp.dueBy !== undefined) fs.dueBy = Math.floor(fp.dueBy)
+      if (fp.resolvedCh === null) delete fs.resolvedCh
+      else if (fp.resolvedCh !== undefined) fs.resolvedCh = Math.floor(fp.resolvedCh)
+      if (fp.lastAdvancedCh !== undefined) fs.lastAdvancedCh = Math.floor(fp.lastAdvancedCh)
+      changed.push(`伏笔:${fs.id}`)
+    }
+
+    if (patch.style) {
+      const st = patch.style
+      if (st.banned) {
+        canon.bible.style.banned = [...new Set(st.banned.map(s => s.trim()).filter(Boolean))]
+      }
+      if (st.addBanned?.length) {
+        canon.bible.style.banned = [...new Set([...canon.bible.style.banned, ...st.addBanned.map(s => s.trim()).filter(Boolean)])]
+      }
+      if (st.removeBanned?.length) {
+        const drop = new Set(st.removeBanned.map(s => s.trim()))
+        canon.bible.style.banned = canon.bible.style.banned.filter(w => !drop.has(w))
+      }
+      if (st.rules) {
+        canon.bible.style.rules = [...new Set(st.rules.map(s => s.trim()).filter(Boolean))]
+      }
+      if (st.addRules?.length) {
+        canon.bible.style.rules = [...new Set([...canon.bible.style.rules, ...st.addRules.map(s => s.trim()).filter(Boolean)])]
+      }
+      if (st.removeRules?.length) {
+        const drop = new Set(st.removeRules.map(s => s.trim()))
+        canon.bible.style.rules = canon.bible.style.rules.filter(r => !drop.has(r))
+      }
+      changed.push(`文风/禁用词(${canon.bible.style.banned.length}词)`)
+    }
+
+    if (patch.taboos) {
+      canon.bible.taboos = patch.taboos.map(s => s.trim()).filter(Boolean)
+      changed.push('禁忌清单')
+    }
+
+    const deduped = [...new Set(changed)]
+    if (deduped.length === 0) throw new NovelError('invalid', '未指定任何有效的设定卡修改字段。')
+    try {
+      files.writeCanon(canon)
+      projectCanonViews(files, canon)
+    } catch (error) {
+      throw new NovelError('invalid', `设定卡校验失败，未写入磁盘：${describe(error)}`)
+    }
+    return { ok: true, bookId, changedCount: deduped.length, changed: deduped }
+  }
+
   chapter(bookId: string, n: number): { n: number; text: string; summary?: ChapterSummary; row?: ChapterRow; notes: string[]; edit?: ChapterEdit; lastChapter: number } {
     const files = this.requireBook(bookId)
     const text = files.readChapter(n)
@@ -544,7 +721,7 @@ export class NovelService {
    * Rewrite one committed chapter's prose from a person's note, in the background. Facts stay as recorded (the prompt
    * forbids changing them), so the canon and later chapters are untouched; the old text is kept for undo.
    */
-  editChapter(bookId: string, n: number, note: string, opts?: { allowShorten?: boolean }): ChapterEdit {
+  editChapter(bookId: string, n: number, note: string, opts?: { allowShorten?: boolean; source?: 'person' | 'director' }): ChapterEdit {
     this.requireEnabled()
     const files = this.requireBook(bookId)
     const text = files.readChapter(n)
@@ -555,11 +732,12 @@ export class NovelService {
     const resolved = this.options.resolve('writer', bookId)
     if (!resolved) throw new NovelError('invalid', '没有可用的写手模型。')
     const id = `e_${randomBytes(6).toString('hex')}`
+    const source: 'person' | 'director' = opts?.source === 'director' ? 'director' : 'person'
     const at = this.now().toISOString()
     const book = files.readBook()
     const chapterTitle = this.options.store.chapters(bookId).find(c => c.n === n)?.title ?? `第 ${n} 章`
-    this.options.db.prepare(`INSERT INTO novel_edits (id, book_id, n, status, note, old_text, created_at, updated_at)
-      VALUES (?, ?, ?, 'running', ?, ?, ?, ?)`).run(id, bookId, n, clean, text, at, at)
+    this.options.db.prepare(`INSERT INTO novel_edits (id, book_id, n, status, source, note, old_text, created_at, updated_at)
+      VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)`).run(id, bookId, n, source, clean, text, at, at)
     this.setEditProgress(id, {
       bookId,
       bookTitle: book.title,
@@ -647,26 +825,27 @@ export class NovelService {
       }
       if (!result?.ok || !result.text.trim()) { fail(`模型调用失败：${result?.error ?? result?.status ?? ''}`, resolvedRef); return }
       if (result.truncated) { fail('改稿被截断，原稿没有动。', resolvedRef); return }
-      const after = countChars(result.text)
+      const fresh = normalizeDraft(result.text, summary?.title ?? `第${n}章`).text
+      const finalChars = countChars(fresh)
       this.setEditProgress(id, {
         bookId,
         bookTitle: book.title,
         chapterTitle,
         stage: 'validating',
-        stageLabel: `模型已返回 ${after} 字，正在校验篇幅与正文格式…`,
+        stageLabel: `模型已返回并清洗出 ${finalChars} 字，正在校验篇幅与正文格式…`,
         attempt: this.editProgress.get(id)?.attempt ?? 1,
         maxAttempts: 4,
         progressPct: 80,
         model: resolvedRef,
         charsBefore,
-        charsAfter: after,
+        charsAfter: finalChars,
       })
       const minAllowed = Math.floor(book.chapterChars[0] * 0.75)
       const effectiveBefore = Math.min(charsBefore, Math.round(book.chapterChars[1] * 1.15))
-      const minFromOriginal = opts?.allowShorten ? minAllowed : Math.floor(effectiveBefore * 0.75)
-      if (after < minAllowed || after < minFromOriginal) { fail(`改稿只有 ${after} 字，比原稿短太多，原稿没有动。`, resolvedRef); return }
-      const fresh = normalizeDraft(result.text, summary?.title ?? `第${n}章`).text
-      const finalChars = countChars(fresh)
+      const dedupeIntent = /去重|重复|精简|删除多余|缩短|剔除/.test(note)
+      const allowShorten = Boolean(opts?.allowShorten || dedupeIntent || charsBefore > book.chapterChars[1] * 1.35)
+      const minFromOriginal = allowShorten ? minAllowed : Math.floor(effectiveBefore * 0.75)
+      if (finalChars < minAllowed || finalChars < minFromOriginal) { fail(`改稿只有 ${finalChars} 字，比原稿短太多，原稿没有动。`, resolvedRef); return }
       this.setEditProgress(id, {
         bookId,
         bookTitle: book.title,

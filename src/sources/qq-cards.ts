@@ -333,14 +333,24 @@ export function extractQqChoiceButtons(replyText: string): { label: string; text
   const text = replyText.trim()
   if (!text) return []
 
+  const allLines = text.split(/\r?\n/)
+  const tailLines = allLines.slice(-8).join('\n')
+  const tailHasQuestion = /(?:请回复|请选择|请拍板|请确认下一步|请决定|选哪|怎么处理|是否需要[^。\n]*[？?]|[？?]\s*$)/.test(tailLines)
+  // 定时巡检报告或明确说明"无需回复/干预"的状态汇报，若末尾没有真实二选一提问，绝不强行生成交互按钮
+  if (/无需.{0,8}(?:回复|确认|干预|操作|处理)|(?:无需|不必|不用)你(?:确认|回复|拍板)/.test(tailLines) && !tailHasQuestion) {
+    return []
+  }
+  if (/^[\[【]?定时巡检/.test(text) && !tailHasQuestion) {
+    return []
+  }
+
   // 1. 优先识别末尾提示行里的「动作A」「动作B」并列候选（如：请回复「确认」或「取消」 / 可选择「继续重试」/「先停掉」）
-  const tailLines = text.split(/\r?\n/).slice(-8).join('\n')
-  const quotedLineRe = /(?:回复|选择|发送|点选|直接说|建议|或者|还是)[^\n]{0,40}(?:[「『"']([^「『"'\n]{1,16})[」』"'])/g
-  const tailHasChoiceHint = /(?:回复|选择|请决定|选哪|方案|确认|还是|或者)/.test(tailLines)
+  const tailHasChoiceHint = /(?:(?:请|可|直接)?(?:回复|选择|发送|点选)|请决定|选哪|请拍板|请确认下一步)/.test(tailLines)
   if (tailHasChoiceHint) {
     const quoted: string[] = []
-    for (const line of text.split(/\r?\n/).slice(-6)) {
-      if (!/(?:回复|选择|请决定|选哪|还是|或者|是否)/.test(line)) continue
+    for (const line of allLines.slice(-6)) {
+      if (/无需|不用|不必|不需要/.test(line)) continue
+      if (!/(?:(?:请|可|直接)?(?:回复|选择|发送|点选)|请决定|选哪|还是|或者|是否)/.test(line)) continue
       const matches = [...line.matchAll(/[「『]([^「『」』\n]{1,16})[」』]/g)].map(m => m[1]!.trim())
       for (const m of matches) {
         if (!m || m.startsWith('/')) continue
@@ -351,15 +361,15 @@ export function extractQqChoiceButtons(replyText: string): { label: string; text
       return quoted.map(q => ({ label: q, text: q }))
     }
   }
-  void quotedLineRe
 
-  // 2. 识别列表形选项（仅当文中出现选择引导词时触发，避免把普通进度清单误变成按钮）
-  const hasPromptAsk = /(?:请选择|选哪[一两]?个|以下.{0,6}方案|推荐.{0,6}方案|怎么处理|哪种方式|请确认下一步|你希望|请拍板)/.test(text)
+  // 2. 识别列表形选项（仅当末尾 10 行附近出现明确选择引导词时触发，避免把长巡检清单误变成按钮）
+  const promptWindow = allLines.slice(-12).join('\n')
+  const hasPromptAsk = /(?:请选择|选哪[一两]?个|以下.{0,6}方案|推荐.{0,6}方案|怎么处理|哪种方式|请确认下一步|你希望|请拍板)/.test(promptWindow)
   if (!hasPromptAsk) return []
 
   const candidates: { label: string; text: string }[] = []
   const seen = new Set<string>()
-  for (const rawLine of text.split(/\r?\n/)) {
+  for (const rawLine of allLines.slice(-12)) {
     const line = rawLine.trim().replace(/\*\*/g, '')
     const m = /^(?:[-•*]\s*)?(?:(?:方案|选项)\s*([A-D1-4])|([A-D])[)）\.、]|([1-4])[)）\.、]|[①②③④])\s*[：:.\-–—]?\s*(.+)$/.exec(line)
     if (!m) continue
@@ -367,6 +377,7 @@ export function extractQqChoiceButtons(replyText: string): { label: string; text
     const key = m[1] || m[2] || m[3] || idxMap[line[0] ?? ''] || ''
     const body = (m[4] || '').split(/[（(：:—\-|｜]/)[0]!.trim()
     if (!body || body.length > 24) continue
+    if (/^(?:已完成|已修复|已发送|已跳过|正常|无异常|检查完毕|已清理)/.test(body)) continue
     const prefix = /^[A-D]$/.test(key) ? `方案${key}` : `选项${key}`
     const label = body.length <= 10 ? `${prefix}：${body}` : `${prefix} · ${body.slice(0, 8)}`
     const sendText = `${prefix}（${body}）`

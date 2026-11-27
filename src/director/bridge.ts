@@ -124,6 +124,7 @@ export type PlatformNoticeEvent =
     chapter: number
     chapterTitle?: string
     status: 'done' | 'failed'
+    source?: 'person' | 'director'
     note: string
     charsBefore?: number
     charsAfter?: number
@@ -193,9 +194,10 @@ export class DirectorBridge {
     if (!opts.director.enabled) return
     const channels = this.activeChannels()
 
-    // 手动停止的工单不刷屏打扰
+    // 手动停止的工单与总控巡检触发的常规修稿成功不刷屏打扰（失败仍汇报）
     if (event.kind === 'ticket.ended' && event.outcome === 'stopped') return
     if (event.kind === 'ticket.ended' && event.fromDirectWechat) return
+    if (event.kind === 'novel.edit_settled' && event.source === 'director' && event.status === 'done') return
 
     const dedupeKey = this.keyOf(event)
     const nowMs = this.doNow().getTime()

@@ -34,7 +34,7 @@ export interface SchedulerServiceDeps {
   }) => Promise<{ ticketId?: string; triggerId: string }>
   runDirectorPrompt?: (input: {
     prompt: string
-    channel: 'web' | 'wechat' | 'feishu'
+    channel: 'web' | 'wechat' | 'feishu' | 'qq'
     userId: string
     deliverToWechat: boolean
   }) => Promise<{ reply: string; sessionId: string }>
@@ -269,7 +269,9 @@ export class SchedulerService {
           throw new Error('当前运行时未启用总控助手（Director）')
         }
         const cfg = schedule.actionConfig
-        const channel = cfg.channel === 'wechat' || cfg.channel === 'feishu' || cfg.channel === 'web' ? cfg.channel : 'web'
+        const channel = cfg.channel === 'wechat' || cfg.channel === 'feishu' || cfg.channel === 'qq' || cfg.channel === 'web'
+          ? cfg.channel
+          : 'web'
         const userId = str(cfg.userId) || 'console'
         const deliverToWechat = cfg.deliverToWechat !== false
         const contractBlock = contract ? `\n\n${this.deps.contracts!.formatForPrompt(contract)}` : ''

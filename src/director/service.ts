@@ -1128,7 +1128,7 @@ export class DirectorService {
         }
 
         const allowTools = step < maxSteps
-        // 满步数进入收口总结步时，临时附带系统收口指令（不落库），防止模型误以为工具未挂载或只剩 manage_task
+        // 满步数进入收口总结步或接近步数上限（倒数第 2 步）时，临时附带系统提示（不落库），提醒优先落库关键写操作并有序收口
         let callMessages: AgentMessage[]
         if (!allowTools && toolsUsed.length > 0) {
           const closingMsg: AgentMessage = {
@@ -1139,6 +1139,15 @@ export class DirectorService {
             ? trimConversationToBudget(conversation, Math.max(4_096, runtimeByteBudget - agentMessageBytes(closingMsg)))
             : conversation
           callMessages = [...trimmedBase, closingMsg]
+        } else if (allowTools && maxSteps >= 4 && step === maxSteps - 2) {
+          const budgetHint: AgentMessage = {
+            role: 'user',
+            content: `[系统步数预警] 本轮工具调用额度仅剩最后 2 步（即将到达单轮上限 ${maxSteps} 步）。请停止继续泛化检索，优先完成尚未执行的关键写动作（如 schedule_create / novel_canon_patch / novel_edit_chapter / followup_set 等）后直接收敛回复。`,
+          }
+          const trimmedBase = runtimeByteBudget
+            ? trimConversationToBudget(conversation, Math.max(4_096, runtimeByteBudget - agentMessageBytes(budgetHint)))
+            : conversation
+          callMessages = [...trimmedBase, budgetHint]
         } else {
           callMessages = runtimeByteBudget
             ? trimConversationToBudget(conversation, runtimeByteBudget)

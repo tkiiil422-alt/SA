@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { NovelStore } from '../src/novel/store.ts'
 import { NovelService } from '../src/novel/service.ts'
 import { BookFiles } from '../src/novel/files.ts'
+import { normalizeDraft } from '../src/novel/pipeline.ts'
 import {
   buildQqChoicePayload,
   buildQqNovelEditPayload,
@@ -110,6 +111,13 @@ describe('QQ formatter, choice extraction and action codec', () => {
 
     const nu = encodeQqAction({ kind: 'novel_undo', bookId: 'b_1', n: 5 })
     expect(decodeQqAction(nu)).toEqual({ kind: 'novel_undo', bookId: 'b_1', n: 5 })
+
+    // 定时巡检报告与显式声明无需回复的报告不应误抽出选项按钮
+    const patrolReport = '[定时巡检：每小时小说检查]\n1. 进度正常\n2. 无需确认下一步\n无需您回复「继续」或「暂停」。'
+    expect(extractQqChoiceButtons(patrolReport)).toEqual([])
+
+    const completedList = '本轮排查汇报：\n1. 已完成数据库检查\n2. 已修复重连限流\n如需「查看日志」或「重启服务」可告知。'
+    expect(extractQqChoiceButtons(completedList)).toEqual([])
   })
 
   it('builds pending action & novel edit payloads with clickable keyboard buttons', () => {
@@ -517,9 +525,127 @@ describe('NovelService chapter edit live progress & onEditSettled', () => {
       const undone = svc.undoEdit(bookId, 1)
       expect(undone.status).toBe('undone')
       expect(svc.chapter(bookId, 1).text).toContain('握紧手中木剑')
+
+      // 验证 patchCanon 可结构化更新境界、禁用词与视图且经 Schema 校验
+      const patched = svc.patchCanon(bookId, {
+        characters: [{ id: 'lin-chen', realm: { id: '筑基', stage: 1 }, location: '内门峰' }],
+        style: { addBanned: ['时辰', '刻钟'] },
+      })
+      expect(patched.ok).toBe(true)
+      const canonAfter = svc.canon(bookId)
+      expect(canonAfter.characters[0]?.realm).toEqual({ id: 'ji', stage: 1 })
+      expect(canonAfter.characters[0]?.location).toBe('内门峰')
+      expect(canonAfter.bible.style.banned).toEqual(['时辰', '刻钟'])
+      expect(readFileSync(join(files.dir, 'views', '人物.md'), 'utf8')).toContain('筑基·中期')
     } finally {
       globalThis.fetch = origFetch
       db.close()
     }
+  })
+
+  it('normalizeDraft strips thought tags, English WAIT lines, bold markdown and duplicate stitched drafts', () => {
+    const p = '山风拂过青石阶，林尘收剑入鞘望向远处云海翻涌的山门。'.repeat(25)
+    const raw = [
+      '# 第1章 初试锋芒',
+      '',
+      '<thought>Let me check word count first</thought>',
+      'WAIT: revise tone',
+      `**林尘**踏步向前。\n\n${p}`,
+      '',
+      '# 第1章 初试锋芒',
+      '',
+      `林尘踏步向前。\n\n${p}结尾他转身走入大殿。`,
+      '',
+      '（注：已按要求字数生成完毕）',
+      '</turn>',
+    ].join('\n')
+    const out = normalizeDraft(raw, '初试锋芒')
+    expect(out.title).toBe('初试锋芒')
+    expect(out.text).not.toContain('thought')
+    expect(out.text).not.toContain('WAIT:')
+    expect(out.text).not.toContain('**')
+    expect(out.text).not.toContain('（注：')
+    expect(out.text).not.toContain('</turn>')
+    // 双份重复草稿已被剥离，只剩单遍正文的篇幅
+    expect(out.text.match(/林尘踏步向前/g)).toHaveLength(1)
+  })
+
+  it('reuses cached QQ /gateway URL on rapid reconnects and enforces rate-limit cooldown on 100017', async () => {
+    const cfg = baseQqConfig({ mode: 'ws' })
+    let gatewayCalls = 0
+    let sockets: { triggerOpen(): void; triggerClose(): void; sent: string[] }[] = []
+    const events: string[] = []
+    const fakeFetch = (async (input: string | URL) => {
+      const url = String(input)
+      if (url.includes('getAppAccessToken')) {
+        return new Response(JSON.stringify({ access_token: 'tok_test', expires_in: 7200 }), { status: 200 })
+      }
+      if (url.endsWith('/gateway')) {
+        gatewayCalls += 1
+        return new Response(JSON.stringify({ url: 'wss://sandbox.example/ws' }), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    }) as typeof fetch
+
+    const qq = new QqSource({
+      config: () => cfg,
+      fetch: fakeFetch,
+      onEvent: ev => events.push(`${ev.kind}:${ev.text}`),
+      onMessage: () => undefined,
+      wsFactory: () => {
+        const listeners = new Map<string, Array<(ev: any) => void>>()
+        const sent: string[] = []
+        const sock: QqWsLike = {
+          readyState: 1,
+          send: data => sent.push(data),
+          close: () => undefined,
+          addEventListener: (type, handler) => {
+            const list = listeners.get(type) ?? []
+            list.push(handler)
+            listeners.set(type, list)
+          },
+        }
+        const ctrl = {
+          sent,
+          triggerOpen: () => {
+            for (const fn of listeners.get('message') ?? []) {
+              fn({ data: JSON.stringify({ op: 10, d: { heartbeat_interval: 30_000 } }) })
+            }
+          },
+          triggerClose: () => {
+            for (const fn of listeners.get('close') ?? []) fn({})
+          },
+        }
+        sockets.push(ctrl)
+        return sock
+      },
+    })
+
+    qq.start()
+    await new Promise(r => setTimeout(r, 30))
+    expect(gatewayCalls).toBe(1)
+    sockets[0]?.triggerOpen()
+    // 模拟重连时复用 /gateway 缓存，不再次请求 HTTP /gateway
+    await (qq as unknown as { connectWs: (resume: boolean) => Promise<void> }).connectWs(true)
+    expect(gatewayCalls).toBe(1)
+    expect(sockets.length).toBe(2)
+
+    // 验证 /gateway 返回 HTTP 400 code:100017 时进入冷静退避期并拒绝立刻再次请求
+    ;(qq as unknown as { wsUrlCache?: unknown }).wsUrlCache = undefined
+    const rlFetch = (async (input: string | URL) => {
+      const url = String(input)
+      if (url.includes('getAppAccessToken')) {
+        return new Response(JSON.stringify({ access_token: 'tok_test', expires_in: 7200 }), { status: 200 })
+      }
+      gatewayCalls += 1
+      return new Response(JSON.stringify({ code: 100017, message: '接口调用超过频率限制' }), { status: 400 })
+    }) as typeof fetch
+    const qqRl = new QqSource({ config: () => cfg, fetch: rlFetch, onMessage: () => undefined })
+    await expect((qqRl as unknown as { fetchGatewayUrl: (t: string, c: QqConfig) => Promise<string> }).fetchGatewayUrl('t', cfg)).rejects.toThrow(/100017/)
+    const beforeBlockedCalls = gatewayCalls
+    await expect((qqRl as unknown as { fetchGatewayUrl: (t: string, c: QqConfig) => Promise<string> }).fetchGatewayUrl('t', cfg)).rejects.toThrow(/冷却期/)
+    expect(gatewayCalls).toBe(beforeBlockedCalls)
+    qq.stop()
+    qqRl.stop()
   })
 })

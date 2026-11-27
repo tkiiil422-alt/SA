@@ -421,11 +421,11 @@ export type ArcClose = z.infer<typeof ArcCloseSchema>
 // --- Triage (a person's message on a novel ticket) -------------------------------------------------------------------
 
 export const TriageSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('steer'), note: Text(500).min(1), chapters: z.number().int().min(1).max(50).default(5) }).strict(),
-  z.object({ kind: z.literal('rewrite'), from: z.number().int().min(1), note: Text(500) }).strict(),
+  z.object({ kind: z.literal('steer'), note: Text(1500).min(1), chapters: z.number().int().min(1).max(50).default(5) }).strict(),
+  z.object({ kind: z.literal('rewrite'), from: z.number().int().min(1), note: Text(1500) }).strict(),
   z.object({ kind: z.literal('pause') }).strict(),
   z.object({ kind: z.literal('resume') }).strict(),
-  z.object({ kind: z.literal('answer'), note: Text(500) }).strict(),
+  z.object({ kind: z.literal('answer'), note: Text(1500) }).strict(),
   z.object({ kind: z.literal('unclear'), question: Text(200).min(1) }).strict(),
 ])
 export type Triage = z.infer<typeof TriageSchema>

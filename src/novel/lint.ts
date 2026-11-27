@@ -46,6 +46,9 @@ const META_MARKERS: [string, RegExp][] = [
   ['（完）', /（完）/],
   ['英文单词串', /[A-Za-z]+(?:[ \t]+[A-Za-z]+){2,}/],
   ['Markdown列表', /^[ \t]*(?:[-*+]|\d+\.)[ \t]+/m],
+  ['思维标签', /<\/?(?:thought|thinking|turn|scratchpad)>/i],
+  ['英文自检', /(?:^|\n)[ \t]*(?:WAIT\s*:|Okay,\s*let's|Let(?:'s| us)\s+(?:check|revise|rewrite|verify)|Here is\s+(?:the|a)\b|Word count\b|Character count\b)/i],
+  ['加粗标记', /\*\*[^*\n]{1,120}\*\*/],
 ]
 
 const compact = (s: string): string => s.replace(/\s+/g, '')
@@ -174,6 +177,29 @@ export function lintChapter(text: string, opts: LintOptions): LintResult {
   for (const [label, pattern] of META_MARKERS) {
     const m = pattern.exec(body)
     if (m) issues.push({ code: 'meta', severity: 'fix', message: `疑似元话语或格式残留（${label}）：「${m[0].trim()}」` })
+  }
+
+  // 检测单章内部前后拼接双草稿：过滤纯单字重复的测试夹具（需至少 6 个不同字符）
+  if (chars >= 1200) {
+    const compactBody = compact(body)
+    const half = Math.floor(compactBody.length / 2)
+    const firstHalf = compactBody.slice(0, half)
+    const secondHalf = compactBody.slice(half)
+    let intraDup = 0
+    for (const seg of firstHalf.split(/[。！？]/)) {
+      if (seg.length < 16 || new Set([...seg]).size < 6) continue
+      if (secondHalf.includes(seg)) {
+        intraDup += 1
+        if (intraDup >= 4) break
+      }
+    }
+    if (intraDup >= 4) {
+      issues.push({
+        code: 'repeat',
+        severity: 'fix',
+        message: `本章疑似前后拼接了两遍重复草稿（检测到 ${intraDup}+ 处长句自重复），请精简为单一完整版本`,
+      })
+    }
   }
 
   return { issues, chars, aiPer1k, phraseHits }

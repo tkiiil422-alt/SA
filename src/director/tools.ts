@@ -541,15 +541,23 @@ export class DirectorToolExecutor {
           if (!this.deps.novels) return fail('未启用小说模块')
           const bookId = str(args.bookId)
           if (!bookId) return fail('缺少 bookId')
+          const includeAllOutlines = bool(args.includeAllOutlines, false)
           const detail = this.deps.novels.detail(bookId)
+          const compactArcs = detail.plan.arcs.slice(0, 20).map(arc => {
+            if (!includeAllOutlines && arc.status === 'done') {
+              const { outline, ...rest } = arc
+              return { ...rest, hasOutline: Boolean(outline) }
+            }
+            return arc
+          })
           return out({
             book: detail.book,
-            idea: detail.idea,
+            idea: detail.idea.length > 600 ? `${detail.idea.slice(0, 600)}…` : detail.idea,
             chapterChars: detail.chapterChars,
             volumes: detail.plan.volumes.length,
-            arcs: detail.plan.arcs.slice(0, 20),
+            arcs: compactArcs,
             chaptersCount: detail.chapters.length,
-            recentChapters: detail.chapters.slice(-20),
+            recentChapters: detail.chapters.slice(-15),
             tickets: detail.tickets.slice(-10),
           })
         }
@@ -1224,12 +1232,23 @@ export class DirectorToolExecutor {
           const note = str(args.note) || str(args.instruction) || str(args.text)
           const allowShorten = args.allowShorten === true || args.allowShorten === 'true'
           if (!bookId || !note) return fail('缺少 bookId 或修改意见 note')
-          const edit = this.deps.novels.editChapter(bookId, chapter, note, { allowShorten })
+          const edit = this.deps.novels.editChapter(bookId, chapter, note, { allowShorten, source: 'director' })
           return out({
             ok: true,
             edit,
             hint: '章节精修已在后台异步执行，请勿在本轮连续轮询 novel_chapter 等待结果。',
           })
+        }
+
+        case 'novel_canon_patch': {
+          if (!this.deps.novels) return fail('未启用小说模块')
+          const bookId = str(args.bookId)
+          if (!bookId) return fail('缺少 bookId')
+          const patchPayload = (typeof args.patch === 'object' && args.patch !== null && !Array.isArray(args.patch))
+            ? args.patch as Record<string, unknown>
+            : args
+          const result = this.deps.novels.patchCanon(bookId, patchPayload as Parameters<NovelService['patchCanon']>[1])
+          return out(result)
         }
 
         case 'pentest_scan': {

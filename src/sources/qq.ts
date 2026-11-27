@@ -223,6 +223,11 @@ export class QqSource {
   private lastSeq: number | null = null
   private sessionId = ''
   private reconnectAttempt = 0
+  private wsUrlCache?: { url: string; fetchedAtMs: number; key: string }
+  private connectedAtMs = 0
+  private rapidDisconnectCount = 0
+  private lastResumedEventLogMs = 0
+  private rateLimitedUntilMs = 0
   private richDisabledUntilMs = 0
   private receivedCount = 0
   private sentCount = 0
@@ -361,7 +366,15 @@ export class QqSource {
     }
   }
 
-  private async fetchGatewayUrl(token: string, cfg: QqConfig): Promise<string> {
+  private async fetchGatewayUrl(token: string, cfg: QqConfig, forceRefresh = false): Promise<string> {
+    const key = `${resolveApiBase(cfg)}|${cfg.appId}`
+    const now = Date.now()
+    if (!forceRefresh && this.wsUrlCache && this.wsUrlCache.key === key && now - this.wsUrlCache.fetchedAtMs < 30 * 60_000) {
+      return this.wsUrlCache.url
+    }
+    if (now < this.rateLimitedUntilMs) {
+      throw new Error(`QQ 网关拉取处于频率限制冷却期，将在 ${Math.ceil((this.rateLimitedUntilMs - now) / 1000)}s 后重试`)
+    }
     const res = await this.doFetch(`${resolveApiBase(cfg)}/gateway`, {
       method: 'GET',
       headers: { authorization: `QQBot ${token}` },
@@ -370,8 +383,15 @@ export class QqSource {
     let json: { url?: unknown } = {}
     try { json = JSON.parse(raw) as typeof json } catch { /* ignore */ }
     if (!res.ok || typeof json.url !== 'string' || !json.url) {
+      const rateLimited = res.status === 429 || /100017|频率限制|rate.?limit/i.test(raw)
+      if (rateLimited) {
+        this.wsUrlCache = undefined
+        const cooldownMs = Math.min(300_000, 60_000 * Math.pow(2, Math.min(3, this.reconnectAttempt)))
+        this.rateLimitedUntilMs = Math.max(this.rateLimitedUntilMs, Date.now() + cooldownMs)
+      }
       throw new Error(`获取 QQ WebSocket 网关地址失败（HTTP ${res.status}）：${scrub(raw.slice(0, 200), cfg, token)}`)
     }
+    this.wsUrlCache = { url: json.url, fetchedAtMs: Date.now(), key }
     return json.url
   }
 
@@ -387,7 +407,9 @@ export class QqSource {
     let token = ''
     try {
       token = await this.getAccessToken(false)
-      const wsUrl = await this.fetchGatewayUrl(token, cfg)
+      // 复用缓存的网关地址，仅在连续重连多次且不在限流冷却期时才强制刷新 /gateway
+      const forceFreshGateway = this.reconnectAttempt >= 3 && Date.now() >= this.rateLimitedUntilMs
+      const wsUrl = await this.fetchGatewayUrl(token, cfg, forceFreshGateway)
       if (gen !== this.generation) return
       const WsCtor = globalThis.WebSocket
       if (!this.deps.wsFactory && typeof WsCtor !== 'function') {
@@ -410,6 +432,21 @@ export class QqSource {
         if (gen !== this.generation) return
         this.ws = undefined
         if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = undefined }
+        const livedMs = this.connectedAtMs > 0 ? Date.now() - this.connectedAtMs : 0
+        this.connectedAtMs = 0
+        if (livedMs >= 30_000) {
+          // 仅在长连接稳定存活至少 30 秒后才清零重连退避计数
+          this.reconnectAttempt = 0
+          this.rapidDisconnectCount = 0
+        } else {
+          this.rapidDisconnectCount += 1
+          if (this.rapidDisconnectCount >= 3) {
+            // 连续闪断时放弃旧 sessionId，改走 op=2 全新 Identify，避免死循环重放失效会话
+            this.sessionId = ''
+            this.lastSeq = null
+            this.rapidDisconnectCount = 0
+          }
+        }
         if (!this.deps.config().enabled || this.deps.config().mode !== 'ws') return
         this.scheduleReconnect(gen)
       })
@@ -423,9 +460,12 @@ export class QqSource {
     }
   }
 
-  private scheduleReconnect(gen: number): void {
+  private scheduleReconnect(gen: number, minDelayMs = 0): void {
     if (this.reconnectTimer || gen !== this.generation) return
-    const delayMs = Math.min(60_000, 3_000 * Math.max(1, ++this.reconnectAttempt))
+    const attempt = ++this.reconnectAttempt
+    const backoffMs = Math.min(120_000, 3_000 * Math.pow(2, Math.min(5, Math.max(0, attempt - 1))))
+    const cooldownMs = Math.max(0, this.rateLimitedUntilMs - Date.now())
+    const delayMs = Math.max(backoffMs, minDelayMs, cooldownMs)
     this.statusState = { ...this.statusState, state: 'connecting', since: new Date().toISOString() }
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined
@@ -469,9 +509,9 @@ export class QqSource {
     }
 
     if (pkt.op === 7) {
-      // 网关要求重连 Resume
+      // 网关要求重连 Resume，经过退避队列重连以防闪断死循环
       this.closeSocketOnly()
-      void this.connectWs(true)
+      this.scheduleReconnect(gen, 2_000)
       return
     }
 
@@ -550,7 +590,7 @@ export class QqSource {
 
     if (eventType === 'READY' || eventType === 'RESUMED') {
       if (typeof d?.session_id === 'string' && d.session_id) this.sessionId = d.session_id
-      this.reconnectAttempt = 0
+      this.connectedAtMs = Date.now()
       this.statusState = {
         ...this.statusState,
         state: 'connected',
@@ -558,7 +598,15 @@ export class QqSource {
         since: nowIso,
         lastError: undefined,
       }
-      this.emit({ kind: 'qq.ws', level: 'info', text: eventType === 'RESUMED' ? 'QQ 长连接已恢复' : 'QQ 长连接已就绪' })
+      if (eventType === 'READY') {
+        this.emit({ kind: 'qq.ws', level: 'info', text: 'QQ 长连接已就绪' })
+      } else {
+        const nowMs = Date.now()
+        if (nowMs - this.lastResumedEventLogMs >= 5 * 60_000) {
+          this.lastResumedEventLogMs = nowMs
+          this.emit({ kind: 'qq.ws', level: 'info', text: 'QQ 长连接已恢复' })
+        }
+      }
       return
     }
 

@@ -153,9 +153,26 @@ export function createSchedulerPlugin(scheduler: SchedulerService, opts: Schedul
     },
 
     directorQueries: {
-      schedules_list: () => {
-        const items = scheduler.list()
-        return { items, total: items.length }
+      schedules_list: args => {
+        const onlyEnabled = args.onlyEnabled === true
+        const includeFullPrompt = args.includeFullPrompt === true
+        const allItems = scheduler.list()
+        const filtered = onlyEnabled ? allItems.filter(item => item.enabled) : allItems
+        const items = includeFullPrompt
+          ? filtered
+          : filtered.map(item => {
+              const prompt = item.actionConfig?.prompt
+              if (typeof prompt !== 'string' || prompt.length <= 200) return item
+              return {
+                ...item,
+                actionConfig: {
+                  ...item.actionConfig,
+                  prompt: `${prompt.slice(0, 200)}…（共 ${prompt.length} 字，完整内容请调用 schedule_detail）`,
+                  promptLength: prompt.length,
+                },
+              }
+            })
+        return { items, total: allItems.length, shown: items.length }
       },
       schedule_detail: args => {
         const id = str(args.id)
@@ -186,17 +203,42 @@ export function createSchedulerPlugin(scheduler: SchedulerService, opts: Schedul
           if (!rawCfg.channel) rawCfg.channel = ctx.channel
           if (!rawCfg.userId) rawCfg.userId = ctx.userId
         }
+        const enabled = typeof args.enabled === 'boolean' ? args.enabled : true
+        const respectPause = typeof args.respectPause === 'boolean' ? args.respectPause : true
+        const cronExpr = str(args.cronExpr) || null
+        const intervalSec = args.intervalSec !== undefined ? Number(args.intervalSec) : null
+        const runAt = str(args.runAt) || null
+        // 防止总控/LLM 因工具调用异常重复创建同名周期定时任务
+        if (enabled && args.allowDuplicate !== true && (triggerKind === 'interval' || triggerKind === 'cron')) {
+          const existing = scheduler.list().find(s =>
+            s.enabled && s.name.trim() === name.trim() && (s.triggerKind === 'interval' || s.triggerKind === 'cron'),
+          )
+          if (existing) {
+            const updated = scheduler.update(existing.id, {
+              description: str(args.description) || existing.description,
+              enabled: true,
+              triggerKind,
+              cronExpr,
+              intervalSec,
+              runAt,
+              actionKind,
+              actionConfig: rawCfg,
+              respectPause,
+            })
+            return { ok: true, item: updated ?? existing, deduplicated: true }
+          }
+        }
         const item = scheduler.create({
           name,
           description: str(args.description),
-          enabled: typeof args.enabled === 'boolean' ? args.enabled : true,
+          enabled,
           triggerKind,
-          cronExpr: str(args.cronExpr) || null,
-          intervalSec: args.intervalSec !== undefined ? Number(args.intervalSec) : null,
-          runAt: str(args.runAt) || null,
+          cronExpr,
+          intervalSec,
+          runAt,
           actionKind,
           actionConfig: rawCfg,
-          respectPause: typeof args.respectPause === 'boolean' ? args.respectPause : true,
+          respectPause,
         })
         return { ok: true, item }
       },
