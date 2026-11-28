@@ -1683,6 +1683,54 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
       service.close()
     })
 
+    it('injects a code-level task routing advice into the system prompt and exposes platform_query(task_route)', async () => {
+      const env = setup()
+      const baseTicket = env.fake.host.ticket('t_alpha')!
+      const doneDir = join(env.dir, 'ws-export')
+      mkdirSync(doneDir, { recursive: true })
+      const exportSummary = { ...env.fake.host.listTickets({ status: 'all', limit: 5, offset: 0 }).items[0]!, id: 't_export', title: '导出销售报表为 CSV', status: 'ended' as const, updatedAt: new Date().toISOString() }
+      const host = {
+        ...env.fake.host,
+        listTickets: () => ({ total: 1, items: [exportSummary] }),
+        ticket: (id: string) => id === 't_export'
+          ? { ...baseTicket, ...exportSummary, prompt: { text: '把销售报表按月份导出成 CSV 文件', at: 't' }, workspace: { path: doneDir, exists: true, fileCount: 3 } }
+          : env.fake.host.ticket(id),
+      } as unknown as AdminHost
+
+      const systems: string[] = []
+      const toolOutputs: string[] = []
+      let turn = 0
+      const service = new DirectorService({
+        host,
+        options: env.options,
+        ledger: env.ledger,
+        events: env.events,
+        store: env.store,
+        redact: env.redact,
+        callTool: async (_target, req) => {
+          turn += 1
+          systems.push(req.system)
+          for (const m of req.messages) if (m.role === 'tool') toolOutputs.push(m.content)
+          if (turn === 1) {
+            return {
+              ok: true, status: 200, latencyMs: 5, text: '',
+              toolCalls: [{ id: 'r1', name: 'platform_query', arguments: { action: 'task_route', params_json: JSON.stringify({ text: '在导出销售报表的基础上再加一个 PDF 版本' }) } }],
+            }
+          }
+          return { ok: true, status: 200, latencyMs: 5, text: '好的。', toolCalls: [] }
+        },
+      })
+
+      await service.chat({ channel: 'web', userId: 'owner', text: '在之前导出销售报表的任务基础上再加一个 PDF 版本' })
+      // 系统提示词里带着本轮的路由预分析：点名相关旧工单并建议原地续做。
+      expect(systems[0]).toContain('任务路由预分析')
+      expect(systems[0]).toContain('t_export')
+      expect(systems[0]).toContain('原地续做')
+      // 显式查询工具返回同样的结构化建议。
+      expect(toolOutputs.join('\n')).toMatch(/action\\*"\s*:\s*\\*"continue[\s\S]*t_export|t_export[\s\S]*action\\*"\s*:\s*\\*"continue/)
+      service.close()
+    })
+
     it('treats Upstream response aborted as retryable and caps exponential backoff at 15s base', () => {
       expect(isRetryableNetworkError(new Error('Upstream response aborted'))).toBe(true)
       expect(isRetryableNetworkError(new Error('Client network socket disconnected before secure TLS connection was established'))).toBe(true)

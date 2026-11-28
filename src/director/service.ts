@@ -15,6 +15,7 @@ import type { EventLog } from '../ledger/events.ts'
 import type { Ledger } from '../ledger/ledger.ts'
 import { callToolModel, type AgentMessage, type ToolCall } from './llm.ts'
 import { buildDirectorSystemPrompt } from './prompt.ts'
+import { routeTask } from './router.ts'
 import { redactPendingAction, redactToolCallArgs } from './settings-patch.ts'
 import { DirectorStore, type DirectorChannel, type DirectorFollowup, type DirectorMessage, type DirectorSession, type FollowupTriggerKind, type PendingAction, type SessionListItem } from './store.ts'
 import { DirectorToolExecutor, type DirectorToolsDeps, type ToolRunResult } from './tools.ts'
@@ -1065,6 +1066,19 @@ export class DirectorService {
       focusTicketId: freshSession.focusTicketId,
     })
     const liveSnapshot = await this.buildLiveSnapshot()
+    // 代码级任务路由预分析：主人这句话是该续做旧工单、分叉、新建还是先问，零 Token 先算好再交给模型参考。
+    let routingAdvice: string | undefined
+    if (!input.autoTrigger && text.length >= 4 && !text.startsWith('/')) {
+      try {
+        routingAdvice = routeTask({
+          host: this.deps.host,
+          text,
+          ...(freshSession.focusTicketId ? { focusTicketId: freshSession.focusTicketId } : {}),
+          linkedTicketIds: this.store.linkedTicketIds(session.id),
+          now: this.doNow(),
+        }).prompt
+      } catch { /* 路由预分析只是辅助，任何异常都不能影响对话 */ }
+    }
     const systemPrompt = buildDirectorSystemPrompt({
       nowIso: this.doNow().toISOString(),
       channel: input.channel,
@@ -1073,6 +1087,7 @@ export class DirectorService {
       pendingFollowups,
       extraPrompt: cfg.extraPrompt,
       ...(liveSnapshot ? { liveSnapshot } : {}),
+      ...(routingAdvice ? { routingAdvice } : {}),
       ...(pluginSections && pluginSections.length > 0 ? { pluginSections } : {}),
     })
     const toolDefsJson = JSON.stringify(this.tools.definitions())

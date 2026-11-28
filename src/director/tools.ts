@@ -9,6 +9,7 @@
 import { existsSync, lstatSync, openSync, readSync, closeSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 import { readLatestPiSession } from '../executor/pi-sessions.ts'
+import { routeTask } from './router.ts'
 import type { AdminHost } from '../admin/host.ts'
 import { SshConnectionSchema, type OptionsStore } from '../admin/options.ts'
 import type { CouncilService } from '../council/service.ts'
@@ -361,6 +362,19 @@ export class DirectorToolExecutor {
             ...(contract ? { contract: { version: contract.version, goal: contract.goal, criteria: contract.criteria } } : {}),
             ...(receipt ? { receipt } : { deliverables }),
           })
+        }
+
+        case 'task_route': {
+          const text = str(args.text)
+          if (!text) return fail('缺少 text（要分析的需求原话）')
+          const result = routeTask({
+            host: this.deps.host,
+            text,
+            ...(ctx.session.focusTicketId ? { focusTicketId: ctx.session.focusTicketId } : {}),
+            linkedTicketIds: this.deps.store.linkedTicketIds(ctx.session.id),
+            now: new Date(),
+          })
+          return out({ advice: result.advice, summary: result.prompt })
         }
 
         case 'ticket_session_history': {

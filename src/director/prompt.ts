@@ -12,6 +12,8 @@ export interface PromptContext {
   extraPrompt?: string
   /** 由 Runtime 实时采集的低开销平台态势快照（活跃工单/就绪项目/进行中 DAG），免去首轮盲查。 */
   liveSnapshot?: string
+  /** 代码级「新任务 vs 续做旧工单」预分析结果（零 Token），只对本轮用户消息有效。 */
+  routingAdvice?: string
   /** 由 PluginRegistry 动态注入的附加段落（如长期记忆、可用技能库、插件工具速查）。 */
   pluginSections?: readonly string[]
 }
@@ -34,6 +36,7 @@ export function buildDirectorSystemPrompt(ctx: PromptContext): string {
     '   - 主人要求排查主机问题、查看日志/容器/文件、或在主机执行运维命令、重启服务、清理 Podman 镜像/容器时，使用 `host_ops`。',
     '   - 主人要求调整控制台**任何配置**（包括模型服务商增删改/模型清单增删改/API Key 设置与轮换/模型路由与自动选模、总控模型与重试次数、并发与沙箱资源、预算、受理策略与操作员白名单、飞书/邮箱/微信/GitHub 通道与凭据、联网搜索与 Exa Key、协作与会商角色、小说/目标/预览/项目限制、SSH 连接、密钥保险库、切换或删除 Pi/开发镜像、清理工作区/孤儿目录、删除/回滚项目等）时，调用 `high_risk_action`；其中模型服务商新增或同步前可先用 `platform_query(model_discover)` 自动拉取远端模型列表，改完后可用 `platform_query(model_test)` 测通。',
     '   - 需求模糊、缺少关键前提或有重大方案分歧时，先用 1~3 个简明问题与主人确认，或建议先开一次多角色会商（`council_start`）。',
+    '   - **自主决策与确认原则（不要每件小事都问主人）**：先看下方「任务路由预分析」，再结合事实自行判断「直答 / 原地续做旧工单 / 分叉承接 / 新建工单 / DAG 计划 / 会商」。**低风险且有把握 → 直接执行，事后用一句话汇报你选了什么、为什么**（例如「已在 #xxxx 上续做，因为这是你刚才那个任务」），主人觉得不对再纠正；**只有高风险（删除/清理/部署/重启/改配置/动密钥/覆盖原件）、有多个同样合理的选择、或要重开被主人手动停止的工单时才先问**，问的时候在回复末尾给出 2~3 个用「」包起来的选项，如 `请回复「续做 01620726」或「新建任务」`，系统会自动变成可点击按钮，主人点一下即可，不要让他打字。',
     '3. **持续跟进与自动续接铁律**：',
     '   - **禁止只口头承诺**：只要你对主人说「等这个任务/会商完成后我会自动做下一步（例如部署、重启服务、验收、切换镜像、发邮件、开下个工单等）」，**必须**在派单时填写 `dispatch_ticket(onComplete="...")`，或对已有工单/会商调用 `subsystem_action(followup_set)` 正式登记自动续接触发器！这样系统会在目标完成时自动唤醒你推进下一步，不需要主人再发指令催你。',
     '   - 当系统因自动续接唤醒你执行后续步骤时，请立即查验前置任务结果并直接调用工具推进（例如阅读交付物、派下一张单、执行部署或发起需主人回复「确认」的宿主机部署操作），并把「前置任务结果 + 下一步执行进展（或确认短码）」一次性清晰汇报给主人。',
@@ -53,7 +56,7 @@ export function buildDirectorSystemPrompt(ctx: PromptContext): string {
     '- `platform_query(action, params_json)` 控制台只读查询（无参传 `"{}"`）：',
     '  * 全局/设置/连通性：`platform_overview`、`system_status`、`orphans_list`、`settings_get({section?:"all"|"models"|"director"|"executor"|"budget"|"policy"|"feishu"|"qq"|"email"|"wechat"|"github"|"web"|"collab"|"council"|"novel"|"goal"|"preview"|"projects"|"ssh"})`、`policy_get`、`models_list`、`model_discover({provider?|baseUrl,api?,apiKey?,sessionHeader?})`、`model_test({ref})`、`channel_test({channel:"feishu"|"qq"|"email"|"wechat"|"github"})`、`wechat_qr_status`、`secrets_overview`、`ssh_list`',
     '  * Pi 与开发环境：`pi_status({force?})`、`devenv_status`',
-    '  * 工单：`tickets_list({status?,q?,limit?})`、`ticket_detail({ticketId})`、`ticket_diagnose({ticketId})`（一键聚合活动流/报错/验收证据/事件/自愈轮次，排障首选）、`ticket_receipt({ticketId})`（一键读取交付物/验收条件/证据/待办）、`ticket_activity({ticketId,limit?})`、`ticket_session_history({ticketId,limit?,maxChars?,includeTools?})`（读取 Pi 历史会话：对话摘要、工具调用、模型与统计，已结束工单也能看，续做/分叉前回顾用）、`ticket_files({ticketId,dir?})`、`ticket_read_file({ticketId,path,startLine?,maxLines?})`',
+    '  * 工单：`tickets_list({status?,q?,limit?})`、`ticket_detail({ticketId})`、`ticket_diagnose({ticketId})`（一键聚合活动流/报错/验收证据/事件/自愈轮次，排障首选）、`ticket_receipt({ticketId})`（一键读取交付物/验收条件/证据/待办）、`ticket_activity({ticketId,limit?})`、`ticket_session_history({ticketId,limit?,maxChars?,includeTools?})`（读取 Pi 历史会话：对话摘要、工具调用、模型与统计，已结束工单也能看，续做/分叉前回顾用）、`task_route({text})`（对一句需求做「续做旧工单/分叉/新建/先问」的代码级预分析，自动注入的提示不够用或收到主人用按钮选择后复核时用）、`ticket_files({ticketId,dir?})`、`ticket_read_file({ticketId,path,startLine?,maxLines?})`',
     '  * 账本/日志：`usage_summary({range?:"today"|"7d"|"30d"})`、`usage_calls({ticketId?,limit?})`、`events_list({level?,ticketId?,limit?})`、`decisions_list({limit?})`',
     '  * 项目库：`projects_list`、`project_detail({projectId})`、`project_files({projectId,dir?})`、`project_read_file({projectId,path,startLine?,maxLines?})`、`project_snapshots({projectId,limit?})`、`project_snapshot_diff({projectId,from,to?})`',
     '  * 小说/会商/防御与渗透/搜索：`novels_list`、`novel_detail({bookId,includeAllOutlines?})`、`novel_chapter({bookId,chapter,includeText?})`、`novel_canon_get({bookId})`、`fanqie_status({bookId?})`、`councils_list({ticketId?,limit?})`、`council_detail({councilId})`、`pentest_list`、`pentest_detail({engagementId})`、`security_task_status({taskId?|engagementId?})`、`web_search({query,count?})`',
@@ -114,6 +117,10 @@ export function buildDirectorSystemPrompt(ctx: PromptContext): string {
 
   if (ctx.liveSnapshot && ctx.liveSnapshot.trim()) {
     lines.push('', '## 平台实时态势快照（已预载，可直接引用 ID）', ctx.liveSnapshot.trim())
+  }
+
+  if (ctx.routingAdvice && ctx.routingAdvice.trim()) {
+    lines.push('', '## 任务路由预分析（代码级，本轮有效）', ctx.routingAdvice.trim())
   }
 
   if (ctx.session.summary.trim()) {

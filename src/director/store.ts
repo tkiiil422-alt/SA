@@ -568,6 +568,12 @@ export class DirectorStore {
     this.updateSession(session.id, { focusTicketId: ticketId })
   }
 
+  /** 本会话关联过的工单编号，最近关联的在前（用于任务路由预分析）。 */
+  linkedTicketIds(sessionId: string, limit = 5): string[] {
+    const rows = this.db.prepare('SELECT ticket_id FROM director_ticket_links WHERE session_id = ? ORDER BY created_at DESC LIMIT ?').all(sessionId, limit) as { ticket_id: string }[]
+    return rows.map(r => r.ticket_id)
+  }
+
   linksForTicket(ticketId: string): TicketLink[] {
     const rows = this.db.prepare('SELECT * FROM director_ticket_links WHERE ticket_id = ? ORDER BY created_at DESC').all(ticketId) as Record<string, string>[]
     return rows.map(r => ({
