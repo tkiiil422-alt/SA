@@ -98,7 +98,8 @@ export function listPiSessionFiles(piConfigDir: string): PiSessionFileInfo[] {
       } catch { /* 文件刚被删除，忽略 */ }
     }
   }
-  return found.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt))
+  // 最近修改的在前；修改时间相同时按文件名（以时间戳开头）倒序，保证结果稳定。
+  return found.sort((a, b) => b.modifiedAt.localeCompare(a.modifiedAt) || basename(b.file).localeCompare(basename(a.file)))
 }
 
 /** 读取并解析一个会话文件，返回统计摘要和最近 `limit` 条对话（system 消息与 thinking 不返回）。 */
