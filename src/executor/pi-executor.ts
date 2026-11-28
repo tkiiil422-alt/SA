@@ -253,12 +253,16 @@ export class PiExecutor implements Executor {
         if (!this.current(ticketId, assignmentId)) { this.release(ticketId); return }
         // A ticket whose earlier Assignment started has a Session in Pi's state directory; a restart or a retry continues it.
         // A first launch has none, so it starts fresh.
-        entry = await this.spawn(ticket, assignment, this.hasSession(ticket, assignment))
+        const resumed = this.hasSession(ticket, assignment)
+        entry = await this.spawn(ticket, assignment, resumed)
         this.activate(ticketId)
         if (this.closed || !this.current(ticketId, assignmentId)) { this.stopEntry(entry); return }
         this.call(() => this.options.engine().assignmentStarted(ticketId, assignmentId))
         if (!this.current(ticketId, assignmentId)) { this.stopEntry(entry); return }
-        const disposition = await entry.client.prompt(this.assignmentMessage(ticket))
+        // 续接旧会话且已有等待投递的新指令时，只发精简提示，不再把最初的需求原文重发一遍：
+        // 旧需求已经在 Pi 的历史会话里，重发会让它误以为要把旧任务从头再做。
+        const latest = this.options.tickets.get(ticketId) ?? ticket
+        const disposition = await entry.client.prompt(this.assignmentMessage(latest, resumed && latest.undelivered.length > 0))
         entry.streaming = disposition !== 'handled'
         if (entry.streaming) this.armWatchdog(entry)
         // `handled` means Pi started no run, so no `agent_settled` will arrive to free the slot.
@@ -359,7 +363,9 @@ export class PiExecutor implements Executor {
       entry = await this.spawn(ticket, assignment, true)
       this.activate(ticket.id)
       if (this.closed || !this.running(ticket.id, assignment.id)) { this.stopEntry(entry); throw new Later(SLOT_RETRY_MS) }
-      const disposition = await entry.client.prompt(this.assignmentMessage(ticket))
+      // 唤醒的进程总是带着 `--continue`，旧需求已在会话里；把刚到的新输入留给随后的投递，不重发需求原文。
+      const woken = this.options.tickets.get(ticket.id) ?? ticket
+      const disposition = await entry.client.prompt(this.assignmentMessage(woken, woken.undelivered.length > 0))
       entry.streaming = disposition !== 'handled'
       if (entry.streaming) this.armWatchdog(entry)
       // `handled` means Pi started no run, so no `agent_settled` will arrive to free the slot.
@@ -709,8 +715,25 @@ export class PiExecutor implements Executor {
 
   // Messages
 
-  private assignmentMessage(ticket: Ticket): string {
+  /**
+   * 工单交给 Pi 的第一条消息。`resumed` 为 true 时表示 Pi 在续接这张工单自己的历史会话：只给出身份信息和
+   * 续接说明，需求原文和之前的进展都在会话历史里，真正要做的事由紧随其后投递的新输入决定。
+   */
+  private assignmentMessage(ticket: Ticket, resumed = false): string {
     const trigger = this.options.triggers?.get(ticket.origin.triggerId)
+    if (resumed) {
+      return JSON.stringify({
+        ticket_id: ticket.id,
+        trigger_id: ticket.origin.triggerId,
+        title: ticket.title,
+        scope: ticket.mandate.scope,
+        resumed: true,
+        note: 'This ticket continues your earlier session, so the original request and your progress are already in your history. '
+          + 'Do not redo finished work or treat the original request as new. Act on the new input that follows this message, '
+          + 'continue in the same workspace, and report when it is done.',
+        ...(trigger ? { from: trigger.actor.id, thread: threadKey(trigger.threads[0]!) } : {}),
+      })
+    }
     const request = trigger?.text ?? ticket.execution?.assignment ?? ticket.title
     return JSON.stringify({
       ticket_id: ticket.id,

@@ -53,6 +53,7 @@ import { allowedSender, assessmentOutcome, settingsPolicy } from './policy.ts'
 import { SqliteRepositories } from './store/sqlite.ts'
 import { Effects } from './effects/effects.ts'
 import { PiExecutor } from './executor/pi-executor.ts'
+import { copyLatestSessionForFork } from './executor/pi-sessions.ts'
 import { MultiRunnerExecutor, type TicketRunnerSelection } from './executor/runner-executor.ts'
 import { ActivityLog } from './executor/activity.ts'
 import { FanqieService } from './fanqie/service.ts'
@@ -293,6 +294,8 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     const collabChoices = new CollabChoices(repo.db)
     /** Secrets requested with a new ticket, keyed by its trigger id until the first launch grants them. */
     const pendingSecrets = new Map<string, string[]>()
+    /** 分叉承接的来源工单，按新工单的 trigger id 登记，直到它的会话真正开始（续接）为止。 */
+    const pendingForks = new Map<string, string>()
     const optionsStore = new OptionsStore(join(stateDir, 'options.json'), defaults)
     // Projects live on the runtime database; construction also recovers an interrupted extraction and stale uploads.
     const projects = new ProjectService({
@@ -1577,9 +1580,30 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         const pluginPromptArgs = pluginPrompts.length > 0
           ? ['--append-system-prompt', pluginPrompts.join('\n\n')]
           : []
+        // 分叉承接：新工单首次启动前，把来源工单最新的 Pi 会话复制进自己的配置目录，再用 `--fork <sessionId>` 继承；
+        // 会话一旦开始（resume 为真）就改回普通 `--continue`，不再需要登记。
+        let forkArgs: string[] = []
+        const forkFrom = pendingForks.get(ticket.origin.triggerId)
+        if (forkFrom) {
+          if (context.resume) {
+            pendingForks.delete(ticket.origin.triggerId)
+          } else {
+            try {
+              const forked = copyLatestSessionForFork(join(stateDir, 'pi-config', forkFrom), directory)
+              if (forked) {
+                forkArgs = ['--fork', forked.sessionId]
+                try { events.add({ kind: 'ticket.forked', level: 'info', ticketId: ticket.id, text: `承接工单 ${forkFrom} 的 Pi 会话历史（${forked.sessionId}）`, data: { fromTicketId: forkFrom, sessionId: forked.sessionId } }) } catch { /* best effort */ }
+              } else {
+                try { events.add({ kind: 'ticket.fork_failed', level: 'warn', ticketId: ticket.id, text: `工单 ${forkFrom} 没有可继承的 Pi 会话，新工单将从头开始` }) } catch { /* best effort */ }
+              }
+            } catch (error) {
+              console.error(`superagentd: session fork failed: ${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
+        }
         return {
           command: config.launcher.command,
-          args: [...launchArgs(config.launcher.args, picked.ref, context.resume), ...goalArgs(ticket.id), ...pluginPromptArgs],
+          args: [...launchArgs(config.launcher.args, picked.ref, context.resume), ...forkArgs, ...goalArgs(ticket.id), ...pluginPromptArgs],
           env: {
             ...config.launcher.env,
             // The console's Pi version page switches this; it wins over the config file so the switch takes effect.
@@ -1861,7 +1885,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
     cleanup.push(() => qq.stop())
 
     const sleep = (ms: number): Promise<void> => new Promise(resolveSleep => setTimeout(resolveSleep, ms))
-    const ask = async (text: string, opts: { model?: string; secrets?: string[]; projectId?: string; projectMode?: ProjectMode; collab?: boolean; goal?: GoalSpec; novel?: { bookId: string; arc: number }; runner?: TicketRunnerSelection } = {}): Promise<AskResult> => {
+    const ask = async (text: string, opts: { model?: string; secrets?: string[]; projectId?: string; projectMode?: ProjectMode; collab?: boolean; goal?: GoalSpec; novel?: { bookId: string; arc: number }; runner?: TicketRunnerSelection; forkFrom?: string } = {}): Promise<AskResult> => {
       let personRef: ModelRef | undefined
       if (opts.model !== undefined) {
         const parsedRef = parseRef(opts.model)
@@ -1873,6 +1897,8 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       if (personRef) choices.set(trigger.id, { ...personRef, source: 'person' })
       // Secrets chosen at creation must be in place before the first launch, which can run before `ask` returns.
       if (opts.secrets && opts.secrets.length > 0) pendingSecrets.set(trigger.id, [...new Set(opts.secrets)])
+      // 分叉承接旧工单的会话：同样按 trigger id 登记，首次启动时把旧会话复制过来并用 `--fork` 继承。
+      if (opts.forkFrom) pendingForks.set(trigger.id, opts.forkFrom)
       // The project is keyed by trigger id for the same reason: the launch can happen before the ticket id is known.
       if (opts.projectId !== undefined) projects.setPending(trigger.id, opts.projectId, opts.projectMode ?? 'copy')
       // Collaboration is on unless switched off for this ticket; the launch reads the choice by trigger id.
@@ -1918,6 +1944,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
       }
       if (result.ticketId === undefined) {
         pendingSecrets.delete(trigger.id)
+        pendingForks.delete(trigger.id)
       }
       if (opts.projectId !== undefined) {
         if (result.ticketId !== undefined) projects.bindTicket(result.ticketId, opts.projectId, opts.projectMode)
@@ -2144,7 +2171,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         if (cfg.enabled && cfg.mode === 'ws') await feishuWs.restart()
         else feishuWs.stop()
       },
-      ask: (text, model, secrets, projectId, collab, goal, projectMode, runner) => ask(text, {
+      ask: (text, model, secrets, projectId, collab, goal, projectMode, runner, forkFrom) => ask(text, {
         ...(goal === undefined ? {} : { goal }),
         ...(model === undefined ? {} : { model }),
         ...(secrets === undefined ? {} : { secrets }),
@@ -2152,6 +2179,7 @@ export async function createRuntime(config: Config): Promise<Runtime> {
         ...(projectMode === undefined ? {} : { projectMode }),
         ...(collab === undefined ? {} : { collab }),
         ...(runner === undefined ? {} : { runner }),
+        ...(forkFrom === undefined ? {} : { forkFrom }),
       }),
       reply: replyOnTicket,
       goalReplied: ticketId => { goals.personReplied(ticketId) },

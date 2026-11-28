@@ -598,7 +598,7 @@ export interface AdminHost {
    * `projectMode: 'direct'` mounts the project library's original tree instead (edits are saved to the library); only
    * one open ticket may edit the same project directly.
    */
-  createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree', runner?: TicketRunnerInput): Promise<CreateTicketResult>
+  createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree', runner?: TicketRunnerInput, forkFromTicketId?: string): Promise<CreateTicketResult>
 
   /** Every stored secret, metadata only, sorted by name. */
   listSecrets(): SecretListItemView[]
@@ -758,6 +758,9 @@ export interface AdminHost {
 
   /** The resolved absolute workspace root of a ticket, or undefined when the ticket has none; the API confines reads to it. */
   workspaceRoot(id: string): string | undefined
+
+  /** 某张工单的 Pi 配置目录（内含 `sessions/` 历史会话）；工单或目录不存在时返回 undefined。 */
+  piConfigDir?(id: string): string | undefined
 
   /** Titles for a set of ticket ids, used to label the usage page's top tickets. */
   ticketTitles(ids: readonly string[]): Record<string, string>

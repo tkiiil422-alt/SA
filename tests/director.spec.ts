@@ -1611,6 +1611,78 @@ describe('director service, tools, high-risk confirmation & wechat bridge', () =
       service.close()
     })
 
+    it('continues work on an earlier ticket: reopens ended tickets via ticket_reply, guards cleaned workspaces, reads Pi session history and forks with fromTicketId', async () => {
+      const env = setup()
+      const doneDir = join(env.dir, 'ws-done')
+      mkdirSync(doneDir, { recursive: true })
+      const cfgDir = join(env.dir, 'pi-cfg-done')
+      const sessionGroup = join(cfgDir, 'sessions', '--workspace--')
+      mkdirSync(sessionGroup, { recursive: true })
+      writeFileSync(join(sessionGroup, '2026-11-14T21-56-18-888Z_sess-done-1.jsonl'), [
+        { type: 'session', version: 3, id: 'sess-done-1', timestamp: '2026-11-14T21:56:18.888Z', cwd: '/workspace' },
+        { type: 'message', id: 'u1', timestamp: '2026-11-14T21:56:20.000Z', message: { role: 'user', content: [{ type: 'text', text: '把报表导出成 CSV' }] } },
+        { type: 'message', id: 'a1', timestamp: '2026-11-14T21:56:50.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'CSV 导出已完成' }] } },
+      ].map(line => JSON.stringify(line)).join('\n'))
+
+      const baseTicket = env.fake.host.ticket('t_alpha')!
+      const replies: Array<{ id: string; text: string }> = []
+      const forkCreates: unknown[][] = []
+      const host = {
+        ...env.fake.host,
+        ticket: (id: string) => (id === 't_done' || id === 't_gone') ? { ...baseTicket, id, status: 'ended' as const } : env.fake.host.ticket(id),
+        workspaceRoot: (id: string) => id === 't_done' ? doneDir : id === 't_gone' ? join(env.dir, 'missing-ws') : env.fake.host.workspaceRoot(id),
+        piConfigDir: (id: string) => id === 't_done' ? cfgDir : undefined,
+        replyTicket: (id: string, text: string) => { replies.push({ id, text }) },
+        createTicket: async (...args: unknown[]) => {
+          forkCreates.push(args)
+          return { ticketId: 't_forked', triggerId: 'tr_forked', threadId: 'th', threadKey: 'cli:th', decision: 'accept' }
+        },
+      } as unknown as AdminHost
+
+      let turn = 0
+      const toolOutputs: string[] = []
+      const service = new DirectorService({
+        host,
+        options: env.options,
+        ledger: env.ledger,
+        events: env.events,
+        store: env.store,
+        redact: env.redact,
+        callTool: async (_target, req) => {
+          turn += 1
+          for (const m of req.messages) if (m.role === 'tool') toolOutputs.push(m.content)
+          if (turn === 1) {
+            return {
+              ok: true, status: 200, latencyMs: 5, text: '',
+              toolCalls: [
+                { id: 'c1', name: 'ticket_manage', arguments: { action: 'ticket_reply', ticketId: 't_done', params_json: JSON.stringify({ text: '在原来基础上再加一个导出功能', onComplete: '验收通过后部署' }) } },
+                { id: 'c2', name: 'ticket_manage', arguments: { action: 'ticket_reply', ticketId: 't_gone', params_json: JSON.stringify({ text: '继续做' }) } },
+                { id: 'c3', name: 'platform_query', arguments: { action: 'ticket_session_history', params_json: JSON.stringify({ ticketId: 't_done' }) } },
+                { id: 'c4', name: 'dispatch_ticket', arguments: { prompt: '基于旧结论做 PDF 版', fromTicketId: 't_done' } },
+              ],
+            }
+          }
+          return { ok: true, status: 200, latencyMs: 5, text: '已在原工单续做并分叉了新单。', toolCalls: [] }
+        },
+      })
+
+      const res = await service.chat({ channel: 'web', userId: 'owner', text: '在之前那个导出任务上继续' })
+      expect(res.reply).toContain('已在原工单续做')
+      // 已结束但工作区仍在：原地重新打开，新要求原样交给原工单。
+      expect(replies).toEqual([{ id: 't_done', text: '在原来基础上再加一个导出功能' }])
+      expect(toolOutputs.join('\n')).toMatch(/"reopened":\s*true[\s\S]*onCompleteRegistered|onCompleteRegistered[\s\S]*"reopened":\s*true/)
+      // 工作区已清理的已结束工单不会被原地重开，而是提示改用 fromTicketId 分叉。
+      expect(toolOutputs.some(t => t.includes('工作区已被清理') && t.includes('fromTicketId'))).toBe(true)
+      // 历史会话可读，且不含系统/思考内容。
+      expect(toolOutputs.some(t => t.includes('把报表导出成 CSV') && t.includes('sess-done-1'))).toBe(true)
+      // 分叉派单：来源工单 id 作为第 9 个参数传给 createTicket，并带上承接说明。
+      expect(forkCreates).toHaveLength(1)
+      expect(String(forkCreates[0]![0])).toContain('【承接工单 t_done】')
+      expect(String(forkCreates[0]![0])).toContain('基于旧结论做 PDF 版')
+      expect(forkCreates[0]![8]).toBe('t_done')
+      service.close()
+    })
+
     it('treats Upstream response aborted as retryable and caps exponential backoff at 15s base', () => {
       expect(isRetryableNetworkError(new Error('Upstream response aborted'))).toBe(true)
       expect(isRetryableNetworkError(new Error('Client network socket disconnected before secure TLS connection was established'))).toBe(true)

@@ -591,8 +591,46 @@ describe('PiExecutor', () => {
       expect(resumed).toHaveLength(2)
       expect(resumed[0]!.resume).toBe(false)
       expect(resumed[1]!.resume).toBe(true)
+      // 唤醒时只给精简的续接提示，旧需求原文留在 Pi 的历史会话里。
+      const wake = JSON.parse(logRecords(log).filter(record => record.command === 'prompt')[2]!.message!) as Record<string, unknown>
+      expect(wake).toMatchObject({ resumed: true, ticket_id: ticketId })
+      expect(wake).not.toHaveProperty('request')
     })
   }
+
+  it('reopens an ended ticket with a compact resumed prompt instead of resending the original request', async () => {
+    const directory = tempDir()
+    const log = join(directory, 'pi.log')
+    const exits = join(directory, 'exit.log')
+    const script = join(directory, 'idle-pi.mjs')
+    writeFileSync(script, IDLE_PI)
+    const system = createSystem(':memory:', {
+      script,
+      maxSlots: 1,
+      env: () => ({ FAKE_PI_LOG: log, FAKE_PI_EXIT_LOG: exits }),
+    })
+    const ticketId = accept(system, '1', 't1', 'A')
+    await until(() => !!running(system, ticketId), 'the assignment to run')
+    await until(() => logRecords(log).some(record => record.command === 'prompt'), 'the first prompt')
+    // The first launch carries the full original request.
+    const first = JSON.parse(logRecords(log).find(record => record.command === 'prompt')!.message!) as Record<string, unknown>
+    expect(first).toMatchObject({ request: 'message 1' })
+    expect(first.resumed).toBeUndefined()
+
+    system.engine.report(ticketId, { state: 'ready', summary: 'done' })
+    await until(() => system.repo.tickets.get(ticketId)!.ended !== undefined, 'the ticket to end')
+    await until(() => exitRecords(exits).length >= 1, 'the worker to exit')
+
+    system.engine.instruct(ticketId, '在原来的基础上再加一个导出功能')
+    await until(() => logRecords(log).filter(record => record.command === 'prompt').length >= 2, 'the resumed prompt')
+    const second = JSON.parse(logRecords(log).filter(record => record.command === 'prompt')[1]!.message!) as Record<string, unknown>
+    expect(second).toMatchObject({ resumed: true, ticket_id: ticketId })
+    expect(second).not.toHaveProperty('request')
+    // The new instruction itself still reaches the worker.
+    await until(() => logRecords(log).some(record => record.message?.includes('再加一个导出功能')), 'the new instruction')
+    const launches = system.launches.filter(launch => launch.ticketId === ticketId)
+    expect(launches.at(-1)!.resume).toBe(true)
+  })
 
   it('does not exit an idle worker after a progress report', async () => {
     const directory = tempDir()

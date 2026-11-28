@@ -24,6 +24,7 @@ import { decisionKindLabel, reasonLabels, ticketStatusLabel } from '../labels.ts
 import type { EventLevel } from '../../ledger/events.ts'
 import type { UsageRange } from '../../ledger/ledger.ts'
 import { GoalError, resolveGoal, type GoalSpec } from '../../goal/service.ts'
+import { readLatestPiSession } from '../../executor/pi-sessions.ts'
 import { runBrowserVerify } from '../../verify/browser.ts'
 import type { AdminRouteDeps, AdminRouteRequest } from './types.ts'
 
@@ -281,6 +282,21 @@ export async function handleTicketsAndAuditRoutes(deps: AdminRouteDeps, { req, r
     const after = clampInt(url.searchParams.get('after'), 0, 0, Number.MAX_SAFE_INTEGER)
     const limit = clampInt(url.searchParams.get('limit'), 120, 1, 300)
     sendJson(res, 200, activity ? activity.list(id, after, limit) : { items: [], last: 0 })
+    return true
+  }
+
+  const sessionMatch = /^\/tickets\/([^/]+)\/session$/.exec(route)
+  if (sessionMatch !== null && method === 'GET') {
+    const id = decodeSegment(sessionMatch[1] ?? '')
+    if (id === undefined) { sendJson(res, 400, { error: 'invalid_path', message: '任务票编号不合法。' }); return true }
+    if (host.ticket(id) === undefined) { sendJson(res, 404, { error: 'not_found', message: '找不到这张任务票。' }); return true }
+    const dir = host.piConfigDir?.(id)
+    const view = dir ? readLatestPiSession(dir, {
+      limit: clampInt(url.searchParams.get('limit'), 30, 1, 200),
+      maxChars: clampInt(url.searchParams.get('maxChars'), 800, 80, 6000),
+      includeTools: url.searchParams.get('tools') === '1',
+    }) : undefined
+    sendJson(res, 200, view ? { exists: true, ...view } : { exists: false, sessions: 0, messages: [] })
     return true
   }
 

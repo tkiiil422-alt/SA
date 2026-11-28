@@ -10,7 +10,7 @@ import type { PluginRegistry } from '../plugins/registry.ts'
 const BASE_QUERY_ACTIONS = [
   'platform_overview', 'system_status', 'orphans_list', 'plugins_list',
   'pi_status', 'devenv_status',
-  'tickets_list', 'ticket_detail', 'ticket_receipt', 'ticket_diagnose', 'ticket_activity', 'ticket_files', 'ticket_read_file',
+  'tickets_list', 'ticket_detail', 'ticket_receipt', 'ticket_diagnose', 'ticket_activity', 'ticket_session_history', 'ticket_files', 'ticket_read_file',
   'usage_summary', 'usage_calls', 'events_list', 'decisions_list',
   'projects_list', 'project_detail', 'project_files', 'project_read_file', 'project_snapshots', 'project_snapshot_diff',
   'novels_list', 'novel_detail', 'novel_chapter', 'novel_canon_get', 'fanqie_status',
@@ -103,13 +103,14 @@ export function buildDirectorToolDefinitions(plugins?: PluginRegistry): readonly
           goal_json: { type: 'string', description: '可选：目标验收 JSON 字符串，格式 {"description":"...","criteria":["..."],"commands":["..."],"requireEvidence":true,"maxRounds":8,"maxUsd":3}' },
           onComplete: { type: 'string', description: '可选：该工单完成后自动唤醒总控执行的下一步动作说明（如“核验测试通过后执行主机部署并重启服务”）。填写后系统会在工单结束时自动唤醒你执行，无需主人再发指令！' },
           onFailure: { type: 'string', enum: ['report', 'continue'], description: '可选：配合 onComplete 使用，report（默认）表示若工单失败仅分析汇报；continue 表示无论成败都按 onComplete 继续处理' },
+          fromTicketId: { type: 'string', description: '可选：承接某张旧工单——新工单会分叉继承它最新的 Pi 会话历史（之前的调研、决策与结论都记得），但使用全新工作区。仅当旧工单工作区已清理/已合并归档，或想在独立新分支上延伸时使用；旧工单工作区还在时优先用 ticket_manage(ticket_reply) 原地续做。' },
         },
         required: ['prompt'],
       },
     },
     {
       name: 'ticket_manage',
-      description: '管理与跟进已有工单：回复人工决策、追加备注、重试、停止、设置或取消验收目标。',
+      description: '管理与跟进已有工单：回复人工决策、追加备注、重试、停止、设置或取消验收目标。**主人对之前的任务提出新要求/追加需求时，优先用 ticket_reply 在原工单上续做**——已完成、已停止、失败的工单都能被重新打开，Pi 会续接原会话记忆与原工作区，无需重建新工单（params_json 还可带 goal 新验收标准、onComplete/onFailure 登记完成后自动续接）。',
       parameters: {
         type: 'object',
         properties: {
@@ -121,7 +122,7 @@ export function buildDirectorToolDefinitions(plugins?: PluginRegistry): readonly
           ticketId: { type: 'string', description: '目标工单 ID' },
           params_json: {
             type: 'string',
-            description: '附加参数 JSON 字符串（无参数传 "{}"）：reply/note 传 {"text":"...","model":"?"}；stop 传 {"reason":"..."}；goal_set 传 {"description":"...","criteria":[],"commands":[]}',
+            description: '附加参数 JSON 字符串（无参数传 "{}"）：reply 传 {"text":"...","model":"?","goal":{"description":"...","criteria":[],"commands":[]},"onComplete":"?","onFailure":"report|continue"}（原工单续做时 goal/onComplete 可选）；note 传 {"text":"..."}；stop 传 {"reason":"..."}；goal_set 传 {"description":"...","criteria":[],"commands":[]}',
           },
         },
         required: ['action', 'ticketId', 'params_json'],

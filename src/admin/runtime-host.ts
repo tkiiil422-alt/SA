@@ -111,7 +111,7 @@ export interface RuntimeAdminDeps {
   /** The Source scope used when a policy change revalidates open mandates. */
   source: SourceScope
   /** Accept a sentence as a ticket, exactly like `sa ask`; `model` is an optional "provider/model" person choice. */
-  ask(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree', runner?: TicketRunnerInput): Promise<CreateTicketResult>
+  ask(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree', runner?: TicketRunnerInput, forkFromTicketId?: string): Promise<CreateTicketResult>
   /** Answer on the ticket's original thread as a person. */
   reply(ticketId: string, text: string): void
   /** Feishu connection test; absent when the runtime has no Feishu source. */
@@ -783,7 +783,12 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
       return deps.previews?.list(id) ?? []
     },
 
-    async createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree', runner?: TicketRunnerInput): Promise<CreateTicketResult> {
+    async createTicket(text: string, model?: string, secrets?: string[], projectId?: string, collab?: boolean, goal?: GoalSpec, projectMode?: 'copy' | 'direct' | 'worktree', runner?: TicketRunnerInput, forkFromTicketId?: string): Promise<CreateTicketResult> {
+      if (forkFromTicketId !== undefined && !deps.repo.tickets.get(forkFromTicketId)) {
+        throw new AdminError('invalid', '提交的内容有误，请检查标出来的字段。', 400, {
+          issues: [{ path: 'fromTicketId', message: `找不到要承接的工单：${forkFromTicketId}` }],
+        })
+      }
       // Validate before accepting: a bad name or an unready project must not leave a ticket behind.
       if (secrets !== undefined) {
         const missing = [...new Set(secrets)].filter(name => !deps.vault.has(name))
@@ -813,7 +818,7 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
       let result: CreateTicketResult
       try {
         // Secrets and the project go in with the message so the first launch already has them.
-        result = await deps.ask(text, model, secrets, projectId, collab, goal, projectMode, runner)
+        result = await deps.ask(text, model, secrets, projectId, collab, goal, projectMode, runner, forkFromTicketId)
       } catch (error) {
         if (error instanceof InvalidModelError) throw new AdminError('invalid', error.message, 400, { issues: error.issues })
         mapUserError(error)
@@ -1425,6 +1430,13 @@ export function createRuntimeAdminHost(deps: RuntimeAdminDeps): AdminHost {
 
     workspaceRoot(id: string): string | undefined {
       return workspacePath(id)
+    },
+
+    piConfigDir(id: string): string | undefined {
+      if (!TICKET_ID.test(id) || !deps.repo.tickets.get(id)) return undefined
+      const dir = resolve(deps.piConfigRoot, id)
+      const info = lstatSafe(dir)
+      return info?.isDirectory() && !info.isSymbolicLink() ? dir : undefined
     },
 
     ticketTitles(ids: readonly string[]): Record<string, string> {

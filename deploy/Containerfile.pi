@@ -1,6 +1,6 @@
 # Pi coding agent worker image, one image for every ticket kind.
 #
-# Build:  podman build -f deploy/Containerfile.pi -t localhost/superagent-pi:1.6.0 deploy/
+# Build:  podman build -f deploy/Containerfile.pi -t localhost/superagent-pi:1.7.0 deploy/
 # The image carries only Pi and the tools a worker is allowed to call. It holds no credentials: the ticket token and
 # the gateway/MCP URLs arrive as environment variables at `podman run` time.
 # BASE_IMAGE is the development image (`Containerfile.dev`, built on the console's 开发环境 page); without one the plain
@@ -37,7 +37,7 @@ RUN git config --system credential.https://github.com.helper '!f() { test "$1" =
 # Pin the agent version: an unpinned update would silently change the RPC protocol under the executor.
 # Try configured NPM_REGISTRY first with retries; if a mirror has not synced a freshly published version or fails,
 # automatically fall back to the official npm registry so transient ECONNRESET / mirror lag does not fail the build.
-ARG PI_VERSION=1.6.0
+ARG PI_VERSION=1.7.0
 RUN set -eux; \
   install_pi() { \
     reg="$1"; \

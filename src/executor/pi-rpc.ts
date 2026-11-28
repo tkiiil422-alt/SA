@@ -307,6 +307,48 @@ export class PiRpcClient {
     return response.data as unknown as PiSessionState
   }
 
+  /** Token 用量、费用与上下文占用统计（Pi RPC `get_session_stats`）。 */
+  async getSessionStats(): Promise<Record<string, unknown>> {
+    const response = await this.sendCommand({ type: 'get_session_stats' })
+    return isRecord(response.data) ? response.data : {}
+  }
+
+  /**
+   * 按追加顺序读取会话条目（含压缩前历史与被放弃的分支）。`since` 是已读到的最后一条 entry id，
+   * 只返回它之后的条目，可作为跨重启的持久游标；`leafId` 为当前叶子，`null` 表示空会话。
+   */
+  async getEntries(since?: string): Promise<{ entries: unknown[]; leafId: string | null }> {
+    const response = await this.sendCommand(since === undefined ? { type: 'get_entries' } : { type: 'get_entries', since })
+    const data = isRecord(response.data) ? response.data : {}
+    return {
+      entries: Array.isArray(data.entries) ? data.entries : [],
+      leafId: typeof data.leafId === 'string' ? data.leafId : null,
+    }
+  }
+
+  /** 把当前会话导出为 HTML，返回写出的文件路径。 */
+  async exportHtml(outputPath?: string): Promise<string | undefined> {
+    const response = await this.sendCommand(outputPath === undefined ? { type: 'export_html' } : { type: 'export_html', outputPath })
+    return isRecord(response.data) && typeof response.data.path === 'string' ? response.data.path : undefined
+  }
+
+  /** 切换到另一个会话文件；扩展取消切换时返回 `cancelled: true`。 */
+  async switchSession(sessionPath: string): Promise<{ cancelled: boolean }> {
+    const response = await this.sendCommand({ type: 'switch_session', sessionPath })
+    return { cancelled: isRecord(response.data) && response.data.cancelled === true }
+  }
+
+  /** 把当前活动分支复制为一个新会话（Pi RPC `clone`）。 */
+  async cloneSession(): Promise<{ cancelled: boolean }> {
+    const response = await this.sendCommand({ type: 'clone' })
+    return { cancelled: isRecord(response.data) && response.data.cancelled === true }
+  }
+
+  /** 给当前会话设置显示名，便于在会话列表里辨认。 */
+  async setSessionName(name: string): Promise<void> {
+    await this.sendCommand({ type: 'set_session_name', name })
+  }
+
   /** Subscribe to every non-response stdout record. Returns an unsubscribe function. */
   onEvent(listener: PiEventListener): () => void {
     this.eventListeners.add(listener)

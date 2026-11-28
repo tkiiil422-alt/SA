@@ -6,8 +6,9 @@
  *
  * 永久禁区：不提供读取明文密钥或修改控制台登录密码的工具。
  */
-import { lstatSync, openSync, readSync, closeSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { existsSync, lstatSync, openSync, readSync, closeSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
+import { readLatestPiSession } from '../executor/pi-sessions.ts'
 import type { AdminHost } from '../admin/host.ts'
 import { SshConnectionSchema, type OptionsStore } from '../admin/options.ts'
 import type { CouncilService } from '../council/service.ts'
@@ -359,6 +360,30 @@ export class DirectorToolExecutor {
             latestSummary: detail.reports.at(-1)?.summary ?? '',
             ...(contract ? { contract: { version: contract.version, goal: contract.goal, criteria: contract.criteria } } : {}),
             ...(receipt ? { receipt } : { deliverables }),
+          })
+        }
+
+        case 'ticket_session_history': {
+          const ticketId = str(args.ticketId)
+          if (!ticketId) return fail('缺少 ticketId')
+          const detail = this.deps.host.ticket(ticketId)
+          if (!detail) return fail(`找不到工单：${ticketId}`)
+          const dir = this.deps.host.piConfigDir?.(ticketId)
+          if (!dir) return out({ ticketId, exists: false, message: '这张工单没有留存 Pi 历史会话（可能已被清理或不是 Pi 执行器的工单）。' })
+          const view = readLatestPiSession(dir, {
+            limit: int(args.limit, 12, 1, 60),
+            maxChars: int(args.maxChars, 500, 80, 3000),
+            includeTools: bool(args.includeTools, false),
+          })
+          if (!view) return out({ ticketId, exists: false, message: '这张工单还没有 Pi 会话记录。' })
+          return out({
+            ticketId,
+            exists: true,
+            status: detail.status,
+            sessions: view.sessions,
+            summary: view.summary,
+            messages: wrapUntrusted(`ticket-session:${ticketId}`, JSON.stringify(view.messages)),
+            hint: '这是 Pi 的真实历史会话摘要（最近若干条）。用 ticket_reply 在原工单上继续派发新要求时，Pi 会自动续接这段记忆。',
           })
         }
 
@@ -1057,16 +1082,19 @@ export class DirectorToolExecutor {
             )
             if (gated) return gated
           }
-          const created = await this.deps.host.createTicket(
-            prompt,
-            model,
-            secrets.length > 0 ? secrets : undefined,
-            projectId,
-            collab,
-            goal,
-            projectMode,
-            ...(runner ? [runner] : []),
-          )
+          const forkFrom = optStr(args.fromTicketId)
+          if (forkFrom) {
+            const source = this.deps.host.ticket(forkFrom)
+            if (!source) return fail(`fromTicketId 指向的工单不存在：${forkFrom}`)
+          }
+          const forkNote = forkFrom
+            ? `【承接工单 ${forkFrom}】你已继承该工单完整的会话历史（之前的调研、决策与结论都记得）。注意：这是全新的工作区，旧工作区里的文件不会自动出现，需要的内容请从项目库或交付物重新取得。\n\n`
+            : ''
+          const ticketText = `${forkNote}${prompt}`
+          const secretArg = secrets.length > 0 ? secrets : undefined
+          const created = forkFrom
+            ? await this.deps.host.createTicket(ticketText, model, secretArg, projectId, collab, goal, projectMode, runner, forkFrom)
+            : await this.deps.host.createTicket(ticketText, model, secretArg, projectId, collab, goal, projectMode, ...(runner ? [runner] : []))
           const onComplete = optStr(args.onComplete)
           const onFailure = str(args.onFailure) === 'continue' ? 'continue' as const : 'report' as const
           let followupId: string | undefined
@@ -1107,9 +1135,63 @@ export class DirectorToolExecutor {
           const text = str(args.text)
           const model = optStr(args.model)
           if (!ticketId || !text) return fail('缺少 ticketId 或 text')
+          const before = this.deps.host.ticket(ticketId)
+          const reopened = before?.status === 'ended'
+          // 已结束的工单可以在原会话上继续做，但前提是原工作区还在；否则应改用 dispatch_ticket(fromTicketId) 分叉新单。
+          if (reopened) {
+            const root = this.deps.host.workspaceRoot(ticketId)
+            if (!root || !existsSync(root)) {
+              return fail(`工单 ${ticketId} 的工作区已被清理，无法原地续做；请改用 dispatch_ticket 并填写 fromTicketId="${ticketId}" 分叉出新工单（会继承它的会话历史）。`)
+            }
+          }
+          const goalRaw = (typeof args.goal === 'object' && args.goal !== null && !Array.isArray(args.goal))
+            ? args.goal as Record<string, unknown>
+            : parseParamsJson(args.goal_json)
+          const goalDescription = str(goalRaw.description) || str(goalRaw.text)
+          const onComplete = optStr(args.onComplete)
+          const onFailure = str(args.onFailure) === 'continue' ? 'continue' as const : 'report' as const
           this.deps.host.replyTicket(ticketId, text, model)
           this.deps.store.linkTicket(ticketId, ctx.session)
-          return out({ ok: true, ticketId, message: '已将回复发送给工单' })
+          let goalSet = false
+          if (goalDescription && this.deps.goals) {
+            const criteria = strArray(goalRaw.criteria, 20)
+            const commands = strArray(goalRaw.commands, 10)
+            const goalDefaults = this.deps.options.get().goal
+            const spec = resolveGoal({
+              text: criteria.length > 0 ? `${goalDescription}\n验收标准：\n${criteria.map(c => `- ${c}`).join('\n')}` : goalDescription,
+              commands,
+              mode: commands.length > 0 ? 'commands+ai' : 'ai',
+              ...(criteria.length > 0 ? { criteria } : {}),
+              ...(goalRaw.maxRounds !== undefined ? { maxRounds: int(goalRaw.maxRounds, goalDefaults.maxRounds, 1, 50) } : {}),
+              ...(goalRaw.maxUsd !== undefined ? { maxUsd: num(goalRaw.maxUsd, goalDefaults.maxUsd, 0.01, 100) } : {}),
+            }, goalDefaults)
+            goalSet = Boolean(this.deps.goals.set(ticketId, spec))
+          }
+          let followupId: string | undefined
+          if (onComplete) {
+            const fw = this.deps.store.createFollowup({
+              sessionId: ctx.session.id,
+              triggerKind: 'ticket.ended',
+              targetId: ticketId,
+              instruction: onComplete,
+              onFailure,
+            })
+            followupId = fw.id
+            this.deps.onAudit?.({
+              kind: 'director.followup_created',
+              level: 'info',
+              text: `总控登记自动续接 #${fw.id}：等待续做的 ${ticketId} 完成后执行`,
+              data: { followupId: fw.id, ticketId, sessionId: ctx.session.id },
+            })
+          }
+          return out({
+            ok: true,
+            ticketId,
+            reopened,
+            message: reopened ? '已重新打开这张已结束的工单，新要求会交给原会话（保留历史与工作区）续做' : '已将回复发送给工单',
+            ...(goalSet ? { goalSet: true } : {}),
+            ...(followupId ? { followupId, onCompleteRegistered: true } : {}),
+          })
         }
 
         case 'ticket_note': {
